@@ -59,9 +59,10 @@ entities while giving combat a deliberate command-menu rhythm.
   that perspective has known limitations.
 - Use matching Tactical RPG versions on the client and server. A dedicated
   server does not need the client-only UI or optional camera mod.
-- The unreleased 0.23.0 candidate raises the battle protocol from 6 to **8** and the
-  separate skill channel to **3**. A 0.22.2 peer and a 0.23.0 peer refuse to mix;
-  update both sides together.
+- **0.23.1** (content identical to the 0.23.0 candidate that was never published) raises the battle
+  protocol from 6 to **8** and the separate skill channel to **3**. A 0.22.2 peer and a 0.23.x peer
+  refuse to mix; update both sides together. Tactical RPG itself is client **and** server side;
+  only ApricityUI and the optional camera mod are client-only.
 
 Install the release JAR in your `mods` folder together with the required
 client dependency. Use only dependency files matching Minecraft 1.21.1 and
@@ -78,11 +79,11 @@ through the command menu. Configuration lives in `config/tactical-common.toml`.
 
 ### Current scope
 
-**Publication status of this specific version:** this description accompanies the **0.23.0
-candidate**. Tactical RPG 0.23.0 has **not** been uploaded to CurseForge in this round, and the
-project's release workflow has not yet run on the public repository. Nothing here should be read as
-"0.23.0 is already available on CurseForge"; this page also makes no statement about which other
-files the project page does or does not list.
+**Publication status of this specific version:** this description accompanies **0.23.1**. The 0.23.0
+release preflight failed (CurseForge lists three version entries named `1.21.1`) and that run
+**uploaded nothing**; its tag is unchanged. The upload status of 0.23.1 is whatever its CurseForge
+file page and the corresponding run show; this page does not predict it and makes no statement
+about which other files the project page does or does not list.
 
 **What is verifiable locally:** the last formal build in this repository is
 **0.22.2** (single battle, protocol 6) and it is still under the older
@@ -90,9 +91,8 @@ files the project page does or does not list.
 font file. **Its external publication status is unknown here.** The validation
 records of that round state that no CurseForge upload happened, and the older
 GitHub release is 0.21.0, so this page does not claim that 0.22.2 is downloadable
-on CurseForge. Everything described below as 0.23.0 exists only as an
-**unreleased working-tree candidate**: it has not been uploaded to this project and
-must not be presented as published. The **LGPL-3.0-only** licence and the removal of
+on CurseForge. Everything described below as 0.23.1 applies to that release candidate: it has not
+been uploaded to this project and must not be presented as published. The **LGPL-3.0-only** licence and the removal of
 the font file apply **only** to that unpublished candidate. The candidate is Minecraft 1.21.1 / NeoForge 21.1.216, main
 protocol `8`, separate skill protocol `3`, and it still requires ApricityUI
 1.2.8 as a client prerequisite (Dungeons Perspective 3.6.3 is an optional
@@ -144,7 +144,7 @@ Bundled or referenced third parties, unchanged:
 - **ApricityUI** and **Dungeons Perspective** are separate mods with their own
   authors, licences and download pages; they are not bundled.
 - **Minecraft** and its assets remain Mojang/Microsoft property. Every page of the unpublished
-  0.23.0 candidate selects the vanilla Minecraft font (`aui-font-mode=mc`) and its JAR ships no
+  0.23.1 candidate selects the vanilla Minecraft font (`aui-font-mode=mc`) and its JAR ships no
   third-party font file. An isolated development-launcher client loaded a no-font candidate JAR
   and displayed the nearby-battle list and battle menu; this was not a formal-launcher or
   glyph-by-glyph audit. The historical 0.22.2 build still declared All Rights
@@ -187,7 +187,7 @@ resolved.
 > “最新为 1.2.7”是 **2026-10-28 的可见列表观察**，不是“ApricityUI 没有 alpha/更新通道”的断言；官方发布状态以其项目页为准。
 - **客户端可选 Dungeons Perspective 3.6.3**。这是镜头集成的验证目标，而非必需前置；不使用该视角时，镜头行为仍有已知限制。
 - 客户端与服务端请使用相同版本的 Tactical RPG。专用服务端不需要客户端 UI 前置或可选镜头模组。
-- 尚未发布的 0.23.0 候选把战斗主协议由 6 升至 8，独立技能协议为 3。0.22.2 与 0.23.0 之间不会静默混连，请同时更新两端。
+- **0.23.1**（内容与未获发布的 0.23.0 候选相同）把战斗主协议由 6 升至 8，独立技能协议为 3。0.22.2 与 0.23.x 之间不会静默混连，请同时更新两端。本模组为客户端 + 服务端；只有 ApricityUI 与可选镜头模组是纯客户端。
 
 将正式发布的 JAR 与必需客户端前置放入 `mods` 文件夹。下载依赖时，请确认文件对应 Minecraft 1.21.1 和 NeoForge，并查看各依赖项目的说明。
 
@@ -199,9 +199,9 @@ resolved.
 
 ### 当前范围与限制
 
-**本版本的发布状态**：本页说明对应 **0.23.0 候选**。本次**没有向 CurseForge 上传 Tactical RPG 0.23.0**，本项目的发布工作流也尚未在公开仓实际运行。本页不支持“0.23.0 已可在 CurseForge 下载”这种读法；本页同样不判断该项目页面上已有或没有其它文件。
+**本版本的发布状态**：本页说明对应 **0.23.1**。0.23.0 的发布预检失败（CurseForge 目录里有三条名为 `1.21.1` 的版本行），该次**没有上传任何文件**，其 tag 不变；0.23.1 的上传状态以其 CurseForge 文件页与对应运行结果为准，本页不预判。本页不支持“0.23.1 已可在 CurseForge 下载”这种读法；本页同样不判断该项目页面上已有或没有其它文件。
 
-**本地可核实的事实**：本仓库上一个正式构建是 **0.22.2**（单场、协议 6），它仍是旧的 **All Rights Reserved** 授权，其 JAR 当时也仍然打包了 LXGW Marker Gothic 字体文件；**它的外部发布状态在此未知**——那一轮验证记录写明未发生 CurseForge 上传，更早的 GitHub Release 是 0.21.0，因此本页不声称 0.22.2 可在 CurseForge 下载。下面所有关于 0.23.0 的描述都只存在于**尚未发布的工作区候选**中：它没有上传到本项目页面，不得表述为已上架。**LGPL-3.0-only** 授权与字体文件不再打包**仅**适用于该未发布候选。该候选对应 Minecraft 1.21.1 / NeoForge 21.1.216，战斗主协议 `8`、独立技能协议 `3`，仍以 ApricityUI 1.2.8 作为必需客户端前置（Dungeons Perspective 3.6.3 是可选镜头/验证目标，不是依赖）。
+**本地可核实的事实**：本仓库上一个正式构建是 **0.22.2**（单场、协议 6），它仍是旧的 **All Rights Reserved** 授权，其 JAR 当时也仍然打包了 LXGW Marker Gothic 字体文件；**它的外部发布状态在此未知**——那一轮验证记录写明未发生 CurseForge 上传，更早的 GitHub Release 是 0.21.0，因此本页不声称 0.22.2 可在 CurseForge 下载。下面所有关于 0.23.1 的描述都属于该发布候选：它没有上传到本项目页面，不得表述为已上架。**LGPL-3.0-only** 授权与字体文件不再打包**仅**适用于该未发布候选。该候选对应 Minecraft 1.21.1 / NeoForge 21.1.216，战斗主协议 `8`、独立技能协议 `3`，仍以 ApricityUI 1.2.8 作为必需客户端前置（Dungeons Perspective 3.6.3 是可选镜头/验证目标，不是依赖）。
 
 候选在上一正式版之上新增两类能力：**多场并行**（按会话键控；同一维度内战区包围盒重叠时按保守 AABB 拒绝新场）与**从附近战斗列表直接加入**（显式同意，不依赖邀请命令）。同一场战斗内多名真实玩家共享行动轨道与公共战况，而每名玩家的 AP、MP、冷却、行动费用、移动与防御各自独立，默认上限 4 人。
 
@@ -217,7 +217,7 @@ resolved.
 
 - **YiRanExpressionLib 1.0.1** 以 JarJar 嵌套库形式随包，按其自身 LGPL v3 条款授权，本项目不重新许可它；其许可正文与并入的 GNU GPL v3 正文位于 JAR 内 `META-INF/licenses/yiran-expression-lib/`。随包二进制是上游提交 `60584101e` 的**官方 JitPack `universal` 未修改构建**（本地按归一化的 `1.0.1` 坐标保留），`NOTICE.md` 记录该来源、上游 LGPL／AGPL 元数据冲突，以及“尚未验证可由该源码本地重建同一字节”——这些是未闭合项，不是已解决项。
 - **ApricityUI** 与 **Dungeons Perspective** 是各自作者的独立模组，各有自己的许可与下载页，不随本包捆绑。
-- **Minecraft** 及其资源仍归 Mojang/Microsoft 所有。未发布的 0.23.0 候选每个页面都选择 Minecraft 原版字体（`aui-font-mode=mc`）且 JAR 内不随附第三方字体文件；隔离开发启动器客户端曾加载该无字体候选 JAR 并显示附近战斗列表和战斗菜单；这不是正式启动器环境测试，也不是逐字形检查。历史构建 0.22.2 仍按 All Rights Reserved 声明，且当时 JAR 内仍打包 `lxgw3500.ttf`（LXGW Marker Gothic 1.003，SIL OFL 1.1）。
+- **Minecraft** 及其资源仍归 Mojang/Microsoft 所有。未发布的 0.23.1 候选每个页面都选择 Minecraft 原版字体（`aui-font-mode=mc`）且 JAR 内不随附第三方字体文件；隔离开发启动器客户端曾加载该无字体候选 JAR 并显示附近战斗列表和战斗菜单；这不是正式启动器环境测试，也不是逐字形检查。历史构建 0.22.2 仍按 All Rights Reserved 声明，且当时 JAR 内仍打包 `lxgw3500.ttf`（LXGW Marker Gothic 1.003，SIL OFL 1.1）。
 
 确切文本以 `LICENSE`、`NOTICE.md` 与发布 JAR 的 `META-INF` 许可目录为准。本节陈述许可事实，不构成法律意见，也不声称许可合规已完全解决。
 

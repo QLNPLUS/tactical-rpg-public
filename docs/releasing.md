@@ -2,7 +2,7 @@
 
 ## 入口和产物
 
-**工作流已包含在本仓库中：** `.github/workflows/build-release.yml`（原获批版本，逐字节恢复，未改动）。脚本仅依赖 Python 3.11+ 标准库（CI 使用 3.12）；GitHub 写操作由工作流中的 `gh` 执行，CF 使用官方 Upload API。**截至本记录（2026-10-28）**，该工作流尚未在公开仓实际运行过，也没有向 CurseForge 上传 Tactical 0.23.0。已存在的配置项只是名称层面的记录，**不能据此确认 token 有效、项目上传权限或上传就绪**。
+**工作流已包含在本仓库中：** `.github/workflows/build-release.yml`（原获批版本，逐字节恢复，未改动）。脚本仅依赖 Python 3.11+ 标准库（CI 使用 3.12）；GitHub 写操作由工作流中的 `gh` 执行，CF 使用官方 Upload API。**0.23.0 的 tag 预检失败、那一次没有上传任何文件**（其 tag `v0.23.0-neoforge-1.21.1` 不改写）；0.23.1 的上传状态以该 tag 的文件页与运行结果为准。截至本记录（2026-10-28），该工作流尚未在公开仓实际运行过。已存在的配置项只是名称层面的记录，**不能据此确认 token 有效、项目上传权限或上传就绪**。
 
 | 事件 | 构建 / 检查 | GitHub Release / CurseForge |
 | --- | --- | --- |
@@ -39,7 +39,7 @@ python tools/release_pipeline.py package
 
 | 类型 | 名称 | 要求 | 记录状态（名称层面） |
 | --- | --- | --- | --- |
-| Variable | `CURSEFORGE_PROJECT_ID` | 本项目的 Minecraft CF 数字 ID | 记录为 **`1766445`**（本次未上传 Tactical 0.23.0） |
+| Variable | `CURSEFORGE_PROJECT_ID` | 本项目的 Minecraft CF 数字 ID | 记录为 **`1766445`**（0.23.0 预检失败且未上传；0.23.1 状态以文件页与运行结果为准） |
 | Secret | `CURSEFORGE_TOKEN` | 有该项目上传权限的 Upload API token；workflow 把它映射为作业内环境变量 `CURSEFORGE_API_TOKEN`（Python 侧变量名不变）。不得提交到源码、URL 或日志 | **名称已配置**（值不入库、不写入文档、未被读取；**不能据此确认有效性与项目权限**） |
 | Variable | `CURSEFORGE_APRICITYUI_SLUG` | 从真实 ApricityUI CF 项目确认的 slug | 已核对并配置（值存于仓库 variables） |
 | Variable | `CURSEFORGE_APRICITYUI_PROJECT_ID` | 同一 ApricityUI 项目的数字 ID | 已核对并配置（值存于仓库 variables） |
@@ -60,12 +60,21 @@ python tools/release_pipeline.py package
 
 发布负责人仍必须在 CF 项目页面核对两个依赖的 slug、数字 ID、作者与 1.21.1 NeoForge 文件是否对应；脚本只校验格式与项目 ID 互异，不能替代这种身份核对。缺配置时发布作业会失败关闭。
 
-**当前是否可上传：不能据配置名称断言就绪。** 工作流已包含在本仓库，仓库 variable `CURSEFORGE_PROJECT_ID=1766445` 与上述四个依赖 variable 已在名称层面配置，secret **名称** `CURSEFORGE_TOKEN` 已配置（值未被读取、未写入任何文件）。但这些都只是**名称层面**的事实：**不能据此确认 token 是否有效、是否具备该项目上传权限、以及上传是否就绪**。本次（2026-10-28）**没有向 CurseForge 上传 Tactical 0.23.0**，也没有调用上传/编辑项目接口；**截至本记录（2026-10-28）**，该工作流尚未在公开仓实际运行过。本文件也**不判断**该项目页面上已有或没有其它文件，也不对历史发布下结论。发布类型默认 `beta`，需要发布时用精确 tag 或手动运行触发。（历史：更早一轮用 `gh variable list --json name` / `gh secret list --json name` 看到相关项为空、`release` 环境返回 404，那是**当时**的观测，之后配置有过变化。）
+**当前是否可上传：不能据配置名称断言就绪。** 工作流已包含在本仓库，仓库 variable `CURSEFORGE_PROJECT_ID=1766445` 与上述四个依赖 variable 已在名称层面配置，secret **名称** `CURSEFORGE_TOKEN` 已配置（值未被读取、未写入任何文件）。但这些都只是**名称层面**的事实：**不能据此确认 token 是否有效、是否具备该项目上传权限、以及上传是否就绪**。**0.23.0 的预检失败、该次没有上传任何文件**，也没有调用上传/编辑项目接口；0.23.1 的上传状态以文件页与运行结果为准；**截至本记录（2026-10-28）**，该工作流尚未在公开仓实际运行过。本文件也**不判断**该项目页面上已有或没有其它文件，也不对历史发布下结论。发布类型默认 `beta`，需要发布时用精确 tag 或手动运行触发。（历史：更早一轮用 `gh variable list --json name` / `gh secret list --json name` 看到相关项为空、`release` 环境返回 404，那是**当时**的观测，之后配置有过变化。）
 
 
-## CF 文件说明的来源
+## CF 文件说明的来源（只取当前版本章节）
 
-CurseForge 上传 metadata 里的 `changelog` 取自**仓库根 `CHANGELOG.md`**（`tools/release_pipeline.py` 的 `--changelog` 默认值，`changelogType: markdown`），因此 `CHANGELOG.md` 顶部的内容会原样出现在 CF 的文件说明/更新记录里。玩家下载页上的前置版本警告（ApricityUI 需 **≥ 1.2.8**、CF 可见最新为 **1.2.7**、官方 Maven 原始 JAR 链接与 SHA-256）就写在 `CHANGELOG.md` 最顶部。`docs/curseforge.md` 只用于 **CF 项目描述栏**的人工粘贴，不参与上传 metadata，工作流也不会改写项目描述。
+CurseForge 上传 metadata 的 `changelog` 由 `tools/release_pipeline.py release-notes`（内部 `release_notes()`）从**仓库根 `CHANGELOG.md`** 中**只提取当前版本的二级章节**：支持 `## 0.23.1` 与 `## [0.23.1] - 2026-10-28` 两种写法，遇到下一个 `## ` 即停止；`### ` 子标题保留在章节内。**章节缺失、重复或为空一律失败**（不会退回整份历史，也不会发空说明）。GitHub Release 用同一次提取的结果（`--notes-file build/release/release-notes.md`）。`docs/curseforge.md` 只用于 **CF 项目描述栏**的人工粘贴，不参与上传 metadata，工作流也不会改写项目描述。
+
+因此前置版本警告（ApricityUI 需 **≥ 1.2.8**、CF 可见最新为 **1.2.7**、官方 Maven 原始 JAR 与 SHA-256）**写在 0.23.1 章节正文里**，确保只上传该章节时玩家仍能看到。
+
+## CF 上传元数据与防重复
+
+- **版本字段**：metadata 使用官方支持的 `gameVersionNames: ["1.21.1", "NeoForge"]`，**不发送 `gameVersions` 数字 ID**。原因是 CurseForge 目录里 `1.21.1` 存在多条同名行（2026-10-28 只读诊断读到 `(11779,77784)`、`(12735,1)`、`(16115,615)`，`NeoForge` 为 `(10150,68441)`），旧的“恰好一个 ID”判断会把合法的重复目录行当成错误——0.23.0 的 tag 预检就是这样失败的。
+- **保留的只读预检**：上传前仍 `GET /api/game/versions`，只要求两个名称**各至少一条正整数 id**，不选 ID、不因重复判错；名称缺失、id 无效、响应异常一律 fail closed。预检额外打印 `upload_game_version_names=1.21.1,NeoForge` 与 `optional_environment_tags_present=…`（对 `Client` / `Server` 这类环境标签**只做观察**；未核实前不写入名称数组）。
+- **跨运行防重复**：POST 之前先把上传意图（tag、commit、project id、JAR SHA-256，**不含 token**）写成 artifact `cf-upload-intent-<tag>`（保留 90 天）；同一 tag 的后续自动运行若查到未过期的旧意图即 **fail closed**，不自动重试。这次门只覆盖 artifact 保留期，之外仍需人工判断。
+- **结果未知的处置**：POST 之后若超时或连接中断，CurseForge 侧状态属于**未知**——文件可能已被接收、也可能仍在审核。此时**必须先到 CF 项目页人工确认**，再决定是否手工处理；脚本与工作流都**不做自动重试**，也不覆盖远端已有文件。成功路径只以 CF 返回的正整数 file ID 为准。
 
 ## CF API 契约与失败行为
 

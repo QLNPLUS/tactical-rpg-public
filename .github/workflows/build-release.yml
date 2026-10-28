@@ -100,6 +100,8 @@ jobs:
     environment: release
     permissions:
       contents: write
+      # Needed to read earlier runs' upload-intent artifacts (duplicate-upload gate).
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -116,6 +118,27 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.build.outputs.tag }}
         run: python tools/release_pipeline.py verify --tag "$RELEASE_TAG"
+      - name: Refuse a second automated upload for this tag
+        if: github.event_name != 'workflow_dispatch' || inputs.target == 'both'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A previous run recorded an upload intent, so a CurseForge POST may already have
+          # happened (including one whose outcome is unknown after a timeout). Fail closed and let a
+          # human inspect the CurseForge project; nothing is retried automatically.
+          name="cf-upload-intent-$RELEASE_TAG"
+          count=$(gh api "repos/$GH_REPO/actions/artifacts?per_page=100&name=$name" \
+            --jq '[.artifacts[] | select(.expired == false)] | length')
+          if [ "$count" != "0" ]; then
+            echo "Refusing to upload: an earlier run already recorded an upload intent for $RELEASE_TAG."
+            echo "Inspect the CurseForge project (a file may be present or under review) before doing anything else."
+            exit 1
+          fi
+          echo "No earlier upload intent for $RELEASE_TAG."
       - name: Preflight CurseForge (missing settings block publication)
         if: github.event_name != 'workflow_dispatch' || inputs.target == 'both'
         env:
@@ -127,6 +150,46 @@ jobs:
           CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID }}
           RELEASE_TYPE: ${{ inputs.release_type || 'beta' }}
         run: python tools/release_pipeline.py curseforge-preflight --release-type "$RELEASE_TYPE"
+      - name: Record CurseForge upload intent before the POST
+        if: github.event_name != 'workflow_dispatch' || inputs.target == 'both'
+        env:
+          CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(ls build/release/*.jar | wc -l)" = "1"
+          jar=$(ls build/release/*.jar)
+          sha=$(sha256sum "$jar" | cut -d' ' -f1)
+          python - "$RELEASE_TAG" "${{ github.sha }}" "$CURSEFORGE_PROJECT_ID" "$sha" <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
+          import sys
+
+          tag, commit, project, jar_sha = sys.argv[1:5]
+          # Written outside build/release: the verified bundle must stay exactly three files.
+          target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'cf-upload-intent.json'
+          target.write_text(json.dumps({
+              'tag': tag,
+              'commit': commit,
+              'projectId': project,
+              'jarSha256': jar_sha,
+              'recordedAtUtc': datetime.datetime.now(
+                  datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'note': 'upload intent only: no token, no request or response body',
+          }, indent=2) + '\n', encoding='utf-8')
+          print('recorded CurseForge upload intent for', tag)
+          PY
+      - name: Keep the CurseForge upload intent across runs
+        if: github.event_name != 'workflow_dispatch' || inputs.target == 'both'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cf-upload-intent-${{ needs.build.outputs.tag }}
+          path: ${{ runner.temp }}/cf-upload-intent.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Refuse duplicate GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -154,6 +217,10 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.target == 'github'
         run: |
           printf '%s\n' 'CurseForge NOT enabled for this explicitly GitHub-only release.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Extract current release notes for GitHub
+        env:
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        run: python tools/release_pipeline.py release-notes --tag "$RELEASE_TAG" --output "$RUNNER_TEMP/release-notes.md"
       - name: Create GitHub release with verified binary and checksums only
         env:
           GH_TOKEN: ${{ github.token }}
@@ -167,6 +234,6 @@ jobs:
           python tools/release_pipeline.py verify --tag "$RELEASE_TAG"
           flags=()
           if [[ "$RELEASE_TYPE" != release ]]; then flags+=(--prerelease); fi
-          gh release create "$RELEASE_TAG" --verify-tag --title "Tactical RPG $VERSION — NeoForge 1.21.1" --notes-file CHANGELOG.md "${flags[@]}" \
+          gh release create "$RELEASE_TAG" --verify-tag --title "Tactical RPG $VERSION — NeoForge 1.21.1" --notes-file "$RUNNER_TEMP/release-notes.md" "${flags[@]}" \
             "build/release/tactical-neoforge-1.21.1-$VERSION.jar" build/release/SHA256SUMS build/release/release-manifest.json
           printf '%s\n' 'GitHub release created from the verified build artifact; no sources or runtime logs uploaded.' >> "$GITHUB_STEP_SUMMARY"
