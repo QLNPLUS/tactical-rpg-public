@@ -1,0 +1,12 @@
+{
+  "attribute.tactical.max_mp": "最大魔力",
+  "attribute.tactical.mp_recovery": "每回合魔力回复",
+  "enchantment.tactical.backstab": "背刺",
+  "key.categories.tactical": "Tactical",
+  "key.tactical.menu": "战斗指令",
+  "key.tactical.end_turn": "结束回合",
+  "key.tactical.flee": "逃跑",
+  "attribute.tactical.ap_recovery": "战术每回合 AP 恢复量",
+  "attribute.tactical.max_ap": "战术 AP 上限系数",
+  "attribute.tactical.turn_charge_speed": "战术回合充能速度"
+}

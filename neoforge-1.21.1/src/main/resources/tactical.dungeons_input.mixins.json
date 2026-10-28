@@ -1,0 +1,9 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "com.tactical.neoforge.client.mixin",
+  "plugin": "com.tactical.neoforge.client.mixin.DungeonsInputMixinPlugin",
+  "compatibilityLevel": "JAVA_21",
+  "client": ["DungeonsScreenMouseMixin"],
+  "injectors": { "defaultRequire": 0 }
+}

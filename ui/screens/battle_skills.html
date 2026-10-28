@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="aui-font-mode" content="mc">
+<meta name="aui-mc-font-scale-policy" content="font-size"><meta name="aui-viewport" content="mode=browser,width=1280">
+<meta name="aui-mouse-events" content="intercept"><meta name="tactical-theme" content="gilded-journal">
+<title>战斗技能</title><!-- BEGIN TACTICAL JOURNAL THEME -->
+<style data-tactical-theme="gilded-journal">
+/* Gilded Journal. Single source: python tools/apply_journal_theme.py.
+   Native4x materials repeat at 128 logical px; only transparent nine-slice rails
+   stretch. No screenshot backgrounds, baked labels, viewport transforms or calc. */
+:root {
+    --ink:#4b3824; --ink-muted:#725b3b; --paper:#eadbb1;
+    --leather:#202333; --cream:#f1dfad; --gold:#c6a15c;
+    --wine:#74333c; --danger:#87382c; --green:#3f6348;
+}
+* { box-sizing:border-box; }
+html,body { margin:0; padding:0; overflow:hidden; background-color:transparent; color:var(--ink); font-family:inherit; font-size:var(--ui-font,14px); user-select:none; }
+input,textarea { user-select:text; }
+/* AUI 1.2.8 uses the HTML root's raw pixel font-size as its em basis. */
+html { font-size:14px; }
+button,input,select,textarea { font-family:inherit; font-size:inherit; }
+button { color:var(--ink); background-color:#ddc99c; border:1px solid #9c7a44; padding:.55em .8em; text-align:center; cursor:pointer; }
+button:hover { color:#43251c; background-color:#ead29c; border-color:#825126; }
+button:active { background-color:#c5a878; border-color:#5c3a23; }
+button:focus-visible { outline:2px solid #843c36; outline-offset:2px; }
+button:disabled,button[disabled],.skill-disabled,.skill-disabled:hover { color:#82705a; background-color:#cfc3a5; border-color:#a59576; cursor:default; }
+.panel,.route-panel,.tactical-panel,.box {
+    padding:1.65em; border:7px solid transparent; border-image:url("../textures/journal/paper-frame.png") 128 / 32px;
+    background-color:var(--paper); background-image:url("../textures/journal/paper-tile.png"); background-repeat:repeat; background-size:128px 128px;
+    box-shadow:0 3px 8px #080a1070;
+}
+.panel,.route-panel,.tactical-panel { position:absolute; }
+.head { border-bottom:1px solid #a58c5d; border-left:3px solid var(--wine); padding:0 0 .7em .65em; margin-bottom:.9em; }
+.title { font-size:1.45em; line-height:1.4; color:#3d2c1b; }
+.subtitle,.muted,.text-muted { color:var(--ink-muted); font-size:.928571em; line-height:1.5; }
+.subtitle { margin-top:.3em; }
+.section { color:#80532f; font-size:.928571em; margin:.9em 0 .45em; }
+.row { display:flex; align-items:center; justify-content:space-between; }
+.option { display:flex; align-items:center; width:100%; padding:.65em .55em; margin-bottom:.4em; text-align:left; }
+.num { width:1.8em; margin-right:.65em; color:#986a30; text-align:center; }
+.opt-body { display:block; flex:1; min-width:0; }
+.opt-title { display:block; font-size:1.142857em; color:var(--ink); }
+.opt-desc { display:block; font-size:.857143em; line-height:1.5; color:var(--ink-muted); margin-top:.25em; white-space:normal; }
+.stat { display:flex; justify-content:space-between; margin:.4em 0; color:var(--ink-muted); }
+.stat span:last-child { color:var(--ink); }
+.menu-status { min-height:1.6em; color:#7d633d; font-size:.857143em; line-height:1.5; }
+.scale { display:flex; gap:.3em; align-items:center; justify-content:space-between; border-top:1px solid #a58c5d; padding-top:.7em; margin-top:.8em; }
+.scale button { padding:.3em .5em; min-width:2em; }
+.scale-value { text-align:center; min-width:3em; }
+.foot { display:flex; justify-content:flex-end; align-items:center; border-top:1px solid #a58c5d; padding-top:.8em; margin-top:.8em; }
+/* Auxiliary paper pages keep the existing geometry, DOM IDs and event bindings. */
+.battle-menu,.facing-panel { right:16px; top:16px; width:304px; max-height:92vh; overflow-y:auto; overflow-x:hidden; }
+.aim-bar { right:16px; top:16px; width:360px; }
+.aim-title { font-size:1.357143em; color:var(--ink); }
+.aim-hint { margin:.65em 0; color:var(--ink-muted); font-size:.928571em; }
+.aim-actions { display:flex; justify-content:flex-end; margin-top:.8em; }
+.facing-row { display:flex; gap:.6em; margin-top:.6em; }
+.facing-button { flex:1; padding:1.1em; }
+.facing-back { width:100%; margin-top:.85em; }
+.route-panel { left:50%; top:100px; margin-left:-230px; width:460px; }
+.route-panel button { display:block; width:100%; padding:1em; margin-top:.7em; }
+#route-warning { color:var(--danger); font-size:.928571em; margin-top:.8em; }
+#skill-mp { color:#704538; margin-bottom:.6em; }
+#skill-empty { margin:.6em 0; }
+.skill-reason { color:var(--green); }
+.skill-disabled .opt-title,.skill-disabled .opt-desc { color:#82705a; }
+.skill-disabled .skill-reason { color:#884e40; }
+/* Vanilla-bound AUI fallback inventory: slot indexing and pointer semantics unchanged. */
+.inv-panel { left:50%; top:16px; margin-left:-290px; width:580px; padding:14px; }
+.player-container { width:540px; grid-template-columns:1fr; gap:0; --aui-slot-size:48; --aui-slot-icon-scale:2.2; }
+slot > item { left:0; top:0; width:100%; height:100%; pointer-events:none; }
+.slot-row { display:flex; gap:6px; margin-bottom:6px; }
+slot { pointer-events:none; flex-shrink:0; width:48px; height:48px; background-color:#b7a176; background-image:none; border:2px solid #6a5333; box-shadow:inset 0 0 0 1px #e8d4a5; --aui-slot-size:48; --aui-slot-icon-scale:2.2; }
+.inv-context { display:none; position:absolute; right:16px; top:110px; width:180px; z-index:30; }
+.inv-context button { display:block; width:100%; margin-top:4px; }
+/* Main journal: 420 x 670 at 14px. Geometry wrappers retain inherited font size.
+   UiZoom sets --ui-font; it must not overwrite journal width/padding/text metrics. */
+.journal-menu { position:absolute; width:30em; height:47.857143em; right:1.142857em; top:1.142857em; border:0; padding:0; max-height:none; overflow-x:visible; overflow-y:visible; background:none; box-shadow:none; font-size:var(--ui-font,14px); }
+.journal-page { overflow-x:hidden; overflow-y:hidden; }
+.journal-actions { min-height:0; overflow-y:auto; overflow-x:hidden; }
+.journal-side { position:absolute; left:0; top:3.285714em; width:7.857143em; height:27.857143em; padding:1.928571em .857143em 1em; color:var(--cream); border:7px solid transparent; border-image:url("../textures/journal/leather-frame.png") 128 / 30px; background:var(--leather) url("../textures/journal/leather-tile.png") repeat; background-size:128px 128px; }
+.journal-page { position:absolute; left:7.142857em; top:0; width:22.857143em; height:47.857143em; padding:1.714286em 1.5em; border:7px solid transparent; border-image:url("../textures/journal/paper-frame.png") 128 / 32px; background:var(--paper) url("../textures/journal/paper-tile.png") repeat; background-size:128px 128px; }
+.journal-bookmark { position:absolute; right:4.5em; top:-.428571em; width:1.428571em; height:4.642857em; background:url("../textures/journal/bookmark.png") center / 100% 100% no-repeat; pointer-events:none; }
+.journal-binding { position:absolute; left:6.785714em; top:2.714286em; width:.857143em; height:28.571429em; background-color:var(--wine); border:1px solid #3c2029; box-shadow:inset 2px 0 0 #a7695a; pointer-events:none; }
+.journal-side .side-block { margin-bottom:1.142857em; }
+.side-label { display:block; font-size:.857143em; color:#d8b66e; margin-bottom:.5em; }
+.side-value { display:block; font-size:.857143em; line-height:1.5; color:#f1dfad; overflow:hidden; }
+#round.side-round { display:block; font-size:1.714286em; line-height:1.2; color:#fff0c7; }
+.journal-side #actor { white-space:normal; }
+.journal-side #stance { display:block; font-size:.857143em; line-height:1.5; color:#e9d59d; }
+/* The seal belongs to the leather panel: its round head overlaps the lower edge. */
+.journal-seal { position:absolute; left:.785714em; bottom:-6em; width:3.285714em; height:8em; background:url("../textures/journal/seal-ribbon.png") center / 100% 100% no-repeat; pointer-events:none; }
+/* Stay outside the scrolling journal so both gear and popover retain native hit tests. */
+.journal-settings-toggle { position:fixed; right:2.428571em; top:2.857143em; width:2em; height:2em; padding:0; z-index:80; border:1px solid #9f8251; background-color:#ddc99c; background-image:url("../textures/journal/settings-gear.png"); background-position:center; background-size:100% 100%; background-repeat:no-repeat; }
+.journal-settings-toggle:hover { background-color:#ead29c; border-color:#825126; }
+.journal-settings-toggle.is-open { background-color:#c5a878; border-color:#71343d; }
+.journal-controls { display:none; position:fixed; right:2.428571em; top:5.571429em; width:10em; padding:.6em .45em; z-index:70; color:var(--cream); border:1px solid #9f8251; background:var(--leather) url("../textures/journal/leather-tile.png") repeat; background-size:128px 128px; }
+.journal-controls.is-open { display:block; }
+.journal-controls .scale { border:0; margin:0; padding:0; flex-wrap:wrap; gap:.25em; }
+.journal-controls .scale button { background-color:#71343d; border-color:#b2905b; color:#f1dfad; padding:.28em .4em; min-width:0; }
+.journal-controls .scale button:hover { background-color:#914952; color:#fff2cf; }
+.journal-controls .scale button:active { background-color:#4c222b; }
+.journal-controls .control-label { width:100%; font-size:.785714em; color:#e5cc99; }
+.journal-controls .scale-value { font-size:.857143em; min-width:2.4em; }
+.journal-controls #scale-minus,.journal-controls #scale-plus { width:1.4em; height:1.7em; padding:0; }
+.journal-side #actor { max-height:3em; overflow:hidden; }
+.journal-controls #scale-reset { width:100%; font-size:.785714em; margin-top:.2em; }
+.journal-controls #menu-close,.journal-controls .journal-preference { display:block; width:100%; margin-top:.5em; padding:.35em; font-size:.857143em; color:#f1dfad; background-color:#343044; border-color:#aa8c56; }
+.journal-controls .journal-preference[aria-pressed="true"] { background-color:#71343d; border-color:#d8b66e; }
+.journal-heading { height:2.285714em; padding:0 .2em; border-bottom:1px solid #9f8556; }
+.journal-heading .title { font-size:1.428571em; line-height:1.3; }
+.journal-ap { display:flex; justify-content:space-between; align-items:center; height:2.5em; border-bottom:1px solid #9f8556; }
+.journal-ap .ap-label { font-size:.857143em; color:#6f5838; }
+.journal-ap #ap { font-size:1.428571em; color:#3e2c1a; white-space:nowrap; }
+.journal-weapon { height:2.142857em; padding-top:.45em; overflow:hidden; white-space:nowrap; }
+.journal-weapon #weapon { font-size:.857143em; color:#594328; }
+.journal-state { height:4.428571em; padding-top:.5em; }
+.journal-state .menu-status { font-size:.857143em; line-height:1.5; min-height:0; }
+.journal-actions .option { height:4.428571em; padding:.4em .25em; margin:0; border:0; border-bottom:1px solid #a58d60; background-color:transparent; box-shadow:none; font-size:inherit; }
+.journal-actions .option:hover { background-color:#d0b36e70; }
+.journal-actions .option:active { background-color:#b89a6370; }
+.journal-actions .option:last-child { border-bottom:0; }
+.journal-actions .opt-title { font-size:1.071429em; line-height:1.4; }
+.journal-actions .opt-desc { margin-top:.4em; font-size:.857143em; line-height:1.4; color:#705a3a; }
+.journal-action-heading { display:flex; justify-content:space-between; align-items:center; }
+.journal-cost { color:#913e2d; font-size:.857143em; white-space:nowrap; padding-left:.3em; }
+/* HUD and chronicle: Java owns safe-area geometry and dynamic roster heights. */
+body.hud-page,body.battle-log-page { width:auto; height:auto; pointer-events:none; color:var(--cream); }
+.journal-leather { border:1px solid transparent; border-image:url("../textures/journal/leather-frame.png") 128 / 14px; background:var(--leather) url("../textures/journal/leather-tile.png") repeat; background-size:128px 128px; color:var(--cream); }
+.battle-hud,.battle-log { border:7px solid transparent; border-image:url("../textures/journal/leather-frame.png") 128 / 32px; background:var(--leather) url("../textures/journal/leather-tile.png") repeat; background-size:128px 128px; color:var(--cream); padding:.65em; }
+.battle-hud { --hud-font:13px; --hud-width:290px; position:absolute; left:12px; top:12px; width:var(--hud-width); font-size:var(--hud-font); }
+.hud-top { display:flex; justify-content:space-between; align-items:center; padding-bottom:.5em; border-bottom:1px solid #a58b53; }
+.battle-hud #actor { max-width:65%; overflow:hidden; white-space:nowrap; color:#f1dfad; }
+#health-roster { max-height:41vh; overflow-y:auto; overflow-x:hidden; pointer-events:auto; }
+.health-row { padding:.4em .2em; }
+.health-line { display:flex; align-items:center; justify-content:space-between; margin-bottom:.25em; }
+.health-name { font-size:var(--hud-font); max-width:61%; white-space:nowrap; overflow:hidden; color:#f1dfad; pointer-events:auto; }
+.health-name:hover,.health-name.health-hovered { color:#fff4d1; text-decoration:underline; }
+.health-number { font-size:var(--hud-font); color:#e2d6b6; white-space:nowrap; }
+.health-track { height:.45em; background-color:#111521; border:1px solid #907747; overflow:hidden; }
+.health-fill { height:100%; background-color:#bca263; }
+.health-active { border-left:2px solid #dfb965; padding-left:.4em; }
+.health-dead .health-name,.health-dead .health-number { color:#a59580; }
+.hud-footer { padding-top:.5em; margin-top:.3em; border-top:1px solid #a58b53; }
+.ap-line { display:flex; justify-content:space-between; align-items:center; }
+.battle-hud #ap { color:#f1dfad; font-size:1.15em; }
+.battle-hud #stance { color:#e3bf76; font-size:.9em; }
+.battle-hud #weapon { display:block; margin-top:.35em; font-size:.9em; color:#d7c6a2; white-space:nowrap; overflow:hidden; }
+.battle-log { display:none; position:fixed; left:12px; top:250px; width:290px; font-size:var(--log-font,13px); padding:.35em .65em; }
+.battle-log * { pointer-events:none; }
+.log-header { display:flex; justify-content:space-between; align-items:center; height:28px; }
+.log-title { color:#e8ca83; font-size:1.076923em; }
+#battle-log-toggle { pointer-events:auto; min-width:54px; height:26px; padding:2px 7px; color:#f1dfad; background-color:#71343d; border:1px solid #b18b54; font-size:.923077em; }
+#battle-log-toggle:hover { background-color:#904b52; color:#fff3cb; }
+#battle-log-toggle:active { background-color:#4e252e; }
+.log-details { padding-top:3px; border-top:1px solid #a58b53; }
+.is-collapsed .log-details { display:none; }
+.log-entry { display:flex; align-items:center; height:var(--log-line-height,21px); line-height:var(--log-line-height,21px); }
+.log-label { flex-shrink:0; width:32px; color:#d7ba77; font-size:.846154em; }
+.log-text { position:relative; display:block; flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:clip; font-size:1em; color:#f1dfad; pointer-events:none; }
+.log-text-inner { position:relative; left:0; display:block; white-space:nowrap; overflow:visible; text-overflow:clip; pointer-events:none; transition:none; }
+.log-damage .log-label,.log-death .log-label { color:#efb3a1; }
+.log-heal .log-label { color:#b7d3a5; }
+.log-effect .log-label { color:#dfb9cc; }
+.log-reject .log-label,.log-block .log-label { color:#f0cf89; }
+.log-status { display:flex; justify-content:space-between; height:22px; padding-top:4px; border-top:1px solid #a58b53; color:#dac7a1; font-size:.769231em; }
+/* Development probes retain their bindings, but share production materials. */
+.tactical-panel { left:16px; top:16px; width:380px; }
+.card-header { border-bottom:1px solid #a58c5d; padding-bottom:.65em; font-size:1.4em; }
+.card-body { padding-top:.6em; }
+.box { position:absolute; left:20px; top:20px; width:200px; height:80px; }
+</style>
+<!-- END TACTICAL JOURNAL THEME -->
+</head><body><div class="panel battle-menu" id="aui-scale-root" data-window-entrance="menu">
+<div class="head"><div class="title">战斗技能</div><div class="muted">角色与装备提供的技能</div></div>
+<div id="skill-mp" class="muted">MP 正在同步</div>
+<div id="skill-empty" class="muted">正在同步技能…</div><div id="skill-list"></div>
+<div class="scale"><span class="muted">界面大小</span><button id="scale-minus">－</button><span id="scale-value" class="scale-value">100%</span><button id="scale-plus">＋</button><button id="scale-reset">重置</button></div>
+<div class="foot"><button id="skill-back">返回指令</button></div>
+</div></body></html>

@@ -1,0 +1,63 @@
+# Turn-based entity effects, food and burning (0.17.0 / NeoForge 1.21.1)
+
+This describes the 0.17.0 contract. Applied-mixin server fixtures and real-client results are recorded in [0.17.0 validation](validation/0.17.0.md).
+
+Each actor owns its effect clock. A cycle is the interval from the start of that actor's turn to the start of its next turn, regardless of how many other actors act or how much real time passes. A complete cycle consumes **200 ticks / 10 seconds** of finite effect duration. Each periodic effect may run its normal `applyEffectTick` callback **once** during that cycle; the engine does not replay 200 damage/healing pulses.
+
+The first own turn establishes a baseline and has no duration deduction or periodic penalty. An effect applied between own starts, a forced replacement, or an actual change to its duration, amplifier, visibility, or hidden chain establishes a new baseline at the next own start. It first loses duration and pulses at the following own start. Thus a midcycle application receives its full first own cycle. Reapplying an identical effect that causes no material change does not postpone settlement. An effect may benefit the actor immediately through its attributes even before its first duration deduction.
+
+## Food consumption, natural healing and starvation
+
+For participating players, the **entire `FoodData.tick`** follows the same own-cycle boundary. The first own start establishes a food baseline without settlement; each subsequent complete own cycle invokes the native food tick exactly once. Ordinary server ticks freeze exhaustion processing, food/saturation consumption, natural healing and starvation damage, even at full health or with natural regeneration disabled. There is no replay of 200 food ticks.
+
+Action exhaustion can still accumulate immediately. At settlement, vanilla order applies: exhaustion above 4 consumes at most **one four-point unit**, reducing saturation by one or, when saturation is exhausted, food by one subject to vanilla difficulty rules. Eligible fast-saturation healing, ordinary natural healing or starvation then receives at most **one native branch callback**. During this scoped call only, the native 10/80-tick healing and starvation thresholds become 1. This does not simulate 200 callbacks or drain all accumulated exhaustion. For example, food 20 / saturation 5 / exhaustion 5 first becomes saturation 4 / exhaustion 1, then an eligible fast heal restores 4/6 HP and adds 4 exhaustion.
+
+`naturalRegeneration` still controls natural healing; disabling it leaves consumption and starvation active. Difficulty and vanilla health floors still govern starvation. Food heals and regeneration-potion pulses are independent and may each contribute once when eligible. Regeneration potions already used the tactical effect clock: the wall-clock healing bug came from the separate food path.
+
+`BattleFoodDataMixin` cancels ordinary participant food ticks. `BattleEffects.onTurnStart` settles food before effects and stops if starvation kills the player. Its scoped target allowance lets native starvation bypass battle isolation / defense modifiers, temporarily clears hurt immunity, and restores the old immunity timer and last-hurt amount in `finally`. Cleanup clears food baselines together with effect clocks. Nonparticipants and players outside battle retain vanilla timing; food intake, direct healing and instant-health effects keep their existing paths. See [food timing details](regeneration-timing.md).
+
+## Burning status (0.17.0)
+
+`BattleBurning` gives participating living entities a separate own-cycle burning baseline. First own start while burning establishes it; subsequent complete own cycles deduct **200 remaining fire ticks** (clamped at zero) and attempt at most **one native `onFire` damage pulse of 1.0 HP**. Refreshing an already-burning duration does not erase elapsed cycles. Extinguishing clears the baseline, so a new ignition receives a fresh baseline. This is burning status, not a conversion of every environmental fire damage source.
+
+`BattleEntityBurningMixin` suspends the ordinary positive, nonimmune `Entity.baseTick` fire countdown and burning pulse for participants. The fire-immune branch remains native; `fireImmune()` and native damage handling, including fire resistance, still apply. Water / rain / bubble extinguishing is retained and also checked at own start. Lava contact damage (`lavaHurt`) is untouched; a unit currently in lava does not receive the extra own-cycle burning pulse. Nonparticipants retain vanilla timing.
+
+`BattleEffects.applyBurningPulse` uses the scoped periodic-target allowance and temporarily clears hurt immunity, restoring both old immunity time and last-hurt amount afterward. Burning settlement is integrated into the actor's own turn start; forget / clear paths also remove burning baselines. Actual fire ticks are not discarded on battle cleanup, allowing native timing to resume outside battle.
+
+## Integration
+
+Register `tactical.effects.mixins.json` through a `[[mixins]]` entry in loader metadata. Its common mixins include `BattleFoodDataMixin` and `BattleEntityBurningMixin`, alongside effect ticking / access hooks; a client-only effect HUD timer freeze reads the existing participant snapshot without changing shared client/network state.
+
+Call `BattleEffects.onTurnStart(actor)` exactly once when that actor actually begins a turn, before calculating AP or other attribute-derived turn values. It can establish the first baseline during battle construction before `BattleManager.current()` has been published. After settlement, check whether the actor died or the encounter ended before continuing that turn. Do not call it for every server tick, round boundary, preview, or skipped scheduler entry that never becomes an actual actor turn.
+
+Call `BattleEffects.forget(actor)` when an actor leaves, dies, or an attempted join is rolled back. Call `BattleEffects.clear()` when the encounter finishes. A server-stop subscriber also clears clocks. Cleanup leaves actual effect instances in place so ordinary vanilla ticking resumes immediately outside battle.
+
+At the beginning of both `CombatModifiers.onIncoming` and `CombatModifiers.onDamage`, return when `BattleEffects.isApplyingEffect(event.getEntity())` is true. This scoped allowlist permits the target's own periodic damage and prevents outsider absorption, height, or defending rules from modifying it. The marker is set only while a normal effect callback runs and always unwinds in `finally`. It identifies the affected target rather than relying on a damage source's attacker, which is null for vanilla poison/wither and may be a potion caster for modded effects.
+
+## Preserved behavior and compatibility
+
+The implementation was checked against the installed `neoforge-21.1.216-sources.jar` / mapped Minecraft 1.21.1 artifact, specifically `MobEffectInstance.tick`, `tickDownDuration`, `update`, `LivingEntity.tickEffects`, and its effect lifecycle callbacks. NeoForge provides Added/Remove/Expired events but no event canceling both ordinary duration advancement and periodic execution; Added occurs before merge, so it is unsuitable as the sole mutation/baseline detector.
+
+The mixin freezes `MobEffectInstance.tick` for participating server entities. It does not cancel the surrounding `LivingEntity.tickEffects`, preserving dirty status processing, particles, invisibility, and glowing. Vanilla effect insertion/merge/force-add and attribute application stay in place. Settlement advances the real instance using its native `tick` method, suppressing additional periodic callbacks. This retains recursive hidden-effect duration aging and promotion, infinite `-1` durations, and periodic callbacks that return false to request removal. Promotion invokes the normal attribute refresh callback. Final expiration posts NeoForge `MobEffectEvent.Expired`; uncanceled expiration removes the exact old map entry and invokes normal removal/attribute cleanup with virtual dispatch, including ServerPlayer synchronization. An expiry canceled by another mod is retried on the next own cycle.
+
+New/replaced effects are never removed through a stale instance. The baseline compares object identity plus an immutable snapshot of the visible/hidden chain; this catches in-place vanilla merges as well as forced replacements. If a periodic callback materially refreshes its own instance, settlement stops after that native tick and baselines its new state instead of consuming the replacement's remaining cycle.
+
+Vanilla instantaneous effects keep their immediate invocation path. Instantaneous effects inserted as active instances also retain ordinary next-tick behavior and are not frozen, baselined, or delayed to a turn boundary.
+
+Periodic recognition evaluates the subclass's normal `shouldApplyEffectTickThisTick(time, amplifier)` and probes time zero, making conventional modulo-based poison, regeneration, wither, hunger, and modded subclasses execute once per own cycle independently of their vanilla pulse interval. Base/attribute-only effects whose predicate always returns false never receive periodic callbacks. Infinite effects use a virtual tick phase rather than the entity's unchanged wall-clock `tickCount`. Mods with unusual nonzero phase predicates are sampled across the 200 consumed duration ticks. Mods that execute side effects inside the predicate, implement ticking outside `MobEffectInstance.tick`, or override the instance's tick implementation without calling its superclass need dedicated compatibility.
+
+During a turn settlement pulse, vanilla real-time hurt immunity is temporarily cleared; both the old `invulnerableTime` and paired `lastHurt` amount are restored afterward. A quick second own cycle therefore applies its one damage pulse without changing the immunity state of ordinary attacks. Instantaneous/out-of-battle callbacks retain ordinary cooldown semantics.
+
+Client effect timers freeze for entities in the existing active participant-health snapshot. Server effect-update packets publish duration changes at settlement. Server rules and damage remain authoritative.
+
+## Verification
+
+The following fixtures were run for 0.17.0; see [the validation record](validation/0.17.0.md) for actual results and limits. `SafetySelfTest` includes planned real-tick burning freeze, fresh baseline / refresh, one 200-tick deduction and one native pulse per own cycle, hurt-immunity restoration, resistance, extinguishing and cleanup checks. The dedicated run emitted SAFETY SELFTEST PASSED.
+
+`RegenerationSelfTest` is opt-in via `-Dtactical.selftest=regeneration`. In a disposable dedicated world, it drives real server connection/player ticks and manager-owned turn advances, with 120-real-tick holds. Planned checks cover the first baseline, frozen HP/food/saturation/exhaustion, one native exhaustion unit and one eligible food heal per complete cycle, full-health consumption with natural regeneration disabled, Hard-difficulty starvation once per cycle with immunity restoration, potion timing, outsider controls, direct/instant healing and vanilla behavior after battle stop. The dedicated run emitted REGENERATION SELFTEST PASSED.
+
+`EffectCycleClockTest` contains ten pure checks for first-turn baseline, complete own cycle, independent actors, midcycle additions, infinite effects, refreshes, equal-valued replacements, hidden-chain mutations, removals, and clock cleanup. It is a JUnit test with a standalone entry point and can run without Minecraft startup.
+
+`EffectsSelfTest` self-registers only for `-Dtactical.selftest=effects`. On a disposable dedicated test server it creates a fake player/enemy encounter and checks real vanilla freeze/pulses, first baseline, rapid cycles and cooldown restoration, expiration events, attributes, hidden promotion, infinite effects, application/refresh/replacement fairness, instant healing, slow custom periodic subclasses, false-return removal, expiry cancellation/retry, and normal ticking after cleanup. The existing general `ServerSelfTest` must limit its property guard to its own battle/regression values to avoid two fixtures starting simultaneously.
+
+For a repeatable dedicated task, parent integration may define a separate server run with a disposable run directory and `systemProperty 'tactical.selftest', 'effects'`. Do not reuse an interactive world. The fixture shuts down its own server after pass/failure and logs `EFFECTS SELFTEST PASSED` or `EFFECTS SELFTEST FAILED`. A dedicated run validates applied mixins and virtual callback dispatch; standalone compilation and pure tests alone do not establish that runtime evidence.

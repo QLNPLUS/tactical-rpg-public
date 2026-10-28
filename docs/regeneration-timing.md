@@ -1,0 +1,29 @@
+# Player food and regeneration timing (NeoForge 1.21.1)
+
+The installed NeoForge 21.1.216 / Minecraft 1.21.1 implementation has two independent healing paths:
+
+- `MobEffectInstance.tick` checks the effect predicate, executes its periodic callback, and decreases duration. `RegenerationMobEffect` heals 1 HP per callback, with a vanilla interval of `50 >> amplifier`. Existing tactical effect settlement already freezes this path during real time and allows one callback per complete own cycle.
+- `Player.tick` invokes `FoodData.tick` separately. With `naturalRegeneration=true`, food 20 and saturation above zero, it normally heals `min(saturation, 6) / 6` HP every 10 real ticks and adds the same `min(saturation, 6)` exhaustion. With food at least 18 and no fast saturation case, it heals 1 HP every 80 real ticks and adds 6 exhaustion. That same food tick consumes exhaustion above 4 by subtracting 4 and reducing saturation by 1, or food by 1 when saturation is exhausted and difficulty is not Peaceful. At zero food, it can inflict 1 HP starvation damage every 80 real ticks, subject to vanilla difficulty/health restrictions. The separate food path explained healing while a player waited on an unchanged tactical turn. A regeneration test on a creeper cannot expose it.
+
+For a battle participant, the entire food tick now shares the actor's own-cycle boundary. The first own start establishes a baseline and performs no food settlement. Every subsequent own start executes exactly one native `FoodData.tick`, regardless of whether the player is hurt, starving, or has natural regeneration enabled. The mixin cancels this tick during ordinary real time and allows it only in that player's scoped own-cycle settlement. Healing and starvation thresholds are reduced to one during that invocation, allowing at most one eligible pulse per complete cycle. There is no replay of 200 food ticks.
+
+Exhaustion caused by actions can still accumulate immediately, but food/saturation consumption waits for the next complete own-cycle boundary. One settlement consumes at most one vanilla four-point exhaustion unit. Native order is preserved: exhaustion consumption occurs before natural healing or starvation. For example, food 20/saturation 5/exhaustion 5 becomes saturation 4/exhaustion 1 before natural healing; the eligible heal is then 4/6 HP and adds 4 exhaustion. Regeneration remains controlled by `naturalRegeneration`; disabling it does not disable consumption or starvation. Vanilla difficulty and health floors still control starvation.
+
+Starvation settlement uses the same target-scoped damage allowance as periodic effects, so battle isolation or defense cannot discard or alter its own native pulse. The settlement temporarily clears hurt immunity and restores the previous immunity timer and last-hurt amount in `finally`, allowing consecutive own cycles to each apply one pulse. Food regeneration and a regeneration potion remain independent sources and can each contribute once when both are eligible.
+
+Nonparticipants and players outside battle keep ordinary vanilla food timing. Direct `heal`, instant-health potions, healing items, and food intake are not intercepted by the food-tick guard. Existing battle cleanup clears the food baseline along with the effect clock, and ordinary food processing resumes after the participant leaves.
+
+`RegenerationSelfTest` is an opt-in dedicated-server fixture selected by `-Dtactical.selftest=regeneration`. Run it in its own disposable world. It creates real `ServerPlayer` entities using the recording-connection pattern from the death integration fixture and registers those transports in the server's actual connection loop. The server invokes the installed `ServerGamePacketListenerImpl.tick` and `ServerPlayer.doTick` once per actual server tick, reaching both `Player.tick` and `FoodData.tick`. Merely adding a `ServerPlayer` to a level does not drive that path and is insufficient evidence. The recording transport answers native keepalive challenges for the duration of the test.
+
+The fixture records HP, food, saturation, exhaustion, accepted healing-call count, real connection ticks and potion duration at every boundary. It covers:
+
+- An outside-battle natural-food positive control and an outsider control during the owner's encounter.
+- At least 120 real ticks without potions, food 20/saturation 5/exhaustion 5/gamerule true, with HP and all food state unchanged until the owner advances.
+- Exactly one native exhaustion consumption followed by one natural-food heal at a complete manager-owned cycle; a further cycle checks another single heal.
+- Immediate direct and instant healing during the encounter.
+- An amplified regeneration potion at food 17 with 120-real-tick holds, one pulse per own cycle, and correct duration/expiry.
+- A full-health player at food 19/saturation 0/exhaustion 5 with natural regeneration disabled: all food state stays unchanged for 120 real ticks; one complete own cycle changes food to 18 and exhaustion to 1 without healing.
+- Zero food on Hard difficulty with natural regeneration disabled: no starvation damage during each 120-real-tick hold; exactly 1 HP damage per complete own cycle; prior hurt-cooldown state is restored.
+- Ordinary natural-food healing after battle stop.
+
+Cycles advance through `BattleManager.endTurn`, including legitimate consecutive own turns selected by the real initiative scheduler. No test code directly ticks a potion or food instance, and no synthetic world-tick loop is used. The runtime pass marker is `REGENERATION SELFTEST PASSED`; a failure logs the actual world tick, phase, cycle, HP and heal-call count. Source review or compilation alone does not establish that the runtime mixins or real-time assertions passed. The earlier natural-healing-only runtime pass is superseded by the expanded food-consumption/starvation requirements and requires a new runtime run.

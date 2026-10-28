@@ -1,0 +1,57 @@
+modLoader = "javafml"
+loaderVersion = "${loader_version_range}"
+license = "${mod_license}"
+
+[[mixins]]
+config = "tactical.dungeons_input.mixins.json"
+
+[[mixins]]
+config = "tactical.camera.mixins.json"
+
+[[mixins]]
+config = "tactical.ui.mixins.json"
+
+[[mixins]]
+config = "tactical.effects.mixins.json"
+
+[[mixins]]
+config = "tactical.creeper.mixins.json"
+
+[[mixins]]
+config = "tactical.server.mixins.json"
+
+[[mods]]
+modId = "${mod_id}"
+version = "${mod_version}"
+displayName = "${mod_name}"
+logoFile = "logo.png"
+authors = "${mod_authors}"
+description = '''${mod_description}'''
+
+[[dependencies.${mod_id}]]
+modId = "neoforge"
+type = "required"
+versionRange = "${neo_version_range}"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.${mod_id}]]
+modId = "minecraft"
+type = "required"
+versionRange = "${minecraft_version_range}"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.${mod_id}]]
+modId = "apricityui"
+type = "required"
+versionRange = "[1.2.8,)"
+ordering = "NONE"
+side = "CLIENT"
+
+[[dependencies.tactical]]
+modId = "dungeons_iso"
+type = "optional"
+versionRange = "[3.6.0,)"
+ordering = "NONE"
+side = "CLIENT"

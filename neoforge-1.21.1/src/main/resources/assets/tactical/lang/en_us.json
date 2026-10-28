@@ -1,0 +1,12 @@
+{
+  "attribute.tactical.max_mp": "Maximum MP",
+  "attribute.tactical.mp_recovery": "MP Recovery Per Turn",
+  "enchantment.tactical.backstab": "Backstab",
+  "key.categories.tactical": "Tactical",
+  "key.tactical.menu": "Battle Menu",
+  "key.tactical.end_turn": "End Turn",
+  "key.tactical.flee": "Flee",
+  "attribute.tactical.ap_recovery": "Tactical AP Recovery Per Turn",
+  "attribute.tactical.max_ap": "Tactical Max AP Factor",
+  "attribute.tactical.turn_charge_speed": "Tactical Turn Charge Speed"
+}

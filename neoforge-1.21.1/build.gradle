@@ -1,0 +1,440 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.82'
+}
+
+version = project.mod_version
+group = project.mod_group_id
+
+base {
+    archivesName = "tactical-neoforge-${minecraft_version}"
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+    withSourcesJar()
+}
+
+// Shared pure-Java rules compile into every loader module so FML's module
+// layer can see them (external project classes are invisible to mods at runtime).
+sourceSets.main.java.srcDir project(':common').file('src/main/java')
+sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
+sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
+
+repositories {
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = 'verifiedYiRanLibrary'
+                url = rootProject.layout.projectDirectory.dir('libs/maven')
+            }
+        }
+        filter { includeModule('com.github.yiran1457', 'YiRanExpressionLib') }
+    }
+    maven {
+        name = 'sighs'
+        url = uri('https://maven.sighs.cc/repository/maven-releases/')
+    }
+}
+
+// Single source of truth for the MP05 isolated harness: run names, game directories,
+// usernames, offline UUIDs and ports. The run models below, the prepare/verify tools
+// and the configuration check all read this map so the values cannot drift apart.
+def multiplayerServerHost = '127.0.0.1'
+def multiplayerHarness = [
+        clientA: [run: 'clientMultiA', target: 'clientA', gameDir: 'run-multiplayer-a',
+                  username: 'TacticalA', uuid: 'bf8308eb-ed73-3ea9-b5fa-a235825ad642', bridgePort: 25590],
+        clientB: [run: 'clientMultiB', target: 'clientB', gameDir: 'run-multiplayer-b',
+                  username: 'TacticalB', uuid: '72b726e2-87b6-3e68-a317-5b1b52afbe7a', bridgePort: 25591],
+        server : [run: 'serverMultiplayer', target: 'server', gameDir: 'run-multiplayer-server',
+                  port: 25569],
+]
+
+neoForge {
+    version = project.neo_version
+
+    runs {
+        client {
+            client()
+            // Opt-in isolation for the literal `runClient` task: only when -PacceptanceGameDir=<dir> is passed
+            // does the run use a separate game directory and auto-join the isolated server. The default
+            // behaviour (shared run/ and its existing world) is untouched.
+            if (project.hasProperty('acceptanceGameDir')) {
+                gameDirectory = file(project.property('acceptanceGameDir').toString())
+                programArguments.addAll '--quickPlayMultiplayer', '127.0.0.1:25569'
+            }
+        }
+        clientSelfTest {
+            client()
+            systemProperty 'tactical.selftest', 'true'
+            systemProperty 'tactical.selftest.battle', 'true'
+            programArguments.addAll '--quickPlayMultiplayer', '127.0.0.1:25565'
+        }
+        clientUiTest {
+            client()
+            systemProperty 'tactical.selftest.ui', 'true'
+            programArguments.addAll '--quickPlayMultiplayer', '127.0.0.1:25565'
+        }
+        // Test-only acceptance run: independent game directory (git-ignored by run-*/) so the shared dev
+        // `run/` directory and its existing world are never touched. No default task uses this run.
+        clientAcceptance {
+            client()
+            gameDirectory = file('run-camera-acceptance')
+            programArguments.addAll '--quickPlayMultiplayer', '127.0.0.1:25569'
+        }
+        server {
+            server()
+            gameDirectory = file('run-server')
+        }
+        serverSelfTest {
+            server()
+            gameDirectory = file('run-server-test')
+            systemProperty 'tactical.selftest', 'battle'
+        }
+        serverEffectsTest {
+            server()
+            gameDirectory = file('run-server-effects-test')
+            systemProperty 'tactical.selftest', 'effects'
+        }
+        serverCreeperTest {
+            server()
+            gameDirectory = file('run-server-creeper-test')
+            systemProperty 'tactical.selftest', 'creeper'
+        }
+        serverDeathTest {
+            server()
+            gameDirectory = file('run-server-death-test')
+            systemProperty 'tactical.selftest', 'death'
+        }
+        serverRangedTest {
+            server()
+            gameDirectory = file('run-server-ranged-test')
+            systemProperty 'tactical.selftest', 'ranged'
+        }
+        serverRegenerationTest {
+            server()
+            gameDirectory = file('run-server-regeneration-test')
+            systemProperty 'tactical.selftest', 'regeneration'
+        }
+        serverSafetyTest {
+            server()
+            gameDirectory = file('run-server-safety-test')
+            systemProperty 'tactical.selftest', 'safety'
+        }
+        serverAttributesTest {
+            server()
+            gameDirectory = file('run-server-attributes-test')
+            systemProperty 'tactical.selftest', 'attributes'
+        }
+        serverFlightTest {
+            server()
+            gameDirectory = file('run-server-flight-test')
+            systemProperty 'tactical.selftest', 'flight'
+        }
+        serverFleeTest {
+            server()
+            gameDirectory = file('run-server-flee-test')
+            systemProperty 'tactical.selftest', 'flee'
+        }
+        serverReinforcementTest {
+            server()
+            gameDirectory = file('run-server-reinforcement-test')
+            systemProperty 'tactical.selftest', 'reinforcements'
+        }
+        serverTeamsTest {
+            server()
+            gameDirectory = file('run-server-teams-test')
+            systemProperty 'tactical.selftest', 'teams'
+        }
+        serverAiSkillsTest {
+            server()
+            gameDirectory = file('run-server-ai-skills-test')
+            systemProperty 'tactical.selftest', 'ai_skills'
+        }
+        serverSkillsTest {
+            server()
+            gameDirectory = file('run-server-skills-test')
+            systemProperty 'tactical.selftest', 'skills'
+        }
+        serverApTest {
+            server()
+            gameDirectory = file('run-server-ap-test')
+            systemProperty 'tactical.selftest', 'ap'
+        }
+        serverPositionTest {
+            server()
+            gameDirectory = file('run-server-position-test')
+            systemProperty 'tactical.selftest', 'position'
+        }
+        serverRegression {
+            server()
+            gameDirectory = file('run-server-test')
+            systemProperty 'tactical.selftest', 'regression'
+        }
+
+        // MP05 isolated two-client harness. Nothing here changes the plain `client`
+        // or any existing run: these are additional runs with their own directories.
+        //
+        // Ports: dedicated server 25569, AgentHelper bridge A 25590, bridge B 25591.
+        // The two clients get explicit distinct `--username`/`--uuid`; MDG does not add
+        // its own `--username` for these runs, so the option is never duplicated.
+        // The offline UUIDs equal UUID.nameUUIDFromBytes("OfflinePlayer:<name>"), i.e.
+        // the identity an offline-mode server derives, so ops.json matches.
+        clientMultiA {
+            client()
+            gameDirectory = file(multiplayerHarness.clientA.gameDir)
+            // ApricityUI's external debug service binds a fixed ws://127.0.0.1:25321 and
+            // cannot serve two clients on one machine; the harness clients disable it.
+            systemProperty 'apricityui.debug.enabled', 'false'
+            programArguments.addAll '--username', multiplayerHarness.clientA.username,
+                    '--uuid', multiplayerHarness.clientA.uuid,
+                    '--quickPlayMultiplayer', "${multiplayerServerHost}:${multiplayerHarness.server.port}"
+        }
+        clientMultiB {
+            client()
+            gameDirectory = file(multiplayerHarness.clientB.gameDir)
+            systemProperty 'apricityui.debug.enabled', 'false'
+            programArguments.addAll '--username', multiplayerHarness.clientB.username,
+                    '--uuid', multiplayerHarness.clientB.uuid,
+                    '--quickPlayMultiplayer', "${multiplayerServerHost}:${multiplayerHarness.server.port}"
+        }
+        serverMultiplayer {
+            server()
+            gameDirectory = file(multiplayerHarness.server.gameDir)
+            // No Swing window: the harness clients own OS focus for real input checks.
+            programArguments.addAll '--nogui'
+        }
+        // Server-side multiplayer self test (com.tactical.neoforge.battle.MultiBattleSelfTest).
+        // Own throwaway directory; the reviewer runs it instead of the fixed harness server.
+        serverMultiBattleTest {
+            server()
+            gameDirectory = file('run-server-multi-battle-test')
+            systemProperty 'tactical.selftest', 'multi_battle'
+            programArguments.addAll '--nogui'
+        }
+    }
+
+    mods {
+        "${mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+dependencies {
+    def expressionLib = implementation('com.github.yiran1457:YiRanExpressionLib:1.0.1')
+    jarJar(expressionLib) {
+        version {
+            strictly '[1.0.1]'
+            prefer '1.0.1'
+        }
+    }
+    implementation "com.sighs:ApricityUI-neoforge-1.21.1:${apricity_version}"
+
+    testImplementation platform("org.junit:junit-bom:5.10.2")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+}
+
+tasks.named('jar', Jar).configure {
+    from(rootProject.file('licenses')) {
+        include 'YiRanExpressionLib-LICENSE.txt', 'GPL-3.0.txt'
+        into 'META-INF/licenses/yiran-expression-lib'
+    }
+    from(rootProject.file('NOTICE.md')) { into 'META-INF' }
+}
+
+tasks.named("test", Test) {
+    useJUnitPlatform()
+}
+
+tasks.withType(ProcessResources).configureEach {
+    from('../ui') {
+        into 'assets/apricityui/apricity/tactical'
+        // The journal UI uses the vanilla Minecraft font (every page sets aui-font-mode=mc) and no
+        // page or class references this file, so the leftover LXGW Marker Gothic file stays in the
+        // repository as history but is not shipped in the JAR. Its OFL text lives in licenses/.
+        exclude 'lxgw3500.ttf'
+    }
+
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: '[1.21.1,1.22)',
+            neo_version            : neo_version,
+            neo_version_range      : '[21.1,21.2)',
+            loader_version_range   : '[4,)',
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+            mod_authors            : 'Tactical',
+            mod_description        : 'Turn-based tactical combat for Minecraft.'
+    ]
+    inputs.properties replaceProperties
+    filesMatching(['META-INF/neoforge.mods.toml']) {
+        expand replaceProperties
+    }
+}
+
+// --- MP05 isolated two-client harness tooling -----------------------------------------
+// These tasks only prepare and verify isolated runtime directories plus this file's
+// configuration. They never launch Minecraft or a dedicated server: the two-client
+// acceptance run is started manually by the reviewer.
+
+def nodeExecutable = providers.gradleProperty('nodeExe').getOrElse('node')
+def harnessRepoDir = rootProject.projectDir
+
+[
+        prepareClientMultiA     : ['prepare', 'clientA'],
+        prepareClientMultiB     : ['prepare', 'clientB'],
+        prepareClientMultiServer: ['prepare', 'server'],
+        prepareServerMultiBattleTest: ['prepare', 'selftest'],
+        verifyClientMulti       : ['verify', 'all'],
+].each { taskName, args ->
+    tasks.register(taskName, Exec) {
+        group = 'multiplayer harness'
+        description = "Runs tools/prepare_multiplayer_runtime.mjs ${args[0]} --target ${args[1]}; no game is launched."
+        workingDir harnessRepoDir
+        commandLine([nodeExecutable, 'tools/prepare_multiplayer_runtime.mjs', args[0], '--target', args[1]])
+    }
+}
+
+tasks.register('multiplayerRunConfigCheck') {
+    group = 'multiplayer harness'
+    description = 'Checks MP05 harness run/port/identity configuration and reports prepared runtime state.'
+
+    def harness = multiplayerHarness.collectEntries { key, value -> [key, new LinkedHashMap(value)] }
+    def serverHost = multiplayerServerHost
+    def expectedRunTasks = multiplayerHarness.values().collect { 'run' + it.run.capitalize() } +
+            ['runServerMultiBattleTest']
+    def runTaskNames = new java.util.ArrayList<String>()
+    def moduleDir = project.projectDir
+
+    def availableRunTasks = tasks.names
+    expectedRunTasks.each { runTask ->
+        if (availableRunTasks.contains(runTask)) runTaskNames.add(runTask)
+    }
+
+    doLast {
+        def problems = []
+        def pending = []
+        def clients = [harness.clientA, harness.clientB]
+
+        def gameDirs = harness.values().collect { it.gameDir }
+        if (new HashSet(gameDirs).size() != gameDirs.size()) {
+            problems << "game directories are not unique: ${gameDirs}"
+        }
+        if (new HashSet(clients.collect { it.username }).size() != clients.size()) {
+            problems << "client usernames are not distinct: ${clients.collect { it.username }}"
+        }
+        if (new HashSet(clients.collect { it.uuid }).size() != clients.size()) {
+            problems << "client uuids are not distinct: ${clients.collect { it.uuid }}"
+        }
+        def ports = clients.collect { it.bridgePort } + [harness.server.port]
+        if (new HashSet(ports).size() != ports.size()) {
+            problems << "harness ports collide: ${ports}"
+        }
+        if (ports.contains(25589)) {
+            problems << 'bridge port 25589 would collide with the default AgentHelper listener'
+        }
+        if (ports.contains(25321)) {
+            problems << 'port 25321 is bound by the ApricityUI debug service'
+        }
+        clients.each { cfg ->
+            if (!(cfg.uuid ==~ /[0-9a-f]{8}-[0-9a-f]{4}-3[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/)) {
+                problems << "${cfg.username}: uuid ${cfg.uuid} is not an offline (version 3) uuid"
+            }
+            if (!(cfg.bridgePort instanceof Integer) || cfg.bridgePort < 1024 || cfg.bridgePort > 65535) {
+                problems << "${cfg.username}: bridge port ${cfg.bridgePort} is out of range"
+            }
+        }
+
+        def missingRunTasks = expectedRunTasks.findAll { !runTaskNames.contains(it) }
+        if (missingRunTasks) {
+            problems << "run tasks are not registered: ${missingRunTasks}"
+        }
+
+        def slurper = new groovy.json.JsonSlurper()
+        clients.each { cfg ->
+            def dir = new File(moduleDir, cfg.gameDir)
+            if (!dir.isDirectory()) {
+                pending << "${cfg.gameDir}: not prepared yet (run prepareClient${cfg.run - 'client'})"
+                return
+            }
+            def helper = new File(dir, 'config/agenthelper.json')
+            if (!helper.isFile()) {
+                pending << "${cfg.gameDir}: missing config/agenthelper.json"
+            } else {
+                def parsed = slurper.parse(helper)
+                if (parsed instanceof Map && parsed.port != cfg.bridgePort) {
+                    problems << "${cfg.gameDir}: agenthelper port ${parsed.port} != expected ${cfg.bridgePort}"
+                }
+            }
+            def mods = new File(dir, 'mods')
+            def jarFilter = { File candidate -> candidate.name.endsWith('.jar') } as java.io.FileFilter
+            def jars = mods.isDirectory() ? (mods.listFiles(jarFilter)?.collect { it.name } ?: []) : []
+            ['agenthelper-', 'dungeons_iso-'].each { prefix ->
+                if (!jars.any { it.startsWith(prefix) }) {
+                    pending << "${cfg.gameDir}/mods: missing ${prefix}*.jar"
+                }
+            }
+            if (!new File(dir, 'options.txt').isFile()) {
+                pending << "${cfg.gameDir}: missing options.txt"
+            }
+        }
+
+        def serverDir = new File(moduleDir, harness.server.gameDir)
+        if (!serverDir.isDirectory()) {
+            pending << "${harness.server.gameDir}: not prepared yet (run prepareClientMultiServer)"
+        } else {
+            def propertiesFile = new File(serverDir, 'server.properties')
+            if (!propertiesFile.isFile()) {
+                pending << "${harness.server.gameDir}: missing server.properties"
+            } else {
+                def wanted = ['server-port', 'server-ip', 'online-mode', 'enforce-secure-profile']
+                wanted.each { key ->
+                    def match = propertiesFile.readLines().find { it.startsWith(key + '=') }
+                    if (match == null) {
+                        pending << "${harness.server.gameDir}/server.properties: missing ${key}"
+                    } else if (key == 'server-port' && match.tokenize('=')[1] != String.valueOf(harness.server.port)) {
+                        problems << "${harness.server.gameDir}/server.properties: ${match} != server-port=${harness.server.port}"
+                    } else if (key == 'server-ip' && match.tokenize('=')[1] != serverHost) {
+                        problems << "${harness.server.gameDir}/server.properties: ${match} != server-ip=${serverHost}"
+                    } else if (key == 'online-mode' && match.tokenize('=')[1] != 'false') {
+                        problems << "${harness.server.gameDir}/server.properties: ${match} must be false for the isolated harness"
+                    }
+                }
+            }
+            def opsFile = new File(serverDir, 'ops.json')
+            if (!opsFile.isFile()) {
+                pending << "${harness.server.gameDir}: missing ops.json"
+            } else {
+                def ops = slurper.parse(opsFile)
+                def uuids = ops.collect { it.uuid }
+                clients.each { cfg ->
+                    if (!uuids.contains(cfg.uuid)) {
+                        problems << "${harness.server.gameDir}/ops.json: ${cfg.username} (${cfg.uuid}) is not an operator"
+                    }
+                }
+            }
+            def eulaFile = new File(serverDir, 'eula.txt')
+            if (!eulaFile.isFile()) {
+                pending << "${harness.server.gameDir}: missing eula.txt"
+            } else if (!eulaFile.readLines().any { it.trim() == 'eula=true' }) {
+                problems << "${harness.server.gameDir}/eula.txt: eula=true is required"
+            }
+        }
+
+        println "MP05 harness configuration"
+        harness.each { key, cfg ->
+            println "  ${key.padRight(8)} run=${('run' + cfg.run.capitalize()).padRight(22)} gameDir=${cfg.gameDir}" +
+                    (cfg.username ? " username=${cfg.username} uuid=${cfg.uuid} bridge=${cfg.bridgePort}".toString() : " port=${cfg.port}".toString())
+        }
+        println "  server endpoint ${serverHost}:${harness.server.port}"
+        pending.each { println "  PENDING  ${it}" }
+        problems.each { println "  PROBLEM  ${it}" }
+        if (problems) {
+            throw new GradleException("MP05 harness configuration has ${problems.size()} problem(s)")
+        }
+        println pending ? 'MP05 harness config OK; runtime state incomplete (see PENDING).' : 'MP05 harness config OK; runtime state prepared.'
+    }
+}

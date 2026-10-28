@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="aui-font-mode" content="mc">
+<meta name="aui-mc-font-scale-policy" content="font-size">
+<meta name="aui-viewport" content="mode=browser,width=1280">
+<meta name="aui-mouse-events" content="passthrough">
+<title>附近战斗提示</title>
+<style>
+:root { --ink:#4b3824; --paper:#eadbb1; --gold:#c6a15c; }
+* { box-sizing:border-box; }
+html,body { margin:0; padding:0; overflow:hidden; background-color:transparent; color:var(--ink); font-family:inherit; }
+html { font-size:14px; }
+#hint-root { position:absolute; left:50%; transform:translateX(-50%); bottom:96px; padding:.5em .9em;
+    border:1px solid var(--gold); background-color:var(--paper); box-shadow:0 2px 6px #080a1070; white-space:nowrap; }
+#hint-root[data-state="hidden"] { display:none; }
+#hint-text { font-size:.928571em; }
+</style>
+</head><body>
+<div id="hint-root" data-state="hidden"><span id="hint-text">附近有正在进行的战斗，按 B 查看</span></div>
+</body></html>

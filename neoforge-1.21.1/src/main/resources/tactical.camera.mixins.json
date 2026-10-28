@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.tactical.neoforge.client.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "BattleCameraMixin",
+    "BattleCameraRenderMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

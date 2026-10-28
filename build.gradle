@@ -1,0 +1,15 @@
+plugins {
+    id 'base'
+}
+
+subprojects {
+    repositories {
+        mavenCentral()
+    }
+    // The module retains its own third-party NOTICE/license packaging.
+    plugins.withId('java') {
+        tasks.named('jar', Jar).configure {
+            from(rootProject.file('LICENSE')) { into 'META-INF' }
+        }
+    }
+}

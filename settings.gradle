@@ -1,0 +1,11 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        maven { url = 'https://maven.neoforged.net/releases' }
+    }
+}
+
+rootProject.name = 'tactical'
+
+include 'common'
+include 'neoforge-1.21.1'

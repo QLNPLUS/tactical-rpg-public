@@ -1,0 +1,27 @@
+.gradle/
+build/
+out/
+run/
+run-*/
+.idea/
+*.iml
+*.ipr
+*.iws
+.acl-recovery/
+reference/
+dist/
+__pycache__/
+*.pyc
+logs/
+
+runclient.log
+
+*.log
+launch_client.cmd
+
+# Local-only native/decompiler dumps and raw acceptance telemetry
+/aui-client-native.txt
+/doc.txt
+/viewport-native.txt
+/viewport-state.txt
+/evidence/

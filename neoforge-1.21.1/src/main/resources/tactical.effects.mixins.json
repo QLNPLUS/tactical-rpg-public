@@ -1,0 +1,9 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.tactical.neoforge.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": ["BattleMobEffectInstanceMixin", "BattleLivingEntityEffectsAccess", "BattleFoodDataMixin", "BattleEntityBurningMixin"],
+  "client": ["ClientBattleMobEffectInstanceMixin"],
+  "injectors": { "defaultRequire": 1 }
+}

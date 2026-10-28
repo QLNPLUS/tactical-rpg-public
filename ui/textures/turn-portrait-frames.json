@@ -1,0 +1,185 @@
+{
+  "schema": "tactical.turn-portrait-frames.v1",
+  "source": {
+    "file_name": "ig_01740d7b9696ade7016adda24a08b487d080ff1bcd595acb2a.png",
+    "sha256": "528b50b2ed4bad4de226cdc8db42cf1662619c16122c8dd19cfb0307a7d6df49",
+    "size_px": [
+      2172,
+      724
+    ],
+    "crop_box_px_half_open": [
+      128,
+      273,
+      289,
+      455
+    ],
+    "source_x_cuts_px": [
+      128,
+      148,
+      270,
+      289
+    ],
+    "source_y_cuts_px": [
+      273,
+      292,
+      436,
+      455
+    ]
+  },
+  "output": {
+    "size_px": [
+      144,
+      168
+    ],
+    "logical_size_px": [
+      36,
+      42
+    ],
+    "pixel_density": 4,
+    "target_x_cuts_px": [
+      2,
+      20,
+      124,
+      142
+    ],
+    "target_y_cuts_px": [
+      2,
+      20,
+      148,
+      166
+    ],
+    "opening_box_px_half_open": [
+      20,
+      20,
+      124,
+      148
+    ],
+    "opening_box_logical_px_half_open": [
+      5,
+      5,
+      31,
+      37
+    ],
+    "opening_margins_px": {
+      "left": 20,
+      "top": 20,
+      "right": 20,
+      "bottom": 20
+    },
+    "opening_margins_logical_px": {
+      "left": 5,
+      "top": 5,
+      "right": 5,
+      "bottom": 5
+    },
+    "outer_clear_safe_margin_px": 2,
+    "effective_midline_metal_thickness_px": 18,
+    "effective_midline_metal_thickness_logical_px": 4.5,
+    "outer_miter_polygon_px": [
+      [
+        2,
+        4
+      ],
+      [
+        4,
+        2
+      ],
+      [
+        140,
+        2
+      ],
+      [
+        142,
+        4
+      ],
+      [
+        142,
+        164
+      ],
+      [
+        140,
+        166
+      ],
+      [
+        4,
+        166
+      ],
+      [
+        2,
+        164
+      ]
+    ]
+  },
+  "processing": [
+    "Read-only source; crop the left metallic portrait frame, not the HUD strip.",
+    "Eight-tile nine-slice LANCZOS resampling retains real double-bevel gold, dark groove, and diagonal miter texture.",
+    "The centre source tile is never read into an output texture; no portrait, lettering, or backdrop is baked in.",
+    "One 4x-supersampled clipped-corner outer mask is reused for all states; the exact rectangular opening and outer safe margins are forced alpha=0.",
+    "Alpha-zero RGB is zeroed; state differences are restrained warm RGB exposure adjustments only, with no added glow.",
+    "Deterministic pixel and PNG encoding settings; no timestamps or absolute local source path in the manifest."
+  ],
+  "generator": "tools/generate_turn_portrait_frames.py",
+  "pillow_version": "13.0.0",
+  "outputs": [
+    {
+      "file": "turn-portrait-frame.png",
+      "sha256": "1a55e7f31d8eed087fe66cd5c6af2a4643d072cfd4b7fd751602de28ad4424e1",
+      "rgb_gain": 1.0,
+      "rgb_lift": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "file": "turn-portrait-frame-current.png",
+      "sha256": "971dbee5de741caf935d16d409d5d248782a391a0b5d8e8fecdff6c4440b1dcc",
+      "rgb_gain": 1.07,
+      "rgb_lift": [
+        2,
+        1,
+        0
+      ]
+    },
+    {
+      "file": "turn-portrait-frame-hover.png",
+      "sha256": "7b7c3ff6a7bd8ce9a47e649beef24de4488de68ed121a79ec0c78b9ff0474c42",
+      "rgb_gain": 1.13,
+      "rgb_lift": [
+        3,
+        2,
+        0
+      ]
+    },
+    {
+      "file": "turn-portrait-frame-current-hover.png",
+      "sha256": "ff3765d938f053fb0d56b69ac4f9b07cb4eb787f36d4572a41e1c7aff15745ad",
+      "rgb_gain": 1.19,
+      "rgb_lift": [
+        4,
+        3,
+        1
+      ]
+    }
+  ],
+  "verification": {
+    "passed": true,
+    "assertions": [
+      "RGBA 144x168",
+      "identical alpha across all four states",
+      "fully transparent opening; no centre portrait RGB",
+      "2px fully clear exterior safe margin",
+      "opaque metal midlines; not an opaque rectangular scene",
+      "all alpha-zero pixels have RGB zero"
+    ],
+    "measured_opening_box_px_half_open": [
+      20,
+      20,
+      124,
+      148
+    ],
+    "nonzero_alpha_pixels": 9645,
+    "total_pixels": 24192,
+    "shared_alpha_sha256": "34ea99b3dbb0bc9887e29c1a7f21bf5d7435568728d24d813e04eef7352dbddc"
+  }
+}

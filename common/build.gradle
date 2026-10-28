@@ -1,0 +1,21 @@
+plugins {
+    id 'java-library'
+}
+
+version = project.mod_version
+group = project.mod_group_id
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+    withSourcesJar()
+}
+
+dependencies {
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
