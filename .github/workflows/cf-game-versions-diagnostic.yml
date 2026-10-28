@@ -1,0 +1,203 @@
+# Manual, read-only CurseForge game-versions diagnostic.
+#
+# Purpose (Terra's minimal scheme): explain why the release preflight finds "not exactly one
+# valid id" for the Minecraft version name `1.21.1`. It performs ONE read-only GET against the
+# fixed CurseForge game-versions endpoint and prints only aggregate counts plus a whitelisted,
+# schema-checked view of the entries named `1.21.1` / `NeoForge`. It never uploads, never writes
+# anything external, and never triggers on push/pull_request/tag.
+#
+# Deliberate constraints:
+#   * workflow_dispatch only; no inputs at all (no user-supplied URL, tag, code or payload).
+#   * permissions: contents: read.
+#   * runs in the `release` environment so the secret is only reachable there.
+#   * CURSEFORGE_TOKEN is mapped to env of the single diagnostic step only. The script never
+#     prints the token, request headers, response bodies or exception texts.
+#   * the token must be visible ASCII (same rule as tools/release_pipeline.py), checked *before*
+#     the request so an illegal secret can never reach urllib's header validation.
+#   * one GET, no redirects followed, environment proxies explicitly disabled, hard timeout, hard
+#     response-size cap.
+#   * output is limited to: HTTP status, totals, name-only and valid-id match counts, and for
+#     matched entries only the numeric id / gameVersionTypeID / the wanted name, plus a yes/no
+#     comparison of the entry's slug against a fixed expected slug per name. **No server-provided
+#     slug value is ever printed.** Anything unexpected is reported as "field name + type" with
+#     no raw value.
+#   * verdicts use the same criterion as the release preflight: an entry counts only when its
+#     `id` is a positive integer, so "name found but no usable id" reads as `missing`, not
+#     `unique`. Rows that are not JSON objects are reported as unusable for the production
+#     preflight instead of being silently skipped.
+#   * exit code 0 = the query itself succeeded (whatever the counts are); exit 1 = the query
+#     could not be completed safely.
+#
+# NOT part of the public source tree: this file lives in the audit directory and is intended to be
+# committed by the release session (suggested path .github/workflows/cf-game-versions-diagnostic.yml)
+# and dispatched manually.
+
+name: CF game versions diagnostic (manual, read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 5
+    steps:
+      - name: Query CurseForge game versions once (no upload, no redirects)
+        env:
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          URL = 'https://minecraft.curseforge.com/api/game/versions'
+          TIMEOUT_SECONDS = 30
+          MAX_BYTES = 2 * 1024 * 1024
+          # Fixed expected slug per wanted name. The server value is only compared against this
+          # whitelist and is never printed.
+          WANTED = (('1.21.1', '1_21_1', '1.21.1'), ('NeoForge', 'neoforge', 'neoforge'))
+          TOKEN_RE = re.compile(r'[!-~]+')
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def report(kind):
+              # Fixed error type only: never the value, never a nested exception text.
+              print('RESULT=ERROR')
+              print('error_type=' + kind)
+              sys.exit(1)
+
+
+          def positive_int(value):
+              return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+          token = (os.environ.get('CURSEFORGE_API_TOKEN') or '').strip()
+          if not token:
+              report('missing_token')
+          if TOKEN_RE.fullmatch(token) is None:
+              report('invalid_token')
+
+          # ProxyHandler({}) disables any proxy inherited from the runner environment, so the
+          # request cannot be redirected through an unexpected endpoint.
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+
+          try:
+              request = urllib.request.Request(
+                  URL,
+                  headers={'X-Api-Token': token, 'Accept': 'application/json'},
+                  method='GET',
+              )
+          except ValueError:
+              report('request_error')
+
+          try:
+              with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
+                  status = int(getattr(response, 'status', 0) or 0)
+                  body = response.read(MAX_BYTES + 1)
+          except urllib.error.HTTPError as error:
+              print('RESULT=ERROR')
+              print('error_type=http_error')
+              print('http_status=' + str(int(getattr(error, 'code', 0) or 0)))
+              sys.exit(1)
+          except urllib.error.URLError:
+              report('network_error')
+          except ValueError:
+              report('request_error')
+          except OSError:
+              report('network_error')
+          except Exception:
+              report('unexpected_error')
+
+          if len(body) > MAX_BYTES:
+              print('RESULT=ERROR')
+              print('error_type=response_too_large')
+              print('max_bytes=' + str(MAX_BYTES))
+              sys.exit(1)
+
+          try:
+              payload = json.loads(body.decode('utf-8'))
+          except UnicodeDecodeError:
+              report('decode_error')
+          except ValueError:
+              report('not_json')
+
+          if not isinstance(payload, list):
+              print('RESULT=ERROR')
+              print('error_type=unexpected_top_level_type')
+              print('top_level_type=' + type(payload).__name__)
+              sys.exit(1)
+
+          objects = [item for item in payload if isinstance(item, dict)]
+          non_object_types = sorted({type(item).__name__ for item in payload if not isinstance(item, dict)})
+
+          print('RESULT=OK')
+          print('http_status=' + str(status))
+          print('total_entries=' + str(len(payload)))
+          print('object_entries=' + str(len(objects)))
+          print('non_object_entries=' + str(len(payload) - len(objects)))
+          if non_object_types:
+              print('non_object_types=' + ','.join(non_object_types))
+          if len(objects) != len(payload):
+              # The production preflight walks the list as entries; a row that is not an object
+              # cannot supply a usable version id, so these rows are rejected there as well.
+              print('non_object_impact=production_preflight_rejects_non_object_rows')
+          print('verdict_basis=valid_positive_integer_id')
+
+          for wanted, label, expected_slug in WANTED:
+              named = [item for item in objects if item.get('name') == wanted]
+              usable = [item for item in named if positive_int(item.get('id'))]
+              print('name_only_matches_' + label + '=' + str(len(named)))
+              print('valid_id_matches_' + label + '=' + str(len(usable)))
+              print('unique_valid_id_' + label + '=' + ('yes' if len(usable) == 1 else 'no'))
+              for index, item in enumerate(named):
+                  version_id = item.get('id')
+                  type_id = item.get('gameVersionTypeID')
+                  slug = item.get('slug')
+                  prefix = 'match_' + label + '_' + str(index)
+
+                  if positive_int(version_id):
+                      print(prefix + ' id=' + str(version_id))
+                  else:
+                      print(prefix + ' id_field=invalid value_type=' + type(version_id).__name__)
+
+                  if type_id is None:
+                      print(prefix + ' gameVersionTypeID=null')
+                  elif positive_int(type_id):
+                      print(prefix + ' gameVersionTypeID=' + str(type_id))
+                  else:
+                      print(prefix + ' gameVersionTypeID_field=invalid value_type=' + type(type_id).__name__)
+
+                  print(prefix + ' name=' + wanted)
+
+                  if isinstance(slug, str):
+                      print(prefix + ' slug_matches_expected=' +
+                            ('yes' if slug == expected_slug else 'no'))
+                  else:
+                      print(prefix + ' slug_field=invalid value_type=' + type(slug).__name__)
+
+          verdicts = []
+          for wanted, _label, _slug in WANTED:
+              count = sum(1 for item in objects
+                          if item.get('name') == wanted and positive_int(item.get('id')))
+              if count == 1:
+                  verdicts.append('unique')
+              elif count == 0:
+                  verdicts.append('missing')
+              else:
+                  verdicts.append('duplicate')
+          print('verdict=' + ','.join(verdicts))
+          PY
