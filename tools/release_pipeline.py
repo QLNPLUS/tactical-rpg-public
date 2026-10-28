@@ -226,7 +226,13 @@ def release_notes(text, version):
     return body + '\n'
 
 
-REQUIRED_VERSION_NAMES = ('1.21.1', 'NeoForge')
+# Names sent in `gameVersionNames` with every upload: the Minecraft version, the loader and the
+# environment tags. The environment tags are not decoration — every 1.21.1 NeoForge file that the
+# CurseForge web UI produced for this game carries `Client` (and `Server` when the mod is installed
+# on both sides), and the official upload documentation mixes the environment tags into its
+# `gameVersionNames` example too. The v0.23.1 upload sent only the version and the loader and the
+# server answered HTTP 400, so the tags are part of the accepted metadata.
+REQUIRED_VERSION_NAMES = ('1.21.1', 'NeoForge', 'Client', 'Server')
 
 
 def cf_metadata(env, changelog, release_type='beta', opener=safe_opener, report=None):
@@ -245,15 +251,12 @@ def cf_metadata(env, changelog, release_type='beta', opener=safe_opener, report=
         return [item['id'] for item in versions
                 if item.get('name') == name and type(item.get('id')) is int and item['id'] > 0]
 
-    for name in REQUIRED_VERSION_NAMES:
-        if not usable_ids(name):
-            raise ValueError(f'CurseForge version name {name} has no usable positive id; refusing to upload')
+    missing = [name for name in REQUIRED_VERSION_NAMES if not usable_ids(name)]
+    if missing:
+        raise ValueError('CurseForge version names absent from the catalog: ' + ', '.join(missing) +
+                         '; refusing to upload')
     if report is not None:
-        # Observation only: the catalog is probed for the environment tags some CurseForge setups
-        # expect, but nothing is added to the upload unless that is verified and decided separately.
-        present = [name for name in ('Client', 'Server') if usable_ids(name)]
         report.append('upload_game_version_names=' + ','.join(REQUIRED_VERSION_NAMES))
-        report.append('optional_environment_tags_present=' + (','.join(present) if present else 'none'))
     return project, token, {'changelog': changelog, 'changelogType': 'markdown',
                             'gameVersionNames': list(REQUIRED_VERSION_NAMES), 'releaseType': release_type,
                             'relations': {'projects': relations}}

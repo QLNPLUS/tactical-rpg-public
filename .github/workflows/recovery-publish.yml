@@ -1,0 +1,156 @@
+# Manual recovery publish for the already-built 0.23.1 release: at most ONE CurseForge POST.
+#
+# Why this exists: the tag run `40661691067` (tag `v0.23.1-neoforge-1.21.1`, commit `c6ecbe3`) built
+# and verified the release artifact, then its CurseForge upload was rejected with `HTTP 400`. The
+# response body was never recorded, so the *cause is unknown* and no automated retry is allowed. A
+# human then checked the CurseForge author dashboard (all statuses, including pending/processing) and
+# confirmed that no 0.23.1 file exists. This workflow performs the single permitted recovery attempt.
+#
+# Deliberate constraints:
+#   * workflow_dispatch only with **no inputs**: tag, source run, commit and JAR SHA-256 are constants,
+#     so a dispatch cannot be pointed at a different product or a different tag.
+#   * nothing is rebuilt. The product is the `verified-release` artifact of run `40661691067`, pinned
+#     by commit and by the exact JAR SHA-256 in `tools/cf_recovery.py`.
+#   * `contents: write` is only needed for the GitHub release, `actions: read` only to download that
+#     artifact and to look for earlier recovery intents. The release environment holds the secret.
+#   * the existing tag is never moved, the original `cf-upload-intent-…` artifact is never touched, and
+#     no file in the repository is modified by this workflow.
+#   * order is: identity guards → product pin → no earlier recovery intent → no existing GitHub
+#     release → catalog/configuration preflight (GET only) → persist the recovery intent → exactly one
+#     POST → GitHub release. Any failure before the POST ends the run without uploading; a failure at
+#     the POST leaves the CurseForge state **unknown** and nothing else is attempted.
+#   * the control code (`tools/cf_recovery.py`) prints only whitelisted `key=value` lines: no token,
+#     no request bytes, no response body, no exception text.
+#
+# Suggested commit for the release session: this file plus `tools/cf_recovery.py` and
+# `tools/test_cf_recovery.py`, committed together and pushed before the single dispatch.
+
+name: Recovery publish v0.23.1 (manual, one CurseForge POST)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: cf-recovery-v0.23.1
+  cancel-in-progress: false
+
+jobs:
+  recovery:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: v0.23.1-neoforge-1.21.1
+      SOURCE_RUN_ID: '40661691067'
+      EXPECTED_COMMIT: c6ecbe3bead2309baeed2ad2e58728d40e3c0dd8
+      EXPECTED_JAR_SHA256: df18bfae641aa20db61e2ac558c847a2bead45557df2c3acd2fb157e92bac141
+      RECOVERY_INTENT_NAME: cf-recovery-intent-v0.23.1-neoforge-1.21.1
+      RELEASE_TYPE: beta
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Guard the release identity (existing tag must still point at the verified commit)
+        shell: bash
+        run: |
+          set -euo pipefail
+          as_commit() {
+            # Resolve a tag object to its commit when the tag is annotated.
+            sha=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.sha)
+            type=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.type)
+            if [ "$type" = "tag" ]; then
+              sha=$(gh api "repos/$GH_REPO/git/tags/$sha" --jq .object.sha)
+            fi
+            printf '%s' "$sha"
+          }
+          sha=$(as_commit)
+          echo "release_tag=$RELEASE_TAG"
+          echo "tag_commit=$sha"
+          test "$sha" = "$EXPECTED_COMMIT"
+          echo "tag_identity_matches=yes"
+
+      - name: Download the previously verified product artifact (no rebuild)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build/release
+          gh run download "$SOURCE_RUN_ID" -R "$GH_REPO" -n verified-release -D build/release
+          ls -l build/release
+
+      - name: Verify the product pin (JAR SHA-256, manifest, exactly three files)
+        run: python tools/cf_recovery.py verify-product
+
+      - name: Refuse a second recovery attempt
+        run: python tools/cf_recovery.py check-intent
+
+      - name: Refuse a duplicate GitHub release
+        run: python tools/cf_recovery.py check-release
+
+      - name: CurseForge catalog and configuration preflight (GET only, no upload)
+        env:
+          CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          CURSEFORGE_APRICITYUI_SLUG: ${{ vars.CURSEFORGE_APRICITYUI_SLUG }}
+          CURSEFORGE_APRICITYUI_PROJECT_ID: ${{ vars.CURSEFORGE_APRICITYUI_PROJECT_ID }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID }}
+        run: python tools/cf_recovery.py preflight
+
+      - name: Record the recovery intent before the POST
+        env:
+          CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+        run: python tools/cf_recovery.py record-intent
+
+      - name: Persist the recovery intent (blocks any later attempt)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ env.RECOVERY_INTENT_NAME }}
+          path: ${{ runner.temp }}/cf-recovery-intent.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload the verified JAR to CurseForge exactly once
+        env:
+          CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          CURSEFORGE_APRICITYUI_SLUG: ${{ vars.CURSEFORGE_APRICITYUI_SLUG }}
+          CURSEFORGE_APRICITYUI_PROJECT_ID: ${{ vars.CURSEFORGE_APRICITYUI_PROJECT_ID }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID }}
+        run: python tools/cf_recovery.py upload
+
+      - name: Extract current release notes for GitHub
+        run: python tools/release_pipeline.py release-notes --tag "$RELEASE_TAG" --output "$RUNNER_TEMP/release-notes.md"
+
+      - name: Create the GitHub release from the same verified artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The CurseForge step already succeeded (this step only runs then), so the local product is
+          # still the pinned artifact. Refuse loudly instead of publishing something else.
+          python tools/cf_recovery.py verify-product
+          flags=()
+          if [ "$RELEASE_TYPE" != release ]; then flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" --verify-tag \
+            --title "Tactical RPG 0.23.1 — NeoForge 1.21.1" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" "${flags[@]}" \
+            build/release/tactical-neoforge-1.21.1-0.23.1.jar \
+            build/release/SHA256SUMS build/release/release-manifest.json
+          printf '%s\n' 'Recovery publish: one CurseForge POST + GitHub release from the pinned artifact.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Note that CurseForge publication stays subject to moderation
+        shell: bash
+        run: |
+          printf '%s\n' 'A CurseForge file may stay "under review" and be invisible in public listings for minutes; do not upload a second time.' >> "$GITHUB_STEP_SUMMARY"

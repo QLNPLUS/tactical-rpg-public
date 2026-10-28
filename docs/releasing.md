@@ -71,10 +71,30 @@ CurseForge 上传 metadata 的 `changelog` 由 `tools/release_pipeline.py releas
 
 ## CF 上传元数据与防重复
 
-- **版本字段**：metadata 使用官方支持的 `gameVersionNames: ["1.21.1", "NeoForge"]`，**不发送 `gameVersions` 数字 ID**。原因是 CurseForge 目录里 `1.21.1` 存在多条同名行（2026-10-28 只读诊断读到 `(11779,77784)`、`(12735,1)`、`(16115,615)`，`NeoForge` 为 `(10150,68441)`），旧的“恰好一个 ID”判断会把合法的重复目录行当成错误——0.23.0 的 tag 预检就是这样失败的。
-- **保留的只读预检**：上传前仍 `GET /api/game/versions`，只要求两个名称**各至少一条正整数 id**，不选 ID、不因重复判错；名称缺失、id 无效、响应异常一律 fail closed。预检额外打印 `upload_game_version_names=1.21.1,NeoForge` 与 `optional_environment_tags_present=…`（对 `Client` / `Server` 这类环境标签**只做观察**；未核实前不写入名称数组）。
+- **版本字段**：metadata 使用官方支持的 `gameVersionNames`，取值固定为 `["1.21.1", "NeoForge", "Client", "Server"]`，**不发送 `gameVersions` 数字 ID**。原因有两条：一是 CurseForge 目录里 `1.21.1` 存在多条同名行（2026-10-28 只读诊断读到 `(11779,77784)`、`(12735,1)`、`(16115,615)`，`NeoForge` 为 `(10150,68441)`），旧的“恰好一个 ID”判断会把合法的重复目录行当成错误（0.23.0 的 tag 预检就是这样失败的）；二是 `v0.23.1-neoforge-1.21.1` 那次 tag 运行只发 `["1.21.1", "NeoForge"]`，服务器回答 **HTTP 400**，且报文体没有记录，所以成因**仍未证实**。当前做法（四个名称）是**假设性修复**，不是已证实的要求：依据只是官方文档把 `gameVersionNames` 视为可选、其示例写成“环境标签 + 版本名”的混合（`["Client", "Server", "26.1.2"]`），以及 CurseForge 网页 UI 产出的同类 1.21.1 + NeoForge 文件**都带 `Client`**（两侧都装的模组还带 `Server`，例如 ApricityUI 的 `Client,1.21.1,NeoForge,Server`）；本模组战斗逻辑跑在服务端且要求双端同版本，故四个名称一起发。官方文档**从未**声明环境标签是必需项，因此如果这次仍然 400，下一步应改用数字 `gameVersions`，并用 `gameVersionTypeID` 区分三条同名 `1.21.1` 目录行（广泛使用的上传实现正是这种做法：只用目录 id、从不发送 `gameVersionNames`）。
+- **已核对的接口边界**：官方 Upload API 只公开 `GET /api/game/dependencies`、`GET /api/game/versions`、`POST .../upload-file`、`POST .../update-file`、Maven 与本地化导入/导出，**没有**“列出本人项目文件/审核中文件”的 GET。因此“CF 上是否已有同名文件”在自动化侧只能记为 **unknown**（公开列表受 Cloudflare 与审核态影响，镜像也会滞后），不允许当作 absent 上报。
+- **保留的只读预检**：上传前仍 `GET /api/game/versions`，只要求这四个名称**各至少一条正整数 id**，不选 ID、不因重复判错；任一名称缺失、id 无效、响应异常一律 fail closed（缺 `Client` / `Server` 也拒绝上传，避免再发出不完整的版本数组）。预检打印 `upload_game_version_names=1.21.1,NeoForge,Client,Server`。
 - **跨运行防重复**：POST 之前先把上传意图（tag、commit、project id、JAR SHA-256，**不含 token**）写成 artifact `cf-upload-intent-<tag>`（保留 90 天）；同一 tag 的后续自动运行若查到未过期的旧意图即 **fail closed**，不自动重试。这次门只覆盖 artifact 保留期，之外仍需人工判断。
 - **结果未知的处置**：POST 之后若超时或连接中断，CurseForge 侧状态属于**未知**——文件可能已被接收、也可能仍在审核。此时**必须先到 CF 项目页人工确认**，再决定是否手工处理；脚本与工作流都**不做自动重试**，也不覆盖远端已有文件。成功路径只以 CF 返回的正整数 file ID 为准。
+
+## 恢复发布（仅 0.23.1 一次；`recovery-publish.yml`）
+
+`v0.23.1-neoforge-1.21.1` 的正常 tag 发布在 CurseForge 上传步骤失败（HTTP 400，报文体未记录，成因未知），
+GitHub Release 也因此没有创建。用户随后在 CurseForge 作者后台（含 pending/processing）确认**不存在** 0.23.1 文件，
+于是允许一次人工恢复发布。
+
+- **触发**：仅 `workflow_dispatch`，**没有任何输入**；tag、来源 run（`40661691067`）、commit（`c6ecbe3…`）、
+  JAR SHA-256（`df18bfae…`）与 recovery intent 名称都是常量，dispatch 无法指向别的产品或别的 tag。
+- **产品来源**：只下载那次运行已核验的 `verified-release` 产物，**不重建**；`tools/cf_recovery.py verify-product`
+  校验三件套、manifest 的 tag/commit、以及 JAR SHA-256 与常量完全一致。
+- **顺序**：tag 身份 → 下载产物 → 产物 pin → 无同名 recovery intent → 无同名 GitHub Release →
+  目录/配置预检（GET）→ 记录 recovery intent 并先上传为 artifact → **只发一次** POST → 建 GitHub Release。
+- **不重试**：任何 HTTP 错误、超时、传输错误、无法解析的响应或没有正整数 file id，都只报一个白名单分类
+  （`http_400` / `http_5xx` / `network_error` / `no_file_id` …）并声明 `curseforge_outcome=unknown` 与
+  `retry_policy=forbidden_second_upload`；脚本不重试、不打印 token、请求体或响应正文。
+- **不动历史**：不改动既有 tag、不删除原 `cf-upload-intent-…` 证据、不做任何 Git 写操作。
+- **人工前置**：本流程仍要求打 dispatch 的人在 CurseForge 后台确认“当前没有任何 0.23.1 文件（含审核中）”，
+  因为 400 之后 CF 侧状态客观上属于未知；用户本次已确认过一次，该确认**不覆盖**之后的任何新 POST。
 
 ## CF API 契约与失败行为
 

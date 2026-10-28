@@ -78,7 +78,8 @@ class Fixture(unittest.TestCase):
 
     def opener(self, request, timeout):
         self.requests.append(request)
-        data = [{'id': 1, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'}]
+        data = [{'id': 1, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'},
+                {'id': 3, 'name': 'Client'}, {'id': 4, 'name': 'Server'}]
         if request.get_method() == 'POST':
             data = {'id': 999}
         return io.BytesIO(json.dumps(data).encode())
@@ -347,7 +348,8 @@ class CurseForgeTests(Fixture):
         project, token, metadata = release.cf_metadata(self.env, 'notes', opener=self.opener)
         self.assertEqual(project, '123')
         # Official field, no numeric ids chosen from the (possibly duplicated) catalog.
-        self.assertEqual(metadata['gameVersionNames'], ['1.21.1', 'NeoForge'])
+        self.assertEqual(metadata['gameVersionNames'],
+                         ['1.21.1', 'NeoForge', 'Client', 'Server'])
         self.assertNotIn('gameVersions', metadata)
         self.assertEqual([p['type'] for p in metadata['relations']['projects']],
                          ['requiredDependency', 'optionalDependency'])
@@ -358,13 +360,16 @@ class CurseForgeTests(Fixture):
     def test_duplicate_catalog_rows_are_accepted(self):
         # Real CurseForge catalog: three entries named 1.21.1, one named NeoForge.
         catalog = [{'id': 11779, 'name': '1.21.1'}, {'id': 12735, 'name': '1.21.1'},
-                   {'id': 16115, 'name': '1.21.1'}, {'id': 10150, 'name': 'NeoForge'}]
+                   {'id': 16115, 'name': '1.21.1'}, {'id': 10150, 'name': 'NeoForge'},
+                   {'id': 999, 'name': 'Client'}, {'id': 998, 'name': 'Server'}]
         opener = lambda *args, **kwargs: io.BytesIO(json.dumps(catalog).encode())  # noqa: E731
         _, _, metadata = release.cf_metadata(self.env, 'notes', opener=opener)
-        self.assertEqual(metadata['gameVersionNames'], ['1.21.1', 'NeoForge'])
+        self.assertEqual(metadata['gameVersionNames'],
+                         ['1.21.1', 'NeoForge', 'Client', 'Server'])
         self.assertNotIn('gameVersions', metadata)
         # Duplicates for NeoForge too: still accepted, still no id chosen.
-        catalog = [{'id': 1, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'}, {'id': 3, 'name': 'NeoForge'}]
+        catalog = [{'id': 1, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'}, {'id': 3, 'name': 'NeoForge'},
+                   {'id': 4, 'name': 'Client'}, {'id': 5, 'name': 'Server'}]
         _, _, metadata = release.cf_metadata(
             self.env, 'notes', opener=lambda *a, **kw: io.BytesIO(json.dumps(catalog).encode()))
         self.assertNotIn('gameVersions', metadata)
@@ -389,6 +394,17 @@ class CurseForgeTests(Fixture):
             with self.subTest(catalog=catalog), self.assertRaises(ValueError):
                 release.cf_metadata(self.env, '', opener=lambda *a, **kw: io.BytesIO(json.dumps(catalog).encode()))
 
+    def test_missing_environment_tag_fails_closed(self):
+        # The upload metadata carries the environment tags itself (v0.23.1 sent only the version
+        # and the loader and CurseForge answered HTTP 400), so a catalog without them must stop
+        # the release instead of silently publishing a file with an incomplete version list.
+        for absent in ('Client', 'Server'):
+            catalog = [{'id': 1, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'},
+                       {'id': 3, 'name': 'Client'}, {'id': 4, 'name': 'Server'}]
+            catalog = [item for item in catalog if item['name'] != absent]
+            with self.subTest(absent=absent), self.assertRaisesRegex(ValueError, absent):
+                release.cf_metadata(self.env, '', opener=lambda *a, **kw: io.BytesIO(json.dumps(catalog).encode()))
+
     def test_upload_payload_uses_names_and_keeps_relations(self):
         self.package()
         self.requests.clear()
@@ -398,7 +414,7 @@ class CurseForgeTests(Fixture):
         posts = [request for request in self.requests if request.get_method() == 'POST']
         self.assertEqual(len(posts), 1)
         payload = posts[0].data
-        self.assertIn(b'"gameVersionNames": ["1.21.1", "NeoForge"]', payload)
+        self.assertIn(b'"gameVersionNames": ["1.21.1", "NeoForge", "Client", "Server"]', payload)
         self.assertNotIn(b'gameVersions', payload)
         self.assertIn(b'"relations"', payload)
         self.assertIn(b'requiredDependency', payload)
@@ -501,12 +517,9 @@ class NotesUploadTests(Fixture):
             self.env, release.release_notes(changelog, '0.23.1'), opener=self.opener, report=report)
         self.assertIn('manual ApricityUI 1.2.8', metadata['changelog'])
         self.assertNotIn('history', metadata['changelog'])
-        self.assertEqual(metadata['gameVersionNames'], ['1.21.1', 'NeoForge'])
-        self.assertIn('upload_game_version_names=1.21.1,NeoForge', report)
-        self.assertTrue(any(line.startswith('optional_environment_tags_present=') for line in report))
-        # Probing the catalog must never add Client/Server to the uploaded names by itself.
-        self.assertNotIn('Client', metadata['gameVersionNames'])
-        self.assertNotIn('Server', metadata['gameVersionNames'])
+        self.assertEqual(metadata['gameVersionNames'],
+                         ['1.21.1', 'NeoForge', 'Client', 'Server'])
+        self.assertIn('upload_game_version_names=1.21.1,NeoForge,Client,Server', report)
 
 
 class BundlePurityTests(Fixture):
