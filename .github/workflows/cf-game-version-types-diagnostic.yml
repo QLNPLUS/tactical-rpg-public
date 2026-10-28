@@ -1,0 +1,215 @@
+# Manual, read-only CurseForge game-version *type* diagnostic (second, independent workflow).
+#
+# Follow-up to cf-game-versions-diagnostic.yml. The first diagnostic returned these entries for the
+# version name `1.21.1`: (id 11779, gameVersionTypeID 77784), (12735, 1), (16115, 615), and for
+# `NeoForge`: (10150, 68441). The release preflight also needs to know what those type IDs *mean*.
+# CurseForge's documented Upload API exposes GET /api/game/dependencies returning id/name/slug.
+#
+# This workflow performs ONE read-only GET against that fixed endpoint and prints, only for the four
+# interesting type ids {1, 615, 68441, 77784}, the numeric id plus — only when the returned name or
+# slug is an exact member of a small fixed whitelist — that value. Anything else is reported as a
+# class (`unknown`) and the raw text is never printed.
+#
+# Deliberate constraints (identical security shape to the reviewed first diagnostic):
+#   * workflow_dispatch only; no inputs at all (no user-supplied URL, tag, id or payload).
+#   * permissions: contents: read.
+#   * runs in the `release` environment so the secret is only reachable there.
+#   * CURSEFORGE_TOKEN is mapped to env of the single diagnostic step only; the script never prints
+#     the token, request headers, response bodies or exception texts.
+#   * the token must be visible ASCII (same rule as tools/release_pipeline.py), checked *before* the
+#     request so an illegal secret can never reach urllib's header validation.
+#   * one GET, no redirects followed, environment proxies explicitly disabled, hard timeout, hard
+#     response-size cap, and only this one absolute URL in the file.
+#   * response text is never echoed: ids are validated as positive integers, name/slug only as
+#     exact matches against fixed whitelists, everything else collapses to a type or a class name.
+#   * rows that are not JSON objects, entries with unusable ids and entries missing id/name/slug
+#     are reported explicitly, so the shape of THIS response is visible. The release preflight does
+#     not read /api/game/dependencies at all (it only calls /api/game/versions), so no statement here
+#     claims what that preflight would do with this payload.
+#   * exit code 0 = the query itself succeeded (whatever the counts are); exit 1 = the query could
+#     not be completed safely.
+#
+# NOT part of the public source tree: this file lives in the audit directory and is intended to be
+# committed by the release session (suggested path .github/workflows/cf-game-version-types-diagnostic.yml)
+# and dispatched manually.
+
+name: CF game version types diagnostic (manual, read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 5
+    steps:
+      - name: Query CurseForge game version types once (no upload, no redirects)
+        env:
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          URL = 'https://minecraft.curseforge.com/api/game/dependencies'
+          TIMEOUT_SECONDS = 30
+          MAX_BYTES = 2 * 1024 * 1024
+          # Type ids reported by the first diagnostic for the version names 1.21.1 / NeoForge.
+          TARGET_IDS = (1, 615, 68441, 77784)
+          # Accepted exact values. Anything else is reported as a class, never echoed.
+          ALLOWED_NAMES = ('Minecraft', 'Java', 'Bedrock', 'NeoForge', 'Forge', 'Fabric', 'Quilt')
+          ALLOWED_SLUGS = ('minecraft', 'java', 'bedrock', 'neoforge', 'forge', 'fabric', 'quilt')
+          TOKEN_RE = re.compile(r'[!-~]+')
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def report(kind):
+              # Fixed error type only: never the value, never a nested exception text.
+              print('RESULT=ERROR')
+              print('error_type=' + kind)
+              sys.exit(1)
+
+
+          def positive_int(value):
+              return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+          def limited(field, value, allowed):
+              # Exact whitelist match only; the raw value is never printed.
+              if not isinstance(value, str):
+                  print(field + '_field=invalid value_type=' + type(value).__name__)
+              elif value in allowed:
+                  print(field + '=' + value)
+              else:
+                  print(field + '_class=unknown')
+
+
+          token = (os.environ.get('CURSEFORGE_API_TOKEN') or '').strip()
+          if not token:
+              report('missing_token')
+          if TOKEN_RE.fullmatch(token) is None:
+              report('invalid_token')
+
+          # ProxyHandler({}) disables any proxy inherited from the runner environment.
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+
+          try:
+              request = urllib.request.Request(
+                  URL,
+                  headers={'X-Api-Token': token, 'Accept': 'application/json'},
+                  method='GET',
+              )
+          except ValueError:
+              report('request_error')
+
+          try:
+              with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
+                  status = int(getattr(response, 'status', 0) or 0)
+                  body = response.read(MAX_BYTES + 1)
+          except urllib.error.HTTPError as error:
+              print('RESULT=ERROR')
+              print('error_type=http_error')
+              print('http_status=' + str(int(getattr(error, 'code', 0) or 0)))
+              sys.exit(1)
+          except urllib.error.URLError:
+              report('network_error')
+          except ValueError:
+              report('request_error')
+          except OSError:
+              report('network_error')
+          except Exception:
+              report('unexpected_error')
+
+          if len(body) > MAX_BYTES:
+              print('RESULT=ERROR')
+              print('error_type=response_too_large')
+              print('max_bytes=' + str(MAX_BYTES))
+              sys.exit(1)
+
+          try:
+              payload = json.loads(body.decode('utf-8'))
+          except UnicodeDecodeError:
+              report('decode_error')
+          except ValueError:
+              report('not_json')
+
+          if not isinstance(payload, list):
+              print('RESULT=ERROR')
+              print('error_type=unexpected_top_level_type')
+              print('top_level_type=' + type(payload).__name__)
+              sys.exit(1)
+
+          objects = [item for item in payload if isinstance(item, dict)]
+          non_object_types = sorted({type(item).__name__ for item in payload if not isinstance(item, dict)})
+
+          print('RESULT=OK')
+          print('http_status=' + str(status))
+          print('total_entries=' + str(len(payload)))
+          print('object_entries=' + str(len(objects)))
+          print('non_object_entries=' + str(len(payload) - len(objects)))
+          if non_object_types:
+              print('non_object_types=' + ','.join(non_object_types))
+          if len(objects) != len(payload):
+              # A row that is not an object cannot supply an id, name or slug to THIS diagnostic.
+              # The release preflight never reads this endpoint, so nothing is claimed about it.
+              print('non_object_impact=diagnostic_dependencies_response_has_non_object_rows')
+          print('target_ids=' + ','.join(str(value) for value in TARGET_IDS))
+          print('name_whitelist_size=' + str(len(ALLOWED_NAMES)))
+          print('slug_whitelist_size=' + str(len(ALLOWED_SLUGS)))
+
+          present = []
+          missing = []
+          duplicated = []
+          # Rows that carry an id which is not a positive integer cannot be matched to a target id
+          # by THIS diagnostic; report the count and the effect on this response only.
+          non_positive_id_rows = sum(1 for item in objects
+                                     if item.get('id') is not None and not positive_int(item.get('id')))
+          for target in TARGET_IDS:
+              matches = [item for item in objects if positive_int(item.get('id')) and item.get('id') == target]
+              print('id_' + str(target) + '_matches=' + str(len(matches)))
+              if not matches:
+                  missing.append(str(target))
+                  continue
+              present.append(str(target))
+              if len(matches) > 1:
+                  duplicated.append(str(target))
+              for index, item in enumerate(matches):
+                  prefix = 'id_' + str(target) + '_' + str(index)
+                  print(prefix + ' id=' + str(target))
+                  if 'name' not in item:
+                      print(prefix + ' name_field=missing')
+                  else:
+                      limited(prefix + ' name', item.get('name'), ALLOWED_NAMES)
+                  if 'slug' not in item:
+                      print(prefix + ' slug_field=missing')
+                  else:
+                      limited(prefix + ' slug', item.get('slug'), ALLOWED_SLUGS)
+
+          print('present_ids=' + (','.join(present) if present else 'none'))
+          print('missing_ids=' + (','.join(missing) if missing else 'none'))
+          print('duplicate_ids=' + (','.join(duplicated) if duplicated else 'none'))
+          if non_positive_id_rows:
+              print('non_positive_id_rows=' + str(non_positive_id_rows))
+              print('non_positive_id_impact=diagnostic_dependencies_response_row_has_unusable_id')
+
+          if duplicated:
+              print('verdict=duplicate')
+          elif missing:
+              print('verdict=partial')
+          else:
+              print('verdict=complete')
+          PY
