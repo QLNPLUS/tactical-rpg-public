@@ -1,0 +1,172 @@
+name: Build and explicit release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*-neoforge-1.21.1']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing exact tag: v<mod_version>-neoforge-1.21.1'
+        required: true
+        type: string
+      target:
+        description: 'Explicit publication target (github skips CurseForge)'
+        required: true
+        default: both
+        type: choice
+        options: [both, github]
+      release_type:
+        description: 'CurseForge release type'
+        required: true
+        default: beta
+        type: choice
+        options: [alpha, beta, release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Validate version, release ref and JDK before build
+        id: validate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_TARGET: ${{ github.event.inputs.target }}
+          INPUT_RELEASE_TYPE: ${{ github.event.inputs.release_type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            case "$INPUT_TARGET" in both|github) ;; *) exit 1 ;; esac
+            case "$INPUT_RELEASE_TYPE" in alpha|beta|release) ;; *) exit 1 ;; esac
+            test -n "$INPUT_TAG"
+          fi
+          args=(validate --java)
+          if [[ "$EVENT_NAME" == workflow_dispatch || "$REF_TYPE" == tag ]]; then
+            tag="${INPUT_TAG:-$REF_NAME}"
+            git check-ref-format "refs/tags/$tag"
+            test "$(git rev-parse "refs/tags/$tag^{commit}")" = "$(git rev-parse HEAD)"
+            args+=(--tag "$tag")
+          fi
+          python tools/release_pipeline.py "${args[@]}"
+      - name: Test release helpers (offline mocks only)
+        run: python -m unittest discover -s tools -p test_release_pipeline.py -v
+      - name: Verify journal theme
+        run: python tools/apply_journal_theme.py --check
+      - name: Build and test
+        run: bash ./gradlew :common:test :neoforge-1.21.1:build --no-daemon
+      - name: Check release package
+        run: python tools/check_release.py
+      - name: Create verified binary-only bundle
+        run: python tools/release_pipeline.py package
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-release
+          path: build/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    # A normal branch push / PR never receives publication credentials or writes externally.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'tag')
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.build.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-release
+          path: build/release
+      - name: Revalidate the exact artifact (never rebuild during publish)
+        env:
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        run: python tools/release_pipeline.py verify --tag "$RELEASE_TAG"
+      - name: Preflight CurseForge (missing settings block publication)
+        if: github.event_name != 'workflow_dispatch' || inputs.target == 'both'
+        env:
+          CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          CURSEFORGE_APRICITYUI_SLUG: ${{ vars.CURSEFORGE_APRICITYUI_SLUG }}
+          CURSEFORGE_APRICITYUI_PROJECT_ID: ${{ vars.CURSEFORGE_APRICITYUI_PROJECT_ID }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID }}
+          RELEASE_TYPE: ${{ inputs.release_type || 'beta' }}
+        run: python tools/release_pipeline.py curseforge-preflight --release-type "$RELEASE_TYPE"
+      - name: Refuse duplicate GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Query the complete release list; authentication/network errors fail closed.
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name' > "$RUNNER_TEMP/existing-release-tags"
+          python -c 'import os,pathlib; tags=pathlib.Path(os.environ["RUNNER_TEMP"],"existing-release-tags").read_text().splitlines(); assert os.environ["RELEASE_TAG"] not in tags, "Release already exists; inspect both services before retrying"'
+      - name: Upload same verified JAR to CurseForge
+        if: github.event_name != 'workflow_dispatch' || inputs.target == 'both'
+        env:
+          CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          CURSEFORGE_APRICITYUI_SLUG: ${{ vars.CURSEFORGE_APRICITYUI_SLUG }}
+          CURSEFORGE_APRICITYUI_PROJECT_ID: ${{ vars.CURSEFORGE_APRICITYUI_PROJECT_ID }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_TYPE: ${{ inputs.release_type || 'beta' }}
+        run: python tools/release_pipeline.py curseforge-upload --tag "$RELEASE_TAG" --release-type "$RELEASE_TYPE"
+      - name: Explicit GitHub-only notice
+        if: github.event_name == 'workflow_dispatch' && inputs.target == 'github'
+        run: |
+          printf '%s\n' 'CurseForge NOT enabled for this explicitly GitHub-only release.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Create GitHub release with verified binary and checksums only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          RELEASE_TYPE: ${{ inputs.release_type || 'beta' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/release_pipeline.py verify --tag "$RELEASE_TAG"
+          flags=()
+          if [[ "$RELEASE_TYPE" != release ]]; then flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" --verify-tag --title "Tactical RPG $VERSION — NeoForge 1.21.1" --notes-file CHANGELOG.md "${flags[@]}" \
+            "build/release/tactical-neoforge-1.21.1-$VERSION.jar" build/release/SHA256SUMS build/release/release-manifest.json
+          printf '%s\n' 'GitHub release created from the verified build artifact; no sources or runtime logs uploaded.' >> "$GITHUB_STEP_SUMMARY"

@@ -2,7 +2,7 @@
 
 ## 入口和产物
 
-**本公开源码快照不包含发布工作流，也没有启用任何自动发布。** 私有开发树中的 `.github/workflows/build-release.yml` 未随本快照导出；下列表格与流程描述的是该工作流的设计与边界，供后续启用时对照，不是本快照已具备的能力。脚本仅依赖 Python 3.11+ 标准库（CI 使用 3.12）；GitHub 写操作由工作流中的 `gh` 执行，CF 使用官方 Upload API。
+**工作流已包含在本仓库中：** `.github/workflows/build-release.yml`（原获批版本，逐字节恢复，未改动）。脚本仅依赖 Python 3.11+ 标准库（CI 使用 3.12）；GitHub 写操作由工作流中的 `gh` 执行，CF 使用官方 Upload API。**截至本记录（2026-10-28）**，该工作流尚未在公开仓实际运行过，也没有向 CurseForge 上传 Tactical 0.23.0。已存在的配置项只是名称层面的记录，**不能据此确认 token 有效、项目上传权限或上传就绪**。
 
 | 事件 | 构建 / 检查 | GitHub Release / CurseForge |
 | --- | --- | --- |
@@ -37,22 +37,35 @@ python tools/release_pipeline.py package
 
 在仓库 Settings → Secrets and variables → Actions 中配置；发布作业使用名为 **release** 的 GitHub Environment，建议为它设置审批人和允许发布的标签规则。可把 token 放进该 Environment 的 secrets；其他值可使用仓库 variables 或该 Environment 的 variables。
 
-| 类型 | 名称 | 要求 |
-| --- | --- | --- |
-| Variable | `CURSEFORGE_PROJECT_ID` | **自己的** Minecraft CF 项目数字 ID；需先实际创建并确认项目，不猜测 |
-| Secret | `CURSEFORGE_TOKEN` | 有该项目上传权限的 Upload API token；workflow 把它映射为作业内环境变量 `CURSEFORGE_API_TOKEN`（Python 侧变量名不变）。不得提交到源码、URL 或日志 |
-| Variable | `CURSEFORGE_APRICITYUI_SLUG` | 从真实 ApricityUI CF 项目确认的 slug |
-| Variable | `CURSEFORGE_APRICITYUI_PROJECT_ID` | 同一 ApricityUI 项目的数字 ID |
-| Variable | `CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG` | 从真实 Dungeons Perspective CF 项目确认的 slug |
-| Variable | `CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID` | 同一 Dungeons Perspective 项目的数字 ID |
-| 自动提供 | `GITHUB_TOKEN`（传给 gh 的 `GH_TOKEN`） | publish job 明确申请 `contents: write`；仓库/组织策略必须允许 |
-| 环境 / 策略 | `release` | Environment 可访问，审批和分支/标签规则允许本次发布 |
+| 类型 | 名称 | 要求 | 记录状态（名称层面） |
+| --- | --- | --- | --- |
+| Variable | `CURSEFORGE_PROJECT_ID` | 本项目的 Minecraft CF 数字 ID | 记录为 **`1766445`**（本次未上传 Tactical 0.23.0） |
+| Secret | `CURSEFORGE_TOKEN` | 有该项目上传权限的 Upload API token；workflow 把它映射为作业内环境变量 `CURSEFORGE_API_TOKEN`（Python 侧变量名不变）。不得提交到源码、URL 或日志 | **名称已配置**（值不入库、不写入文档、未被读取；**不能据此确认有效性与项目权限**） |
+| Variable | `CURSEFORGE_APRICITYUI_SLUG` | 从真实 ApricityUI CF 项目确认的 slug | 已核对并配置（值存于仓库 variables） |
+| Variable | `CURSEFORGE_APRICITYUI_PROJECT_ID` | 同一 ApricityUI 项目的数字 ID | 已核对并配置（值存于仓库 variables） |
+| Variable | `CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG` | 从真实 Dungeons Perspective CF 项目确认的 slug | 已核对并配置（值存于仓库 variables） |
+| Variable | `CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID` | 同一 Dungeons Perspective 项目的数字 ID | 已核对并配置（值存于仓库 variables） |
+| 自动提供 | `GITHUB_TOKEN`（传给 gh 的 `GH_TOKEN`） | publish job 明确申请 `contents: write`；仓库/组织策略必须允许 | 由 GitHub 提供 |
+| 环境 / 策略 | `release` | Environment 可访问，审批和分支/标签规则允许发布 | **工作流指定**；当前**未核实**该 Environment 是否已创建、是否有保护规则（此前一次 `gh api .../environments` 列表为空） |
 
-依赖关系在 CF 上传 metadata 中分别为 `requiredDependency` 和 `optionalDependency`，而不是 `embeddedLibrary`。ApricityUI **1.2.8** 为必需客户端前置；Dungeons Perspective **3.6.3** 为可选客户端镜头验证目标。CF 关系本身只标项目，不锁定版本或客户端 side；英文描述明确版本和客户端要求，以 JAR NeoForge 元数据控制实际加载要求。
+依赖关系在 CF 上传 metadata 中分别为 `requiredDependency` 和 `optionalDependency`，而不是 `embeddedLibrary`。ApricityUI **1.2.8** 为必需客户端前置；Dungeons Perspective **3.6.3** 为可选客户端镜头验证目标。CF 关系本身只标项目，**不锁定版本或客户端 side**；英文描述明确版本和客户端要求，以 JAR NeoForge 元数据控制实际加载要求。
 
-本次无法可靠确认这两个依赖的真实 CF slug/ID，故**不填入猜测值**。发布负责人必须在 CF 项目页面核对 slug、数字 ID、作者和 1.21.1 NeoForge 文件是否对应；脚本校验格式和项目 ID 互异，但不能替代这种身份核对。若依赖没有可确认的 CF 项目，保持缺配置阻断，或明确选择 `github`，不要伪造关系或默默删掉前置。
+> ### ⚠ 依赖版本缺口（必须告知玩家）
+>
+> 截至 **2026-10-28** 查看，CurseForge 上 ApricityUI 的 **1.21.1 NeoForge 文件列表最新的是 1.2.7**，**不满足** Tactical RPG 的 `>= 1.2.8` 要求。CF 的 `requiredDependency` 只是“必须是这个项目”，**不保证自动装到 1.2.8**，所以玩家可能被装上 1.2.7 而在版本检查处失败。处理方式：
+>
+> - 玩家从官方 Maven 手动下载 1.2.8 **原始 JAR**：<https://maven.sighs.cc/repository/maven-releases/com/sighs/ApricityUI-neoforge-1.21.1/1.2.8/ApricityUI-neoforge-1.21.1-1.2.8.jar>（SHA-256 `7636ae43311b5401b13776799fb79cf4122b23db7fe4ae6ca03a94b14acbc0f6`）；
+> - **不下调**本模组的版本范围，**不把** ApricityUI 的 JAR 复制进本仓库或本模组分发包（保持 `requiredDependency` 关系，不改为 `embeddedLibrary`）；
+> - 该观察仅为 **2026-10-28 的可见列表**，不是“ApricityUI 没有 alpha/更新通道”的断言；上游发布状态以其项目页为准。
 
-**当前是否可自动上传：不能据此宣称已启用。** 本快照内**没有**发布工作流，因此不存在可执行的自动上传路径；以下是开发过程中的配置观测，仅作记录。主会话报告：仓库 variable `CURSEFORGE_PROJECT_ID=1766445` 已设置并验证，secret **名称** `CURSEFORGE_TOKEN` 已存在；未读取任何 secret 值，也未调用上传/编辑项目接口、未创建 Release 或 tag，因此“配置就绪”只到“名称与映射对齐”这一层。其余 variable（ApricityUI / Dungeons Perspective 的 slug 与数字 ID）仍需负责人核对；缺少这些值时发布作业会失败关闭，不会上传半成品。即便配置齐备，发布仍需在补回工作流后单独完成构建、包检查与真实运行验收，**本快照不构成发布就绪结论**。（此前一轮用 `gh variable list --json name` / `gh secret list --json name` 看到两者为空、`release` 环境返回 404，该记录是**当时**的观测，已被上面的最新报告取代但保留为历史。）
+发布负责人仍必须在 CF 项目页面核对两个依赖的 slug、数字 ID、作者与 1.21.1 NeoForge 文件是否对应；脚本只校验格式与项目 ID 互异，不能替代这种身份核对。缺配置时发布作业会失败关闭。
+
+**当前是否可上传：不能据配置名称断言就绪。** 工作流已包含在本仓库，仓库 variable `CURSEFORGE_PROJECT_ID=1766445` 与上述四个依赖 variable 已在名称层面配置，secret **名称** `CURSEFORGE_TOKEN` 已配置（值未被读取、未写入任何文件）。但这些都只是**名称层面**的事实：**不能据此确认 token 是否有效、是否具备该项目上传权限、以及上传是否就绪**。本次（2026-10-28）**没有向 CurseForge 上传 Tactical 0.23.0**，也没有调用上传/编辑项目接口；**截至本记录（2026-10-28）**，该工作流尚未在公开仓实际运行过。本文件也**不判断**该项目页面上已有或没有其它文件，也不对历史发布下结论。发布类型默认 `beta`，需要发布时用精确 tag 或手动运行触发。（历史：更早一轮用 `gh variable list --json name` / `gh secret list --json name` 看到相关项为空、`release` 环境返回 404，那是**当时**的观测，之后配置有过变化。）
+
+
+## CF 文件说明的来源
+
+CurseForge 上传 metadata 里的 `changelog` 取自**仓库根 `CHANGELOG.md`**（`tools/release_pipeline.py` 的 `--changelog` 默认值，`changelogType: markdown`），因此 `CHANGELOG.md` 顶部的内容会原样出现在 CF 的文件说明/更新记录里。玩家下载页上的前置版本警告（ApricityUI 需 **≥ 1.2.8**、CF 可见最新为 **1.2.7**、官方 Maven 原始 JAR 链接与 SHA-256）就写在 `CHANGELOG.md` 最顶部。`docs/curseforge.md` 只用于 **CF 项目描述栏**的人工粘贴，不参与上传 metadata，工作流也不会改写项目描述。
 
 ## CF API 契约与失败行为
 

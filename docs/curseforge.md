@@ -35,6 +35,25 @@ entities while giving combat a deliberate command-menu rhythm.
   not available or claimed as supported.
 - **ApricityUI 1.2.8 is required on the client.** Install it separately alongside
   Tactical RPG. It is not bundled into this download.
+
+> **⚠ Required prerequisite version — read this before installing.**
+> As of **2026-10-28**, the newest ApricityUI file listed on CurseForge for
+> **Minecraft 1.21.1 / NeoForge** is **1.2.7**, which does **not** satisfy Tactical RPG's
+> requirement of **ApricityUI ≥ 1.2.8**. Therefore:
+>
+> - The CurseForge "required dependency" relation only states *which project* is required; it does
+>   **not** pin a version. An automatic dependency install can therefore give you 1.2.7 or older,
+>   and Tactical RPG will refuse to load/satisfy its prerequisite.
+> - Install **1.2.8** yourself from the official Maven repository, using the **original, unmodified
+>   JAR**: <https://maven.sighs.cc/repository/maven-releases/com/sighs/ApricityUI-neoforge-1.21.1/1.2.8/ApricityUI-neoforge-1.21.1-1.2.8.jar>
+>   — SHA-256 `7636ae43311b5401b13776799fb79cf4122b23db7fe4ae6ca03a94b14acbc0f6` (verify the digest
+>   before dropping the file into `mods/`).
+> - The version requirement will **not** be lowered, and the ApricityUI JAR is **not** copied into
+>   this repository or bundled with the Tactical RPG download.
+>
+> This "newest is 1.2.7" statement is an **observation of the visible file list on 2026-10-28**; it is
+> not a claim that ApricityUI has no alpha or other update channel. Consult its project page for the
+> authoritative publication state.
 - **Dungeons Perspective 3.6.3 is optional on the client.** This is the camera
   integration test target, not a required dependency. Camera behavior without
   that perspective has known limitations.
@@ -58,6 +77,12 @@ combat. Press **E** for the vanilla inventory; battle item use is performed
 through the command menu. Configuration lives in `config/tactical-common.toml`.
 
 ### Current scope
+
+**Publication status of this specific version:** this description accompanies the **0.23.0
+candidate**. Tactical RPG 0.23.0 has **not** been uploaded to CurseForge in this round, and the
+project's release workflow has not yet run on the public repository. Nothing here should be read as
+"0.23.0 is already available on CurseForge"; this page also makes no statement about which other
+files the project page does or does not list.
 
 **What is verifiable locally:** the last formal build in this repository is
 **0.22.2** (single battle, protocol 6) and it is still under the older
@@ -152,6 +177,14 @@ resolved.
 
 - **仅支持 Minecraft 1.21.1 / NeoForge**。当前开发与验证目标为 **NeoForge 21.1.216**；其他 Minecraft 版本及 Forge 移植尚未提供，也不宣称支持。
 - **客户端必需 ApricityUI 1.2.8**，请与 Tactical RPG 一同单独安装；本模组不内置该前置。
+
+> **⚠ 前置版本要求（安装前必读）**：截至 **2026-10-28** 查看，CurseForge 上 ApricityUI 的 **1.21.1 NeoForge 文件列表最新仍是 1.2.7**，**不满足**本模组要求的 `>= 1.2.8`。
+>
+> - CF 的“必需依赖”只声明是**哪个项目**，不锁定版本；自动安装可能给你 1.2.7 或更旧，本模组的前置版本要求因此无法满足。
+> - 请自行从**官方 Maven** 下载 1.2.8 的**原始 JAR**：<https://maven.sighs.cc/repository/maven-releases/com/sighs/ApricityUI-neoforge-1.21.1/1.2.8/ApricityUI-neoforge-1.21.1-1.2.8.jar>，SHA-256 `7636ae43311b5401b13776799fb79cf4122b23db7fe4ae6ca03a94b14acbc0f6`，核对无误后再放入 `mods/`。
+> - **不会**下调本模组的版本范围，也**不会**把 ApricityUI 的 JAR 复制进本仓库或本模组分发包。
+>
+> “最新为 1.2.7”是 **2026-10-28 的可见列表观察**，不是“ApricityUI 没有 alpha/更新通道”的断言；官方发布状态以其项目页为准。
 - **客户端可选 Dungeons Perspective 3.6.3**。这是镜头集成的验证目标，而非必需前置；不使用该视角时，镜头行为仍有已知限制。
 - 客户端与服务端请使用相同版本的 Tactical RPG。专用服务端不需要客户端 UI 前置或可选镜头模组。
 - 尚未发布的 0.23.0 候选把战斗主协议由 6 升至 8，独立技能协议为 3。0.22.2 与 0.23.0 之间不会静默混连，请同时更新两端。
@@ -165,6 +198,8 @@ resolved.
 自己的回合中，在指令菜单选择行动，再点击有效位置或目标。战斗期间暂停普通 WASD 移动；按 **E** 打开原版背包，战斗道具使用通过指令菜单执行。配置文件位于 `config/tactical-common.toml`。
 
 ### 当前范围与限制
+
+**本版本的发布状态**：本页说明对应 **0.23.0 候选**。本次**没有向 CurseForge 上传 Tactical RPG 0.23.0**，本项目的发布工作流也尚未在公开仓实际运行。本页不支持“0.23.0 已可在 CurseForge 下载”这种读法；本页同样不判断该项目页面上已有或没有其它文件。
 
 **本地可核实的事实**：本仓库上一个正式构建是 **0.22.2**（单场、协议 6），它仍是旧的 **All Rights Reserved** 授权，其 JAR 当时也仍然打包了 LXGW Marker Gothic 字体文件；**它的外部发布状态在此未知**——那一轮验证记录写明未发生 CurseForge 上传，更早的 GitHub Release 是 0.21.0，因此本页不声称 0.22.2 可在 CurseForge 下载。下面所有关于 0.23.0 的描述都只存在于**尚未发布的工作区候选**中：它没有上传到本项目页面，不得表述为已上架。**LGPL-3.0-only** 授权与字体文件不再打包**仅**适用于该未发布候选。该候选对应 Minecraft 1.21.1 / NeoForge 21.1.216，战斗主协议 `8`、独立技能协议 `3`，仍以 ApricityUI 1.2.8 作为必需客户端前置（Dungeons Perspective 3.6.3 是可选镜头/验证目标，不是依赖）。
 

@@ -418,12 +418,7 @@ class CurseForgeTests(Fixture):
 
 class WorkflowTests(unittest.TestCase):
     def test_publication_gate_and_pinned_actions(self):
-        workflow = release.ROOT / '.github/workflows/build-release.yml'
-        if not workflow.is_file():
-            # This public source snapshot intentionally ships no release workflow, so there is
-            # nothing to assert here. Do not read this skip as "the workflow passed review".
-            self.skipTest(f'{workflow} is not part of this source snapshot; release workflow not shipped')
-        text = workflow.read_text(encoding='utf-8')
+        text = (release.ROOT / '.github/workflows/build-release.yml').read_text(encoding='utf-8')
         self.assertIn("if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'tag')", text)
         self.assertIn("tags: ['v*-neoforge-1.21.1']", text)
         self.assertIn(':common:test :neoforge-1.21.1:build', text)
