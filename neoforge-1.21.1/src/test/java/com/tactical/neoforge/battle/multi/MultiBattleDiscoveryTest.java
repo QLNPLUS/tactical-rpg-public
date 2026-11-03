@@ -9,6 +9,7 @@ import com.tactical.neoforge.network.JoinBattleIntentPacket;
 import com.tactical.neoforge.network.JoinBattleResultPacket;
 import com.tactical.neoforge.network.NearbyBattlesPacket;
 import com.tactical.neoforge.network.NearbyBattlesRequestPacket;
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import net.minecraft.network.FriendlyByteBuf;
 import org.junit.jupiter.api.Test;
@@ -63,25 +64,32 @@ class MultiBattleDiscoveryTest {
         }
     }
 
+    /**
+     * The row shape itself: identity, manager text, distance, roster and the joinable flag.
+     *
+     * <p>A row's reason is a native component now, and building one needs a booted game's codec, so the
+     * wire round-trip of these two packets lives in the {@code discovery_wire} runtime fixture. What is
+     * pinned here is the model and the bounds that are decided before any byte is written.</p>
+     */
     @Test
-    void nearbySummaryRoundTripsIncludingTheEmptyState() {
+    void aRowCarriesItsIdentityManagerAndJoinableFlag() {
         UUID first = UUID.randomUUID();
         UUID second = UUID.randomUUID();
         NearbyBattlesPacket packet = new NearbyBattlesPacket(7L, List.of(
                 new NearbyBattlesPacket.Entry(first, "TacticalA", 12, 2, 4, true, ""),
-                new NearbyBattlesPacket.Entry(second, "TacticalB", 40, 4, 4, false, "参战人数已达上限")));
-        NearbyBattlesPacket decoded = roundTrip(NearbyBattlesPacket.STREAM_CODEC, packet);
-        assertEquals(7L, decoded.requestId());
-        assertEquals(2, decoded.entries().size());
-        assertEquals(first, decoded.entries().get(0).sessionId());
-        assertEquals("TacticalA", decoded.entries().get(0).manager());
-        assertEquals(12, decoded.entries().get(0).distance());
-        assertTrue(decoded.entries().get(0).joinable());
-        assertEquals("参战人数已达上限", decoded.entries().get(1).reason());
-        assertFalse(decoded.entries().get(1).joinable());
+                new NearbyBattlesPacket.Entry(second, "TacticalB", 40, 4, 4, false,
+                        com.tactical.neoforge.battle.BattleText.denial(BattleEligibility.Denial.BATTLE_FULL))));
+        assertEquals(7L, packet.requestId());
+        assertEquals(2, packet.entries().size());
+        assertEquals(first, packet.entries().get(0).sessionId());
+        assertEquals("TacticalA", packet.entries().get(0).manager());
+        assertEquals(12, packet.entries().get(0).distance());
+        assertTrue(packet.entries().get(0).joinable());
+        assertEquals(com.tactical.neoforge.battle.BattleText.denial(BattleEligibility.Denial.BATTLE_FULL),
+                packet.entries().get(1).reason(), "the refusal travels as the authoritative structure");
+        assertFalse(packet.entries().get(1).joinable());
 
-        NearbyBattlesPacket empty = roundTrip(NearbyBattlesPacket.STREAM_CODEC,
-                new NearbyBattlesPacket(1L, List.of()));
+        NearbyBattlesPacket empty = new NearbyBattlesPacket(1L, List.of());
         assertTrue(empty.entries().isEmpty(), "an empty list is the explicit nothing-nearby state");
         assertEquals(1L, empty.requestId());
     }
@@ -91,9 +99,9 @@ class MultiBattleDiscoveryTest {
         NearbyBattlesPacket packet = new NearbyBattlesPacket(2L, List.of(
                 new NearbyBattlesPacket.Entry(UUID.randomUUID(), "x".repeat(200), 1, 1, 4, true,
                         "y".repeat(200))));
-        NearbyBattlesPacket.Entry entry = roundTrip(NearbyBattlesPacket.STREAM_CODEC, packet).entries().get(0);
-        assertEquals(NearbyBattlesPacket.MAX_NAME, entry.manager().length());
-        assertEquals(NearbyBattlesPacket.MAX_REASON, entry.reason().length());
+        NearbyBattlesPacket.Entry entry = packet.entries().get(0);
+        assertEquals(NearbyBattlesPacket.MAX_NAME, entry.manager().length(),
+                "the manager is a player's own name, so it is bounded as text");
 
         List<NearbyBattlesPacket.Entry> tooMany = new ArrayList<>();
         for (int index = 0; index <= NearbyBattlesPacket.MAX_ENTRIES; index++) {
@@ -104,39 +112,56 @@ class MultiBattleDiscoveryTest {
     }
 
     @Test
-    void joinIntentAndResultRoundTripEveryDenial() {
+    void theJoinIntentStillCarriesOnlyTheTargetSession() {
         UUID session = UUID.randomUUID();
         assertEquals(session, roundTrip(JoinBattleIntentPacket.STREAM_CODEC,
                 new JoinBattleIntentPacket(session)).sessionId());
-        JoinBattleResultPacket decoded = roundTrip(JoinBattleResultPacket.STREAM_CODEC,
-                new JoinBattleResultPacket(session, BattleEligibility.Denial.BATTLE_FULL,
-                        BattleEligibility.describe(BattleEligibility.Denial.BATTLE_FULL)));
-        assertEquals(session, decoded.sessionId());
-        assertEquals(BattleEligibility.Denial.BATTLE_FULL, decoded.denial());
-        assertFalse(decoded.joined());
-
-        JoinBattleResultPacket accepted = roundTrip(JoinBattleResultPacket.STREAM_CODEC,
-                new JoinBattleResultPacket(session, BattleEligibility.Denial.NONE, ""));
-        assertTrue(accepted.joined());
-
-        for (BattleEligibility.Denial denial : BattleEligibility.Denial.values()) {
-            assertEquals(denial, roundTrip(JoinBattleResultPacket.STREAM_CODEC,
-                    new JoinBattleResultPacket(session, denial, "")).denial());
-        }
         assertEquals(42L, roundTrip(NearbyBattlesRequestPacket.STREAM_CODEC,
                 new NearbyBattlesRequestPacket(42L)).requestId());
     }
 
+    /** The code and the wording are both the server's decision, and every denial keeps its own code. */
+    @Test
+    void everyDenialKeepsItsCodeAndItsOwnWording() {
+        UUID session = UUID.randomUUID();
+        JoinBattleResultPacket refused = new JoinBattleResultPacket(session, BattleEligibility.Denial.BATTLE_FULL,
+                com.tactical.neoforge.battle.BattleText.denial(BattleEligibility.Denial.BATTLE_FULL));
+        assertEquals(session, refused.sessionId());
+        assertEquals(BattleEligibility.Denial.BATTLE_FULL, refused.denial());
+        assertFalse(refused.joined());
+        assertTrue(new JoinBattleResultPacket(session, BattleEligibility.Denial.NONE, "").joined());
+
+        for (BattleEligibility.Denial denial : BattleEligibility.Denial.values()) {
+            assertEquals(denial, new JoinBattleResultPacket(session, denial, "").denial());
+        }
+        // The self-service list wording differs from the invitation wording for the same status, and the
+        // server decides which one an answer carries - the client never rebuilds it.
+        assertNotEquals(com.tactical.neoforge.battle.BattleText.listDenial(BattleEligibility.Denial.NOT_A_SAFE_BOUNDARY),
+                com.tactical.neoforge.battle.BattleText.denial(BattleEligibility.Denial.NOT_A_SAFE_BOUNDARY));
+    }
+
     @Test
     void aDecodeOfAnUnknownDenialIsRejected() {
-        FriendlyByteBuf buffer = new FriendlyByteBuf(Unpooled.buffer());
+        net.minecraft.network.RegistryFriendlyByteBuf buffer = new net.minecraft.network.RegistryFriendlyByteBuf(
+                Unpooled.buffer(), net.minecraft.core.RegistryAccess.EMPTY,
+                net.neoforged.neoforge.network.connection.ConnectionType.OTHER);
+        ByteBuf body = Unpooled.buffer();
         try {
-            buffer.writeUUID(UUID.randomUUID());
-            buffer.writeVarInt(BattleEligibility.Denial.values().length + 5);
-            buffer.writeUtf("", JoinBattleResultPacket.MAX_MESSAGE);
+            // The wire form is a length prefix and then the body. Writing the body without its length made
+            // this check depend on the random session id's leading byte: half the runs refused the declared
+            // length, half fell through to a slice error. The framed form exercises the ordinal guard itself.
+            net.minecraft.network.RegistryFriendlyByteBuf framed = new net.minecraft.network.RegistryFriendlyByteBuf(
+                    body, net.minecraft.core.RegistryAccess.EMPTY,
+                    net.neoforged.neoforge.network.connection.ConnectionType.OTHER);
+            framed.writeUUID(UUID.randomUUID());
+            framed.writeVarInt(BattleEligibility.Denial.values().length + 5);
+            buffer.writeVarInt(framed.readableBytes());
+            buffer.writeBytes(body);
+            // The ordinal is refused before the message frame is ever read, so this needs no game codec.
             assertThrows(IllegalArgumentException.class,
                     () -> JoinBattleResultPacket.STREAM_CODEC.decode(buffer));
         } finally {
+            body.release();
             buffer.release();
         }
     }

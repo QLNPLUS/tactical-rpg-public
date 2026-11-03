@@ -88,10 +88,10 @@ public final class AttackRangeService {
         // No client-controlled coordinates, radius, roster or weapon; bound request work before scanning.
         if (entry.lastRequestTick == tick) return;
         entry.lastRequestTick = tick;
-        GridPos origin = battle.playerCell(player);
+        GridPos origin = battle.commandCell(player);
         if (origin == null) return;
-        int kind = battle.weaponKind(player);
-        if (!player.isAlive() || !battle.isPlayerTurnNow(player) || battle.isBusy()) {
+        int kind = battle.commandWeaponKind(player);
+        if (!player.isAlive() || !battle.isCommandTurn(player) || battle.isBusy()) {
             clearCache(entry);
             com.tactical.neoforge.network.ServerPackets.sendUncheckedType(player,
                     new AttackRangeSnapshotPacket(request.requestId(), false,
@@ -130,7 +130,7 @@ public final class AttackRangeService {
         List<Tile> tiles = new ArrayList<>();
         boolean truncated = false;
         int radius = kind == 0 ? 1 : Math.min(AttackRangeGeometry.MAX_RADIUS,
-                Math.max(battle.weaponRangeFor(player, origin), battle.weaponRangeFor(player,
+                Math.max(battle.commandWeaponRange(player, origin), battle.commandWeaponRange(player,
                         new GridPos(origin.x(), origin.y() - AttackRangeGeometry.MAX_ELEVATION, origin.z()))));
         // Visit near columns first so truncation remains useful on layered terrain.
         scan: for (int ring = 0; ring <= radius; ring++) {
@@ -143,7 +143,7 @@ public final class AttackRangeService {
                     int dy = offset == 0 ? 0 : (offset % 2 == 1 ? (offset + 1) / 2 : -offset / 2);
                     GridPos cell = new GridPos(x, origin.y() + dy, z);
                     if (!battle.zone().contains(cell)
-                            || !AttackRangeGeometry.contains(origin, cell, kind, battle.weaponRangeFor(player, cell))
+                            || !AttackRangeGeometry.contains(origin, cell, kind, battle.commandWeaponRange(player, cell))
                             || !LevelGridWorld.isStandable(level, x, cell.y(), z)) continue;
                     if (tiles.size() == AttackRangeGeometry.MAX_TILES) {
                         truncated = true;
@@ -164,7 +164,7 @@ public final class AttackRangeService {
                 break;
             }
             if (target == player || !target.isAlive() || target.isRemoved()) continue;
-            if (battle.previewWeaponAttack(player, target).isEmpty()) targets.add(new Target(target.getId(), target.getUUID()));
+            if (battle.commandAttackAllowed(player, target)) targets.add(new Target(target.getId(), target.getUUID()));
         }
         return new AttackRangeSnapshotPacket(0, true, battleId, level.dimension().location(), tick,
                 origin, kind, truncated, tiles, targets);

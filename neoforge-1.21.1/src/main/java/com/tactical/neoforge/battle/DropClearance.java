@@ -35,8 +35,16 @@ public final class DropClearance {
   }
   return true;
  }
- public static boolean clearTrajectorySegment(Level level, Player actor, GridPos from, GridPos to,
-                                                double start, double end, boolean drop) {
+ /**
+  * The same sweep over one slice of a trajectory, for the caller that already advances per tick.
+  *
+  * <p>It takes a living entity rather than a player because a forced fall drops mobs through the same
+  * curve: one sweep implementation for both, so a mob can never be pushed through a block a player would
+  * have been stopped by.</p>
+  */
+ public static boolean clearTrajectorySegment(Level level, net.minecraft.world.entity.LivingEntity actor,
+                                               GridPos from, GridPos to,
+                                               double start, double end, boolean drop) {
   AABB shape=actor.getBoundingBox().move(-actor.getX(),-actor.getY(),-actor.getZ());
   int samples=Math.max(8,(int)Math.ceil((end-start)*80));
   for(int i=0;i<=samples;i++) {

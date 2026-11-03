@@ -2,7 +2,7 @@
 
 > mod id：`tactical`（显示名待定）
 > 目标版本：1.21.1 NeoForge（主线）→ 1.20.1 Forge → 26.1.2 NeoForge
-> UI：ApricityUI（AUI）1.2.8，三个版本均有 Maven 发布
+> UI：本模组原生绘制（`GuiGraphics` + 自有布局/命中）。历史上曾用 ApricityUI 1.2.8 承载页面，已在界面重制中移除；本文其余各处涉及 AUI / 页面文件的描述一律属历史草稿，不代表当前实现。
 > 状态：v0.1 历史设计草稿，不是当前版本规则。当前 AP 积攒、恢复、连续操作费用和站位伤害以 [README](../README.md)、[更新记录](../CHANGELOG.md) 与 [扩展说明](extending-battles.md) 为准。
 
 ---
@@ -89,7 +89,7 @@ PEACE ──触发──▶ DEPLOY ──▶ TURN_LOOP ──▶ END ──▶ C
 - 外部敌对生物攻击参与者时，不是简单地被挡住，而是被**吸收进战斗**：战场半径扩展到覆盖它，冻结并加入回合队列。
 - 外部玩家攻击参与者：目前拦截并提示（多人联合作战尚未支持）。
 - 战场半径随吸收动态扩大，客户端边界环同步更新（`BattleStatePacket.zoneRadius`）。
-- 战场交互：HUD 仅展示；按 `B` 打开 `ApricityScreen` 指令菜单（有鼠标），可结束回合/逃跑。
+- 战场交互：HUD 仅展示；按 `B` 打开原生指令菜单（有鼠标），可结束回合/逃跑。
 
 ### 4.4 玩家逃离
 - 按钮“逃跑”消耗 50 AP，进行一次判定（基础成功率 50% + 移速修正 + 周围敌人数量惩罚）。
@@ -195,7 +195,7 @@ PEACE ──触发──▶ DEPLOY ──▶ TURN_LOOP ──▶ END ──▶ C
 
 ---
 
-## 11. 玩家操作与 AUI 界面
+## 11. 玩家操作与界面
 
 ### 11.1 操作
 - 点击格子移动（高亮可达范围/消耗/路径）。
@@ -206,13 +206,15 @@ PEACE ──触发──▶ DEPLOY ──▶ TURN_LOOP ──▶ END ──▶ C
 - 方块 = 子菜单：挖掘 / 放置 / 交互；点击方块执行，扣 AP。
 - 战斗中禁用原版 WASD 移动、跳跃、攻击键（客户端拦截 + 服务端位置校验）。
 
-### 11.2 AUI 页面（三个版本共用）
-| 页面 | 宿主 | 内容 |
-|------|------|------|
-| `ui/battle_hud.html` | Overlay（intercept） | 先攻条、当前回合、AP 球、行动按钮、目标信息、提示 |
-| `ui/item_picker.html` | Screen | 背包网格、武器/道具筛选、AP 消耗预览 |
-| `ui/block_menu.html` | Overlay/Screen | 挖掘/放置/交互模式切换 |
-| `ui/theme` | — | Ore 主题（`/apricityui/theme/ore/ore.css`），只写业务样式 |
+### 11.2 界面承载（历史草稿已失效）
+本节原来列的是「三个版本共用」的 AUI 页面（`ui/battle_hud.html`、`ui/item_picker.html`、`ui/block_menu.html` 与 Ore 主题）。那套页面与其主题已经退役：现在没有页面模板、样式表、主题 CSS，也没有宿主 Overlay/Screen 之分。当前承载为原生实现：
+
+| 承载 | 内容 |
+|------|------|
+| 战场 HUD（无 Screen，直接绘制） | 生命名册、战斗纪事、行动顺序带、附近提示 |
+| 原生命令菜单/五页（`Screen`） | 指令菜单、瞄准、朝向、技能、移动选择、附近战斗列表 |
+
+具体界面清单、缩放档位与视觉规范见 [ui-remake 计划](ui-remake/plan.md) 与 [视觉规范](ui-remake/visual-spec.md)。
 
 - 数据绑定：服务端 → `BattleSnapshot` → 客户端 `UiBridge` → AUI Document 更新（Java 侧操作 DOM / 注册事件）。
 - 网格高亮和屏障不用 AUI：走世界渲染（方块边框/半透明面）。

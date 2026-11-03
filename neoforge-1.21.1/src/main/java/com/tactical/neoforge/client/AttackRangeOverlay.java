@@ -4,8 +4,13 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import com.tactical.core.grid.GridPos;
 import com.tactical.neoforge.Tactical;
+import com.tactical.neoforge.client.ui.platform.ClientText;
 import com.tactical.neoforge.network.AttackRangeRequestPacket;
 import com.tactical.neoforge.network.AttackRangeSnapshotPacket;
+import com.tactical.neoforge.client.UiPalette;
+import com.tactical.neoforge.client.BattleMenu;
+import com.tactical.neoforge.client.BattleClientState;
+import com.tactical.neoforge.client.ui.theme.Palette;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -50,10 +55,22 @@ public final class AttackRangeOverlay {
 
     private record ParticipantStamp(int id, UUID uuid, double x, double y, double z,
                                     boolean alive, int health) { }
-    private record AimKey(GridPos origin, int kind, int range, int selected, int actionCount, int ap,
+    /**
+     * What one preview belongs to.
+     *
+     * <p>It names the acting body itself - session, turn generation and entity id - beside the origin, the
+     * weapon kind and the price the preview was requested with. Without those the key could not tell the
+     * owner's body from a companion's, nor one companion from the next, so a stale answer could end up on the
+     * wrong actor. A companion has no hotbar slot and no main-hand item of its own in this cache, so both are
+     * the neutral value while it is commanding.</p>
+     */
+    private record AimKey(java.util.UUID sessionId, long turnEpoch, int actorEntityId, GridPos origin, int kind,
+                          int range, int selected, int actionCount, int ap,
                           List<ParticipantStamp> roster, ItemStack weapon) {
         boolean matches(AimKey other) {
-            return other != null && origin.equals(other.origin) && kind == other.kind && range == other.range
+            return other != null && java.util.Objects.equals(sessionId, other.sessionId)
+                    && turnEpoch == other.turnEpoch && actorEntityId == other.actorEntityId
+                    && origin.equals(other.origin) && kind == other.kind && range == other.range
                     && selected == other.selected && actionCount == other.actionCount && ap == other.ap
                     && roster.equals(other.roster) && ItemStack.matches(weapon, other.weapon);
         }
@@ -62,10 +79,15 @@ public final class AttackRangeOverlay {
     private AttackRangeOverlay() { }
 
     private static boolean aiming(Minecraft mc) {
-        return BattleClientState.active && BattleClientState.mode == BattleMode.ATTACK
-                && BattleClientState.isPlayerTurn() && !BattleClientState.moving
+        // A companion that does not declare the attack order gets no preview either: the surface follows the
+        // same mask the server enforces.
+        boolean allowed = !BattleClientState.isCommandingCompanion()
+                || BattleClientState.command.allows(
+                        com.tactical.neoforge.api.companion.CompanionAbility.ATTACK.ordinal());
+        return BattleClientState.active && BattleClientState.mode == BattleMode.ATTACK && allowed
+                && BattleMenu.commandTurn() && !BattleClientState.commandMoving()
                 && mc.level != null && mc.player != null && mc.player.isAlive() && !mc.player.isRemoved()
-                && (mc.screen == null || mc.screen instanceof BattleAim.BattleAimScreen);
+                && (mc.screen == null || BattleAim.isOpen());
     }
 
     private static AimKey key(Minecraft mc) {
@@ -76,9 +98,13 @@ public final class AttackRangeOverlay {
                     : new ParticipantStamp(entity.getId(), entity.getUUID(), entity.getX(), entity.getY(), entity.getZ(),
                     entity.isAlive() && !entity.isRemoved(), entry.getValue()[0]));
         }
-        return new AimKey(BattleClientState.playerCell(), BattleClientState.weaponKind, BattleClientState.weaponRange,
-                mc.player.getInventory().selected, BattleClientState.actionCount, BattleClientState.ap,
-                List.copyOf(roster), mc.player.getMainHandItem().copy());
+        boolean companion = BattleClientState.isCommandingCompanion();
+        return new AimKey(BattleClientState.sessionId, BattleClientState.turnEpoch,
+                BattleClientState.commandEntityId(), BattleClientState.commandCell(),
+                BattleClientState.commandWeaponKind(), BattleClientState.commandWeaponRange(),
+                companion ? -1 : mc.player.getInventory().selected, BattleClientState.actionCount,
+                BattleClientState.commandAp(), List.copyOf(roster),
+                companion ? ItemStack.EMPTY : mc.player.getMainHandItem().copy());
     }
 
     @SubscribeEvent(priority = EventPriority.LOWEST)
@@ -114,8 +140,8 @@ public final class AttackRangeOverlay {
         if (!aiming(mc) || level != mc.level
                 || pendingKey == null || !pendingKey.matches(key(mc))
                 || !packet.dimension().equals(level.dimension().location())
-                || !packet.origin().equals(BattleClientState.playerCell())
-                || packet.weaponKind() != BattleClientState.weaponKind
+                || !packet.origin().equals(BattleClientState.commandCell())
+                || packet.weaponKind() != BattleClientState.commandWeaponKind()
                 || !refresh.accept(packet.requestId(), level.getGameTime())) return;
         if (!packet.active()) {
             discardSnapshot();
@@ -129,10 +155,18 @@ public final class AttackRangeOverlay {
     }
 
     private static boolean fresh(Minecraft mc) {
-        if (snapshot == null || !aiming(mc) || mc.level != level || !snapshotKey.matches(currentKey)
-                || !ItemStack.matches(snapshotKey.weapon(), mc.player.getMainHandItem())
-                || !snapshot.origin().equals(BattleClientState.playerCell())
-                || snapshotKey.actionCount() != BattleClientState.actionCount || snapshotKey.ap() != BattleClientState.ap) return false;
+        if (snapshot == null || !aiming(mc) || mc.level != level || !snapshotKey.matches(currentKey)) return false;
+        // The same identity the key carries, re-read: a switched actor or a new turn invalidates at once.
+        boolean companion = BattleClientState.isCommandingCompanion();
+        if (!ItemStack.matches(snapshotKey.weapon(),
+                companion ? ItemStack.EMPTY : mc.player.getMainHandItem())) return false;
+        if (!snapshot.origin().equals(BattleClientState.commandCell())) return false;
+        if (snapshot.weaponKind() != BattleClientState.commandWeaponKind()) return false;
+        if (snapshotKey.actionCount() != BattleClientState.actionCount) return false;
+        if (snapshotKey.ap() != BattleClientState.commandAp()) return false;
+        if (!java.util.Objects.equals(snapshotKey.sessionId(), BattleClientState.sessionId)
+                || snapshotKey.turnEpoch() != BattleClientState.turnEpoch
+                || snapshotKey.actorEntityId() != BattleClientState.commandEntityId()) return false;
         return refresh.fresh(level.getGameTime());
     }
 
@@ -162,10 +196,12 @@ public final class AttackRangeOverlay {
             float x = tile.cell().x() + 0.1F;
             float z = tile.cell().z() + 0.1F;
             float y = (float) (tile.surfaceY() + 0.025D);
-            quads.addVertex(matrix, x, y, z).setColor(1.0F, 0.47F, 0.12F, 0.27F);
-            quads.addVertex(matrix, x + 0.8F, y, z).setColor(1.0F, 0.47F, 0.12F, 0.27F);
-            quads.addVertex(matrix, x + 0.8F, y, z + 0.8F).setColor(1.0F, 0.47F, 0.12F, 0.27F);
-            quads.addVertex(matrix, x, y, z + 0.8F).setColor(1.0F, 0.47F, 0.12F, 0.27F);
+            // The range colour is its own preference; fill alpha 0.27 stays exactly as approved.
+            int fill = UiPalette.rangeFill();
+            quads.addVertex(matrix, x, y, z).setColor(Palette.red(fill), Palette.green(fill), Palette.blue(fill), 0.27F);
+            quads.addVertex(matrix, x + 0.8F, y, z).setColor(Palette.red(fill), Palette.green(fill), Palette.blue(fill), 0.27F);
+            quads.addVertex(matrix, x + 0.8F, y, z + 0.8F).setColor(Palette.red(fill), Palette.green(fill), Palette.blue(fill), 0.27F);
+            quads.addVertex(matrix, x, y, z + 0.8F).setColor(Palette.red(fill), Palette.green(fill), Palette.blue(fill), 0.27F);
         }
         buffers.endBatch(RenderType.debugQuads());
         VertexConsumer lines = buffers.getBuffer(RenderType.lines());
@@ -174,7 +210,8 @@ public final class AttackRangeOverlay {
             LevelRenderer.renderLineBox(pose, lines,
                     new AABB(cell.x() + 0.1D, tile.surfaceY() + 0.02D, cell.z() + 0.1D,
                             cell.x() + 0.9D, tile.surfaceY() + 0.045D, cell.z() + 0.9D),
-                    1.0F, 0.52F, 0.16F, 0.8F);
+                    Palette.red(UiPalette.rangeOutline()), Palette.green(UiPalette.rangeOutline()),
+                    Palette.blue(UiPalette.rangeOutline()), 0.8F);
         }
         float partialTick = event.getPartialTick().getGameTimeDeltaPartialTick(false);
         for (var target : snapshot.targets()) {
@@ -197,7 +234,8 @@ public final class AttackRangeOverlay {
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public static void onScreen(ScreenEvent.Render.Post event) {
         Minecraft mc = Minecraft.getInstance();
-        if (event.getScreen() instanceof BattleAim.BattleAimScreen && !mc.options.hideGui && UiZoom.showRangeLegend())
+        if (event.getScreen() instanceof com.tactical.neoforge.client.ui.aim.BattleAimScreen && !mc.options.hideGui
+                && UiZoom.showRangeLegend())
             drawLegend(event.getGuiGraphics());
     }
 
@@ -205,26 +243,40 @@ public final class AttackRangeOverlay {
         Minecraft mc = Minecraft.getInstance();
         if (!aiming(mc) || mc.options.hideGui || !UiZoom.showRangeLegend()) return;
         boolean ready = fresh(mc);
-        String status = ready ? "绿色实体框：已通过服务器射程与弹道校验（" + targets.size() + "）"
-                : "正在更新射程与目标校验…";
-        if (ready && snapshot.truncated()) status += " · 预览已达显示边界";
-        String hover = "攻击仍需满足AP、弹药及服务器当次校验";
+        String status = ready
+                ? ClientText.get(ClientText.Keys.RANGE_VALID_COUNT, Integer.toString(targets.size()))
+                : ClientText.get(ClientText.Keys.RANGE_PENDING);
+        if (ready && snapshot.truncated()) status += ClientText.get(ClientText.Keys.RANGE_TRUNCATED);
+        String hover = ClientText.get(ClientText.Keys.RANGE_HOVER);
         if (ready && BattleAim.pickAtCursor() instanceof EntityHitResult hit) {
-            hover = hit.getEntity().getDisplayName().getString() + (validatedTarget(hit.getEntity())
-                    ? " · 已通过射程与弹道校验" : " · 未通过射程/遮挡/弹道或阵营校验");
+            hover = hit.getEntity().getDisplayName().getString() + ClientText.get(validatedTarget(hit.getEntity())
+                    ? ClientText.Keys.RANGE_HOVER_OK : ClientText.Keys.RANGE_HOVER_FAIL);
         }
-        List<net.minecraft.util.FormattedCharSequence> lines = new ArrayList<>();
+        // The legend wraps with the client's own line folder: Latin text breaks at spaces, Chinese between
+        // characters, and nothing is cut. The wrapped lines are plain strings, which is also what makes the
+        // development probe able to report the wording it really drew.
+        List<String> lines = new ArrayList<>();
         int width = Math.max(40, Math.min(360, mc.getWindow().getGuiScaledWidth() - 24));
-        for (String text : List.of("橙色格子：武器几何射程，不代表穿墙或弹道可达", status, hover))
-            lines.addAll(mc.font.split(Component.literal(text), width));
+        for (String text : List.of(ClientText.get(ClientText.Keys.RANGE_ORANGE), status, hover)) {
+            lines.addAll(com.tactical.neoforge.client.ui.layout.TextMetrics.wrap(text, width, 1.0D, mc.font::width));
+        }
         int x = 10;
         int y = Math.max(8, Math.min(mc.getWindow().getGuiScaledHeight() / 2 + 18,
                 mc.getWindow().getGuiScaledHeight() - lines.size() * 11 - 12));
         graphics.pose().pushPose();
         graphics.pose().translate(0, 0, 600);
-        graphics.fill(x - 4, y - 4, x + width + 4, y + lines.size() * 11 + 2, 0xD0191C24);
-        for (int index = 0; index < lines.size(); index++)
-            graphics.drawString(mc.font, lines.get(index), x, y + index * 11, index == 0 ? 0xFFFFB26B : 0xFFE4E9EF, true);
+        // The legend is a floating surface (plan: tooltip style with the opaque FLOAT base), so it may
+        // sit over the roster or the panel without their text showing through it.
+        graphics.fill(x - 4, y - 4, x + width + 4, y + lines.size() * 11 + 2,
+                com.tactical.neoforge.client.ui.theme.Slate.FLOAT);
+        for (int index = 0; index < lines.size(); index++) {
+            // The legend draws straight through GuiGraphics, so it reports its own lines to the same
+            // development-only record the rest of the client uses; the drawing itself is unchanged.
+            com.tactical.neoforge.client.ui.debug.DrawnText.record(lines.get(index), mc.font, x, y + index * 11);
+            graphics.drawString(mc.font, lines.get(index), x, y + index * 11,
+                    index == 0 ? com.tactical.neoforge.client.ui.theme.Slate.TEXT
+                            : com.tactical.neoforge.client.ui.theme.Slate.TEXT2, true);
+        }
         graphics.pose().popPose();
     }
 

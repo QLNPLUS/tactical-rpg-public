@@ -99,6 +99,24 @@ public final class BattleMembership {
      *         {@link Decision#ACCEPT_IDEMPOTENT} for a repeated identical one, otherwise a refusal.
      */
     public static Decision transition(long serverEpoch, long generation, UUID sessionId, boolean active) {
+        Decision decision = preview(serverEpoch, generation, sessionId, active);
+        if (decision == Decision.ACCEPT_TRANSITION) {
+            current = new Scope(serverEpoch, generation, sessionId, active);
+            revision++;
+        }
+        return decision;
+    }
+
+    /**
+     * The same rules, asked without changing anything.
+     *
+     * <p>It exists for payloads that are assembled from several parts before they may be applied: a
+     * receiver has to know that a part belongs to a membership this client could still accept <em>before</em>
+     * it spends anything on the part, and a whole snapshot has to be complete before a transition is
+     * allowed to happen. The answer is exactly what {@link #transition} would do right now; the transition
+     * itself still only happens when the complete payload is applied.</p>
+     */
+    public static Decision preview(long serverEpoch, long generation, UUID sessionId, boolean active) {
         if (generation <= 0) return Decision.REJECT_UNBOUND;
         if (active && sessionId == null) return Decision.REJECT_MALFORMED;
         // Traffic of the connection this client already closed cannot come back.
@@ -116,8 +134,6 @@ public final class BattleMembership {
             if (sameEncounter && active == current.active()) return Decision.ACCEPT_IDEMPOTENT;
             return Decision.REJECT_CONFLICT;
         }
-        current = new Scope(serverEpoch, generation, sessionId, active);
-        revision++;
         return Decision.ACCEPT_TRANSITION;
     }
 

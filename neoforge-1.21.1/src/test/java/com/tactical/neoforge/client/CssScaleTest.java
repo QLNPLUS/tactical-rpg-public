@@ -6,45 +6,76 @@ import java.util.Properties;
 import static org.junit.jupiter.api.Assertions.*;
 
 class CssScaleTest {
-    @Test void nineDistinctPresetsHavePublicBoundsAndNormalSize() {
-        assertEquals(List.of(60, 70, 80, 90, 100, 110, 125, 140, 160), CssScale.PRESETS);
+    @Test void eightEvenPresetsCoverTheReadableRange() {
+        assertEquals(List.of(80, 85, 90, 95, 100, 105, 110, 115), CssScale.PRESETS);
         assertEquals(CssScale.MIN_PERCENT, CssScale.PRESETS.getFirst());
         assertEquals(CssScale.MAX_PERCENT, CssScale.PRESETS.getLast());
+        for (int index = 1; index < CssScale.PRESETS.size(); index++)
+            assertEquals(CssScale.STEP_PERCENT,
+                    CssScale.PRESETS.get(index) - CssScale.PRESETS.get(index - 1), "one 5% step at a time");
+        assertEquals("3", CssScale.VERSION);
         assertThrows(UnsupportedOperationException.class, () -> CssScale.PRESETS.add(200));
     }
 
-    @Test void legacyStepsMigrateToOriginalActualPercentages() {
+    @Test void everyOldPresetMigratesOntoTheNewRange() {
+        // Literal mapping of the specification: clamp to 80..115, then round to the nearest step.
+        int[][] mapping = {{60, 80}, {70, 80}, {80, 80}, {85, 85}, {90, 90}, {95, 95}, {100, 100},
+                {105, 105}, {110, 110}, {115, 115}, {125, 115}, {140, 115}, {160, 115}};
+        for (int[] pair : mapping) {
+            Properties old = new Properties();
+            old.setProperty("version", "2");
+            old.setProperty("percent", Integer.toString(pair[0]));
+            assertEquals(pair[1], CssScale.readPercent(old), pair[0] + "% must migrate to " + pair[1] + "%");
+            Properties written = CssScale.properties(old, CssScale.readPercent(old), false);
+            assertEquals("3", written.getProperty("version"), "the file is rewritten as version 3");
+            assertEquals(Integer.toString(pair[1]), written.getProperty("percent"));
+            assertEquals(pair[1], CssScale.readPercent(written), "the migrated value is stable");
+        }
+    }
+
+    @Test void legacyStepsMigrateToOriginalActualPercentagesThenSnap() {
+        int[] expected = {85, 100, 115};
         for (int step = 0; step <= 2; step++) {
             Properties old = new Properties();
             old.setProperty("step", Integer.toString(step));
-            int expected = new int[]{85, 100, 125}[step];
-            assertEquals(expected, CssScale.readPercent(old));
+            assertEquals(expected[step], CssScale.readPercent(old));
             Properties migrated = CssScale.properties(CssScale.readPercent(old));
-            assertEquals("2", migrated.getProperty("version"));
+            assertEquals("3", migrated.getProperty("version"));
             assertNull(migrated.getProperty("step"));
-            assertEquals(expected, CssScale.readPercent(migrated));
+            assertEquals(expected[step], CssScale.readPercent(migrated));
         }
     }
 
-    @Test void newPercentWinsAndCorruptConfigIsSafe() {
-        Properties p = CssScale.properties(140);
+    @Test void aCorruptValueFallsBackToOneHundredInsteadOfAnEndOfTheRange() {
+        Properties p = CssScale.properties(110);
         p.setProperty("step", "0");
-        assertEquals(140, CssScale.readPercent(p));
+        assertEquals(110, CssScale.readPercent(p));
         p.setProperty("percent", "oops");
         assertEquals(100, CssScale.readPercent(p));
-        assertEquals(60, CssScale.readPercent(CssScale.properties(-50)));
-        assertEquals(160, CssScale.readPercent(CssScale.properties(900)));
+        assertEquals(80, CssScale.readPercent(CssScale.properties(-50)));
+        assertEquals(115, CssScale.readPercent(CssScale.properties(900)));
+        assertEquals(100, CssScale.readPercent(new Properties()), "an empty file means the default");
     }
 
-    @Test void arrowsReachEveryPresetAndHandleMigrated85WithoutJumpingToEnds() {
-        assertEquals(80, CssScale.adjacent(85, -1));
-        assertEquals(90, CssScale.adjacent(85, 1));
-        assertEquals(85, CssScale.adjacent(85, 0));
+    @Test void everyWrittenValueIsAlreadyAPreset() {
+        for (int raw : new int[]{-100, 0, 79, 81, 83, 87, 92, 97, 102, 108, 113, 114, 116, 400}) {
+            int written = CssScale.readPercent(CssScale.properties(raw));
+            assertTrue(CssScale.PRESETS.contains(written), raw + "% became " + written + "%, not a preset");
+            assertEquals(0, written % CssScale.STEP_PERCENT);
+        }
+    }
+
+    @Test void arrowsReachEveryPresetAndStopAtBothEnds() {
         for (int i = 0; i < CssScale.PRESETS.size(); i++) {
             int value = CssScale.PRESETS.get(i);
-            assertEquals(CssScale.PRESETS.get(Math.min(i + 1, 8)), CssScale.adjacent(value, 1));
+            assertEquals(CssScale.PRESETS.get(Math.min(i + 1, CssScale.PRESETS.size() - 1)),
+                    CssScale.adjacent(value, 1));
             assertEquals(CssScale.PRESETS.get(Math.max(i - 1, 0)), CssScale.adjacent(value, -1));
         }
+        assertEquals(85, CssScale.adjacent(80, 1));
+        assertEquals(80, CssScale.adjacent(80, -1), "the smallest preset keeps the smaller button disabled");
+        assertEquals(115, CssScale.adjacent(115, 1), "the largest preset keeps the larger button disabled");
+        assertEquals(100, CssScale.adjacent(100, 0));
     }
 
     @Test void rangeLegendDefaultsOffWithoutResettingLegacyOrCurrentSize() {
@@ -66,15 +97,15 @@ class CssScaleTest {
     }
 
     @Test void alternatingToggleAndScaleSavesRoundTripWithoutClobberingEither() throws Exception {
-        Properties saved = CssScale.properties(140);
+        Properties saved = CssScale.properties(110);
         saved = roundTrip(CssScale.properties(saved, CssScale.readPercent(saved), true));
-        assertEquals(140, CssScale.readPercent(saved));
+        assertEquals(110, CssScale.readPercent(saved));
         assertTrue(CssScale.readRangeLegend(saved));
-        saved = roundTrip(CssScale.properties(saved, 160, CssScale.readRangeLegend(saved)));
-        assertEquals(160, CssScale.readPercent(saved));
+        saved = roundTrip(CssScale.properties(saved, 115, CssScale.readRangeLegend(saved)));
+        assertEquals(115, CssScale.readPercent(saved));
         assertTrue(CssScale.readRangeLegend(saved));
         saved = roundTrip(CssScale.properties(saved, CssScale.readPercent(saved), false));
-        assertEquals(160, CssScale.readPercent(saved));
+        assertEquals(115, CssScale.readPercent(saved));
         assertFalse(CssScale.readRangeLegend(saved));
         saved = roundTrip(CssScale.properties(saved, 100, CssScale.readRangeLegend(saved)));
         assertEquals(100, CssScale.readPercent(saved));

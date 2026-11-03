@@ -34,7 +34,7 @@ public final class TargetHighlightRenderer {
             return;
         }
         Minecraft minecraft = Minecraft.getInstance();
-        if (minecraft.screen == null || minecraft.screen instanceof BattleAim.BattleAimScreen) {
+        if (minecraft.screen == null || BattleAim.isOpen()) {
             // Vanilla uses its own outline ray; MOVE renders the collider-based ground pick below.
             event.setCanceled(true);
         }
@@ -54,28 +54,11 @@ public final class TargetHighlightRenderer {
         if (minecraft.player == null || minecraft.level == null) {
             return;
         }
-        if (minecraft.screen != null && !(minecraft.screen instanceof BattleAim.BattleAimScreen)) {
+        if (minecraft.screen != null && !BattleAim.isOpen()) {
             return;
         }
         HitResult hit = BattleClientState.mode == BattleMode.NONE ? null : BattleAim.pickAtCursor();
-        // SkillOverlay owns its target label, including server failure reasons and costs.
-        if (BattleClientState.mode != BattleMode.SKILL
-                && minecraft.screen instanceof BattleAim.BattleAimScreen screen && screen.getLinkedDocument() != null) {
-            var label = screen.getLinkedDocument().getElementById("aim-target");
-            String text = "";
-            if (BattleClientState.mode == BattleMode.ATTACK) {
-                text = hit instanceof net.minecraft.world.phys.EntityHitResult entityHit
-                        ? entityHit.getEntity().getDisplayName().getString() : "";
-            } else if (BattleClientState.mode == BattleMode.MOVE) {
-                GridPos target = CursorWorldPicker.standCell(minecraft, hit);
-                text = target == null ? "未指向可站立地面" : "落点 " + target.x() + ", " + target.y() + ", " + target.z()
-                        + (BattleClientState.reachable.contains(target) ? " · 可到达" : " · 超出移动范围");
-            } else if (BattleClientState.mode == BattleMode.PLACE && hit instanceof BlockHitResult blockHit) {
-                BlockPos pos = blockHit.getBlockPos();
-                text = "放置面 " + pos.getX() + ", " + pos.getY() + ", " + pos.getZ();
-            }
-            if (label != null && !text.equals(label.getTextContent())) label.setTextContent(text);
-        }
+        // The aiming page owns its own target slot: the renderer only draws the world outline.
         if (hit == null) return;
         PoseStack pose = event.getPoseStack();
         Vec3 camera = event.getCamera().getPosition();

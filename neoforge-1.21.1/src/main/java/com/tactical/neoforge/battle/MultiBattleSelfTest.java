@@ -6,6 +6,7 @@ import com.tactical.neoforge.Tactical;
 import com.tactical.neoforge.battle.multi.ActionStamp;
 import com.tactical.neoforge.battle.multi.BattleEligibility;
 import com.tactical.neoforge.battle.multi.BattleRelationPolicy;
+import com.tactical.neoforge.skill.SkillText;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.server.MinecraftServer;
@@ -1645,14 +1646,14 @@ public final class MultiBattleSelfTest {
         };
         battle.relationPolicy(faction);
         check(battle.opposed(owner, guest), "identity-sensitive policy overrides the default same-side ally");
-        check(!"不能攻击友方".equals(battle.previewWeaponAttack(owner, guest)),
+        check(!SkillText.isKey(battle.previewWeaponAttack(owner, guest), SkillText.KEY_REJECT_FRIENDLY_FIRE),
                 "attack legality preview follows the identity policy, not sideOnly");
         check(!BattleParticipation.allied(owner, guest),
                 "friendly-fire protection follows the injected identity policy");
         battle.relationPolicy(pve);
         check(BattleParticipation.allied(owner, guest), "under PvE two members are allies again");
         check(!battle.opposed(owner, guest), "default PvE relations are restored");
-        check("不能攻击友方".equals(battle.previewWeaponAttack(owner, guest)),
+        check(SkillText.isKey(battle.previewWeaponAttack(owner, guest), SkillText.KEY_REJECT_FRIENDLY_FIRE),
                 "under PvE two members are allies for attack legality again");
         check(battle.opposed(zombie, owner), "a hostile remains opposed to a player under PvE");
         var chosen = battle.primaryOpponent(zombie);

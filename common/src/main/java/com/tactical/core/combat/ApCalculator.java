@@ -8,6 +8,8 @@ public final class ApCalculator {
     public static final int MELEE_COST = 10;
     public static final int ITEM_COST = 8;
     public static final int PLACE_COST = 10;
+    /** Base cost of one block break; breaking is its own command, never a placement or item price. */
+    public static final int BREAK_COST = 10;
     public static final int MIN_MOVE_COST = 4;
     public static final int MAX_MOVE_COST = 24;
     private static final double DEFAULT_MOVE_SPEED = 0.1D;

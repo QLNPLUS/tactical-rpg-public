@@ -9,13 +9,13 @@ config = "tactical.dungeons_input.mixins.json"
 config = "tactical.camera.mixins.json"
 
 [[mixins]]
-config = "tactical.ui.mixins.json"
-
-[[mixins]]
 config = "tactical.effects.mixins.json"
 
 [[mixins]]
 config = "tactical.creeper.mixins.json"
+
+[[mixins]]
+config = "tactical.witch.mixins.json"
 
 [[mixins]]
 config = "tactical.server.mixins.json"
@@ -41,13 +41,6 @@ type = "required"
 versionRange = "${minecraft_version_range}"
 ordering = "NONE"
 side = "BOTH"
-
-[[dependencies.${mod_id}]]
-modId = "apricityui"
-type = "required"
-versionRange = "[1.2.8,)"
-ordering = "NONE"
-side = "CLIENT"
 
 [[dependencies.tactical]]
 modId = "dungeons_iso"

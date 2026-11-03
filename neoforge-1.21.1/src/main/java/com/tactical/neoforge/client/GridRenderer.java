@@ -3,6 +3,7 @@ package com.tactical.neoforge.client;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import com.tactical.core.grid.GridPos;
+import com.tactical.neoforge.client.ui.theme.Palette;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.MultiBufferSource;
@@ -16,9 +17,6 @@ import org.joml.Matrix4f;
 public final class GridRenderer {
 
     private static final float CELL_INSET = 0.09F;
-    private static final float RED = 0x91 / 255.0F;
-    private static final float GREEN = 0xaf / 255.0F;
-    private static final float BLUE = 0xd9 / 255.0F;
 
     private GridRenderer() {
     }
@@ -46,14 +44,14 @@ public final class GridRenderer {
             for (GridPos cell : BattleClientState.reachable) {
                 float y = cell.y() + 0.02F;
                 addQuad(quads, matrix, cell.x() + CELL_INSET, y, cell.z() + CELL_INSET,
-                        1.0F - CELL_INSET * 2, RED, GREEN, BLUE, 0.30F);
+                        1.0F - CELL_INSET * 2, themeRed(), themeGreen(), themeBlue(), 0.30F);
             }
             buffers.endBatch(RenderType.debugQuads());
 
             VertexConsumer lines = buffers.getBuffer(RenderType.lines());
             for (GridPos cell : BattleClientState.reachable) {
                 LevelRenderer.renderLineBox(pose, lines, cellBox(cell, CELL_INSET, 0.02F),
-                        RED, GREEN, BLUE, 0.9F);
+                        themeRed(), themeGreen(), themeBlue(), 0.9F);
             }
             LevelRenderer.renderLineBox(pose, lines, cellBox(BattleClientState.playerCell(), 0.02F, 0.05F),
                     1.0F, 0.85F, 0.3F, 1.0F);
@@ -78,5 +76,18 @@ public final class GridRenderer {
         consumer.addVertex(matrix, x2, y, z).setColor(red, green, blue, alpha);
         consumer.addVertex(matrix, x2, y, z2).setColor(red, green, blue, alpha);
         consumer.addVertex(matrix, x, y, z2).setColor(red, green, blue, alpha);
+    }
+
+    /** Reachable cells follow the theme colour: one source, the same one the HUD accents use. */
+    private static float themeRed() {
+        return Palette.red(UiPalette.theme());
+    }
+
+    private static float themeGreen() {
+        return Palette.green(UiPalette.theme());
+    }
+
+    private static float themeBlue() {
+        return Palette.blue(UiPalette.theme());
     }
 }

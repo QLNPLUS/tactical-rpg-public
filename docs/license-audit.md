@@ -1,7 +1,5 @@
 # 第三方许可审计：YiRanExpressionLib 1.0.1
 
-> 注：本文中形如 `evidence/...` 的路径指私有开发树中的取证目录，**不随本公开源码快照发布**；保留它们只为追溯当时的取证位置，此处没有对应文件，也不能据此核对内容。
-
 本文件记录事实核查的结论与边界，服务于发布门判断。它不是法律意见，也不构成合规保证。凡证据只能支持“观察”的地方，本文不写成“证明”。
 
 ## 1. 结论摘要
@@ -35,7 +33,7 @@ sha256sum libs/maven/com/github/yiran1457/YiRanExpressionLib/1.0.1/*.jar \
 git hash-object libs/maven/com/github/yiran1457/YiRanExpressionLib/1.0.1/*.jar \
                 libs/maven/com/github/yiran1457/YiRanExpressionLib/1.0.1/*.pom \
                 licenses/YiRanExpressionLib-LICENSE.txt
-unzip -p <构建产物或本地发布包>/tactical-neoforge-1.21.1-<版本>.jar \
+unzip -p dist/tactical-neoforge-1.21.1-<版本>.jar \
       META-INF/jarjar/YiRanExpressionLib-1.0.1.jar > /tmp/nested.jar && sha256sum /tmp/nested.jar
 python tools/check_release.py            # 包内嵌套库字节 + JarJar 身份/区间/路径 + 唯一条目
 python -m unittest discover -s tools -p test_release_pipeline.py
@@ -81,7 +79,7 @@ javap -v  <同上>
 - 旧 JAR 为 62894 字节，SHA-256 `dbaa9f289b0e1a21ff8a0ce0b293ac05cc221e6f1383abc99663b37e1da51ab3`，git blob `7e5cf834…`，与 `QLNPLUS/Advanced-Leveling` 提交 `c4b34fe38ca6008fce844af584b610b249ecadbb`（2026-09-02T15:26:07Z）中的 blob 完全一致；引入该文件的提交为 `0419ff80`（“Make YiRanExpressionLib fallback reproducible”）。
 - 与官方 `universal` 制品比对（**两份归档同为 58 个条目、52 个文件条目**）：49 条逐字节相同；`META-INF/mods.toml` 仅 `loaderVersion` 不同（官方 `"[47,)"`，副本 `"[43,)"`）；`AstNode.class`、`Token.class` 字节不同，但 `javap -p -c` 输出完全相同，`javap -v` 去掉文件路径行与 `SHA-256 checksum` 行后各仅 2 行差异，且都位于 **`PermittedSubclasses`** 属性内——只差一条条目的位置（`AstNode$BinaryAstNode`、`Token$FunctionToken`）。此前本文件写“`InnerClasses` 中条目位置变化”，经 2026-10-28 用 JDK 21.0.5 的 `javap` 复核属**属性名误记**，已更正；`InnerClasses` 段在两个版本间完全相同，旧记录“各 12 行差异”亦不再成立。
 - 计数更正：此前本文件与 `NOTICE.md`、`libs/maven/README.md` 把同一比对写成“60 个归档条目、57 条相同”。对同一批字节重算得到 **58 个归档条目（52 个文件条目）、49 个文件条目逐字节相同**（另 3 条为 `mods.toml`、`AstNode.class`、`Token.class`），旧的计数有误，以本节为准；差异条目、大小与哈希结论本身未变。
-- 该副本的 `[43,)` 改动没有公开补丁或构建说明载体，制作方与意图至今未知（上下游均无说明；本轮未向上游询问谁构建了这份副本，也未创建 issue）。它现在已不在产品中，但作为历史事实保留：**旧版本已发布产物仍携带该副本**，追溯旧版本的来源仍需本节信息。
+- 该副本的 `[43,)` 改动没有公开补丁或构建说明载体，制作方与意图至今未知（上下游均无说明；按约束未联系作者、未创建 issue）。它现在已不在产品中，但作为历史事实保留：**旧版本已发布产物仍携带该副本**，追溯旧版本的来源仍需本节信息。
 
 ## 5. 未闭合与已知边界
 
@@ -91,8 +89,6 @@ javap -v  <同上>
 - **AGPL/LGPL 元数据冲突未解决**：JitPack POM 与仓库级元数据标 AGPL、提交源码标 LGPL，两者共存事实已确证，法律后果未定，不得断言 AGPL 肯定适用或不适用。
 - **JarJar 替换路径：隔离实测在其有限范围内通过，正式路径未测**：隔离副本只替换嵌套条目（其余 447 条与 `metadata.json` 字节一致）；运行期 `Expression`／`ExpressionBuilder` 由该被替换的嵌套 JAR 提供（与产品类同一 loader，可读到随机标记），并通过产品 API 完成一次公式烟测（`SkillFormula.compile` + `evaluate`，`base=10 level=3` → 17.5）。**未测**：正式启动器路径，以及任何库代码修改后的行为差异。
 - **1.0.1 再许可是否覆盖 1.0.0 的全部贡献者**未核实；仓库表现为单一维护者只是观察，不是证明。
-- **作者许可（已报告，未核实）**：项目维护者此前已取得库作者对本项目打包该库的许可——该事实于 2026-10-28 的会话中告知，**实际取得日期未知**；但**未提供任何许可文本、范围、当事方或证据**，因此本文件不引用、不解释、也不据此下结论；它既未核实，也不解除上述任何一项（官方字节可复现性、再许可覆盖范围、AGPL/LGPL 元数据冲突、LGPL-3.0 §4 组合路径）。只有把实际条款记录在案并对照随包字节复核，才算闭合。
-- **纪事纸张/皮革/金属装饰与回合头像边框（用户确认的权利，依据未记录）**：项目维护者确认自己拥有、或已获得这两族素材及其衍生图（`ui/textures/journal/*-source.png` 与 `*-tile.png`、`*-frame.png`；`ui/textures/turn-portrait-frame*.png`）在公开源码发布与作为 CF 模组使用/分发上的权利。本文件如实记为**用户陈述**：**未**记录权利人姓名、许可名称、授权范围文件或转让证据，**也**不把「允许使用与分发」推断为「允许按 LGPL-3.0-only 再许可」——项目自有许可声明不因此扩展到这两族素材。turn portrait 的输入图仍不在仓库内，其制作工具与来源无记录。此前把这两族记为「权属待核实」的表述，已被本条用户确认取代；事实层面的来源缺口仍然存在。
 - **法律门不是表态就能消除的**：即使权利人声明接受 LGPL-3.0 §4 路径，上面的事实缺口仍需闭合；反过来，事实证据齐备也不能替代授权决定。
 
 ## 6. 发布门与建议

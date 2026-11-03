@@ -36,23 +36,39 @@ required = [
  'com/tactical/neoforge/client/BattleScreenInput.class',
  'com/tactical/neoforge/client/BattleEntityLocator.class',
  'com/tactical/neoforge/client/TurnChargeHud.class',
- 'com/tactical/neoforge/client/JournalUiLayout.class',
+ 'com/tactical/neoforge/client/ui/hud/HudLayout.class',
+ 'com/tactical/neoforge/client/ui/layout/Scale.class',
  'com/tactical/neoforge/battle/TacticalAttributes.class',
  'com/tactical/neoforge/client/BattleTool.class',
- 'com/tactical/neoforge/client/WindowEntrance.class',
  'com/tactical/neoforge/client/PlayerStepAnimation.class',
- 'com/tactical/neoforge/mixin/TacticalAuiCursorMixin.class',
- 'tactical.camera.mixins.json', 'tactical.ui.mixins.json',
+ 'com/tactical/neoforge/client/UiZoom.class',
+ 'com/tactical/neoforge/client/CssScale.class',
+ 'com/tactical/neoforge/client/ui/screen/NativeTacticalScreen.class',
+ 'com/tactical/neoforge/client/ui/screen/TacticalSurface.class',
+ 'com/tactical/neoforge/client/ui/panel/NativePanelScreen.class',
+ 'com/tactical/neoforge/client/ui/command/BattleMenuScreen.class',
+ 'com/tactical/neoforge/client/ui/aim/BattleAimScreen.class',
+ 'com/tactical/neoforge/client/ui/facing/BattleFacingScreen.class',
+ 'com/tactical/neoforge/client/ui/skill/SkillMenuScreen.class',
+ 'com/tactical/neoforge/client/ui/hud/NativeHud.class',
+ 'com/tactical/neoforge/client/ui/hud/JournalViewport.class',
+ 'com/tactical/neoforge/client/ui/platform/Draw.class',
+ 'tactical.camera.mixins.json',
 ]
 with ZipFile(jar) as archive:
     names = set(archive.namelist())
     for path in required:
         assert path in names, f'missing {path}'
-    configs = ('tactical.camera.mixins.json', 'tactical.ui.mixins.json', 'tactical.effects.mixins.json', 'tactical.creeper.mixins.json', 'tactical.dungeons_input.mixins.json')
+    configs = ('tactical.camera.mixins.json', 'tactical.effects.mixins.json', 'tactical.creeper.mixins.json',
+               'tactical.dungeons_input.mixins.json', 'tactical.server.mixins.json')
     pack = json.loads(archive.read('pack.mcmeta'))
     assert pack['pack']['pack_format'] == 34
-    for page in ('screens/battle_move_choice.html', 'overlays/battle_log.html'):
-        assert 'assets/apricityui/apricity/tactical/' + page in names
+    # The bundled UI framework and its page sources are gone: no page, no font, no engine asset.
+    assert not any(name.startswith('assets/apricityui/') for name in names), \
+        'the retired UI dependency asset tree must not be packaged'
+    assert not any(name.startswith('com/sighs/') for name in names), \
+        'no class of the retired UI dependency may be packaged'
+    assert 'tactical.ui.mixins.json' not in names, 'the retired mixin config must not be packaged'
     for config in configs:
         mixins = json.loads(archive.read(config))
         if mixins.get('plugin'):
@@ -64,7 +80,10 @@ with ZipFile(jar) as archive:
             assert path in names, f'missing mixin class {path}'
     metadata = archive.read('META-INF/neoforge.mods.toml').decode()
     assert f'version = "{version}"' in metadata
-    assert 'tactical.camera.mixins.json' in metadata and 'tactical.ui.mixins.json' in metadata
+    assert 'tactical.camera.mixins.json' in metadata and 'tactical.server.mixins.json' in metadata
+    assert 'tactical.ui.mixins.json' not in metadata, 'the retired mixin config must not be declared'
+    assert 'apricity' not in metadata.lower(), 'the metadata must not require the retired UI dependency'
+    assert 'dungeons_iso' in metadata, 'the optional camera dependency must stay declared'
     assert 'license = "LGPL-3.0-only"' in metadata, 'mod metadata must declare LGPL-3.0-only'
     licence = archive.read('META-INF/LICENSE')
     assert licence == (root / 'licenses/YiRanExpressionLib-LICENSE.txt').read_bytes(), \
@@ -80,30 +99,11 @@ with ZipFile(jar) as archive:
     # agree with the resolved Maven artifact, under the pinned JarJar identity/range/path.
     expression_lib.check_local_artifact(root)
     nested_sha = expression_lib.check_nested(archive, root, names)
-    # The UI renders with the vanilla font; the leftover third-party font must not ship.
+    # The interface draws its own shapes and text; no font file may be packaged.
     assert not any(name.lower().endswith('.ttf') for name in names), 'no font file may be packaged'
-    assert 'assets/apricityui/apricity/tactical/lxgw3500.ttf' not in names
-    page = archive.read('assets/apricityui/apricity/tactical/screens/battle_inventory.html').decode()
-    assert len(re.findall(r'<slot\s', page)) == 36
-    assert 'slot > item { left:0; top:0; width:100%; height:100%' in page
-    prefix = 'assets/apricityui/apricity/tactical/'
-    # Hint overlay: no journal chrome. tools/apply_journal_theme.py does not theme it either.
-    non_journal_pages = {'overlays/nearby_hint.html'}
-    for file in sorted((root / 'ui').rglob('*')):
-        if not file.is_file() or file.suffix not in ('.html', '.png', '.css', '.json'):
-            continue
-        path = prefix + file.relative_to(root / 'ui').as_posix()
-        assert path in names, f'missing journal asset {path}'
-        assert archive.read(path) == file.read_bytes(), f'stale journal asset {path}'
-        if file.suffix == '.html':
-            html = archive.read(path).decode('utf-8')
-            # Every page renders with the vanilla font; only the journal pages carry the theme hook.
-            assert 'name="aui-font-mode" content="mc"' in html, path
-            assert 'html { font-size:14px; }' in html, f'missing AUI em fallback {path}'
-            if file.relative_to(root / 'ui').as_posix() in non_journal_pages:
-                assert 'data-tactical-theme' not in html, f'{path} must stay theme-free'
-            else:
-                assert 'data-tactical-theme="gilded-journal"' in html, path
+    # The shipped language files stay: every native label resolves from them.
+    for lang in ('assets/tactical/lang/en_us.json', 'assets/tactical/lang/zh_cn.json'):
+        assert lang in names, f'missing {lang}'
     assert not any('agenthelper' in name.lower() for name in names)
 print(f'PASS packaging: {jar.name} ({jar.stat().st_size} bytes)')
 print(f'SHA256 {sha256(jar.read_bytes()).hexdigest()}')

@@ -40,7 +40,7 @@ const SERVERS = {
 const SERVER = SERVERS.server;
 const CLIENTS = {
     clientA: {role: 'clientA', gameDir: 'run-multiplayer-a', username: 'TacticalA', uuid: 'bf8308eb-ed73-3ea9-b5fa-a235825ad642', bridgePort: 25590},
-    clientB: {role: 'clientB', gameDir: 'run-multiplayer-b', username: 'TacticalB', uuid: '72b726e2-87b6-3e68-a317-5b1b52afbe7a', bridgePort: 25591},
+    clientB: {role: 'clientB', gameDir: 'run-multiplayer-b', username: 'TacticalB', uuid: '72b726e2-87b6-3e68-a317-5b1b52afbe7a', bridgePort: 25593},
 };
 const MOD_PREFIXES = ['agenthelper-', 'dungeons_iso-'];
 const POINTER = '.tactical-mp-harness.json';
@@ -326,7 +326,6 @@ async function prepareClient(client) {
         bridgePort: client.bridgePort,
         serverEndpoint: `${SERVER_HOST}:${SERVER.port}`,
         mods,
-        apuiExternalDebug: 'disabled for this run by -Dapricityui.debug.enabled=false',
     }, null, 2) + '\n');
 
     report.prepared.push({role: client.role, gameDir: client.gameDir, mods, bridgePort: client.bridgePort, options: optionsState});
@@ -385,7 +384,7 @@ async function verifyGradleMentions() {
             if (!text.includes(needle)) problem(`build.gradle does not mention ${needle}`);
         }
     }
-    for (const needle of [runs.server, SERVER.gameDir, String(SERVER.port), 'apricityui.debug.enabled']) {
+    for (const needle of [runs.server, SERVER.gameDir, String(SERVER.port)]) {
         if (!text.includes(needle)) problem(`build.gradle does not mention ${needle}`);
     }
     report.verified.push('build.gradle mentions every harness run block, directory, identity and port');

@@ -65,6 +65,8 @@ public final class SkillSelfTest {
     private static final ResourceLocation TRIANGLE = id("fixture_skill_triangle");
     private static final ResourceLocation INVALID = id("fixture_skill_nonfinite");
     private static final ResourceLocation EXTENSION = id("fixture_skill_extension");
+    private static final ResourceLocation THROWING = id("fixture_skill_throwing_condition");
+    private static final ResourceLocation LITERAL_REJECT = id("fixture_skill_literal_reject");
     private static final List<Entity> entities = new ArrayList<>();
     private static final List<Wire> wires = new ArrayList<>();
     private static final List<BlockPos> chunks = new ArrayList<>();
@@ -241,6 +243,22 @@ public final class SkillSelfTest {
             .damage(ResourceLocation.withDefaultNamespace("magic"), "fixture_bonus+native_power+target_guard")
             .action(context -> { check(context.caster() == owner && context.level() == 2 && context.affected().equals(List.of(enemy)),
                 "public custom action receives authoritative caster, source level and deduplicated target"); actionCalls++; }).build());
+        // A third-party condition that throws is a server-side defect: the player must read one stable
+        // sentence and the encounter must keep its resources, whatever the defect is.
+        SkillConditions.register(id("fixture_throwing_condition"), context -> {
+            throw new IllegalStateException("fixture condition failure");
+        });
+        register(THROWING, """
+            {"aim":"entity","range":"10","ap_cost":"15","mp_cost":"10",
+             "conditions":["tactical:fixture_throwing_condition"]}
+            """);
+        // A third-party validator answers with finished text; it must stay that text.
+        SkillRegistry.register(SkillDefinition.builder(LITERAL_REJECT).aim(SkillDefinition.Aim.ENTITY).range("10")
+            .costs("15", "10")
+            .action(new SkillDefinition.Action() {
+                @Override public String validate(SkillCastContext context) { return "自定义条件未满足"; }
+                @Override public void apply(SkillCastContext context) { actionCalls++; }
+            }).build());
     }
     private static void register(ResourceLocation id, String definition) { SkillRegistry.register(SkillDefinition.parse(id, json(definition))); }
     private static JsonObject json(String value) { return JsonParser.parseString(value).getAsJsonObject(); }
@@ -260,7 +278,7 @@ public final class SkillSelfTest {
         close(ManaResources.current(owner), 37, "battle entry preserves current MP instead of refilling");
         check(battle.isParticipant(enemy) && battle.isParticipant(second), "loaded native hostile roster");
         check(battle.tryAddFriendly(friend), "native party member recruited through public API");
-        sourceCases(); rejectionCases(); meleeCases(); recoveryCases(); formulaAndAreaCases();
+        sourceCases(); rejectionCases(); meleeCases(); recoveryCases(); formulaAndAreaCases(); rejectionTextCases();
     }
 
     private static void sourceCases() {
@@ -324,7 +342,7 @@ public final class SkillSelfTest {
         check(TacticalSkills.cooldown(battle, owner, BACKSTAB) == 1, "successful skill starts cooldown1");
         check(battle.quoteActorActionCost(owner, 15, true) == 19, "successful skill joins the shared25percent AP ramp");
         denied(BACKSTAB, SkillTarget.entity(enemy.getUUID()), "same-turn replay rejected without extra costs");
-        check(TacticalSkills.available(battle, owner).stream().anyMatch(a -> a.id().equals(BACKSTAB) && !a.ready() && !a.reason().isBlank()),
+        check(TacticalSkills.available(battle, owner).stream().anyMatch(a -> a.id().equals(BACKSTAB) && !a.ready() && !a.reason().getString().isBlank()),
             "unavailable owned skill remains visible with reason");
         owner.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.IRON_SWORD));
         check(!SkillSources.resolve(owner).containsKey(BACKSTAB) && TacticalSkills.cooldown(battle, owner, BACKSTAB) == 1,
@@ -409,6 +427,68 @@ public final class SkillSelfTest {
         check(BattleManager.start(owner, true), "same real player can reenter encounter"); battle = BattleManager.current();
         close(ManaResources.current(owner), remaining, "reentry never refills saved MP");
         check(TacticalSkills.cooldown(battle, owner, BACKSTAB) == 0, "new battle resets old cooldown");
+    }
+
+    /**
+     * What the player reads when a cast is refused.
+     *
+     * <p>Every refusal is display structure now: an expected decision carries its own key, a third-party
+     * validator's finished text stays that text, and a broken condition turns into one stable generic
+     * sentence whose real cause stays in the server log - never in the journal row the player reads.</p>
+     */
+    private static void rejectionTextCases() throws Exception {
+        begin(enemy);
+        SkillPreview offTurn = TacticalSkills.preview(battle, owner, BACKSTAB, SkillTarget.entity(enemy.getUUID()));
+        check(!offTurn.valid() && SkillText.isKey(offTurn.reason(), SkillText.KEY_REASON_NOT_MY_TURN),
+            "an off-turn preview answers with a stable reason key instead of a server sentence");
+        begin(owner);
+
+        persistent(LITERAL_REJECT, 1); prepare(enemy);
+        Snapshot before = snapshot(LITERAL_REJECT);
+        com.tactical.neoforge.network.ServerPackets.startCapture();
+        check(!TacticalSkills.cast(battle, owner, LITERAL_REJECT, SkillTarget.entity(enemy.getUUID())),
+            "a custom validator's refusal rejects the cast");
+        check(before.equals(snapshot(LITERAL_REJECT)), "its refusal keeps AP/MP/count/cooldown/health untouched");
+        check(literalRejectRow(owner, "自定义条件未满足"),
+            "the custom validator's finished text is displayed literally, never guessed to be a key");
+
+        persistent(THROWING, 1); prepare(enemy);
+        before = snapshot(THROWING);
+        com.tactical.neoforge.network.ServerPackets.startCapture();
+        check(!TacticalSkills.cast(battle, owner, THROWING, SkillTarget.entity(enemy.getUUID())),
+            "a broken third-party condition rejects the cast instead of failing it");
+        check(before.equals(snapshot(THROWING)), "an unexpected failure still preserves every resource");
+        check(rejectRowIsKey(owner, SkillText.KEY_REJECT_UNEXPECTED),
+            "an unexpected failure gives the player one stable generic sentence");
+        check(!rejectRowContains(owner, "IllegalStateException") && !rejectRowContains(owner, "fixture condition failure"),
+            "the real cause never reaches the row the player reads");
+        SkillPreview broken = TacticalSkills.preview(battle, owner, THROWING, SkillTarget.entity(enemy.getUUID()));
+        check(!broken.valid() && SkillText.isKey(broken.reason(), SkillText.KEY_REJECT_UNEXPECTED),
+            "the preview path answers with the same stable sentence");
+    }
+
+    /** The newest reject row this member was actually sent, as display structure. */
+    private static net.minecraft.network.chat.Component lastRejectRow(ServerPlayer recipient) {
+        net.minecraft.network.chat.Component row = null;
+        for (net.minecraft.network.protocol.common.custom.CustomPacketPayload payload
+                : com.tactical.neoforge.network.ServerPackets.capturedFor(recipient.getUUID())) {
+            if (!(payload instanceof com.tactical.neoforge.network.BattleLogPacket log)) continue;
+            for (com.tactical.neoforge.network.BattleLogPacket.Entry entry : log.history())
+                if ("reject".equals(entry.category())) row = entry.text();
+        }
+        return row;
+    }
+    private static boolean literalRejectRow(ServerPlayer recipient, String expected) {
+        net.minecraft.network.chat.Component row = lastRejectRow(recipient);
+        return row != null && row.getContents() instanceof net.minecraft.network.chat.contents.PlainTextContents plain
+            && expected.equals(plain.text()) && row.getSiblings().isEmpty();
+    }
+    private static boolean rejectRowIsKey(ServerPlayer recipient, String key) {
+        return SkillText.isKey(lastRejectRow(recipient), key);
+    }
+    private static boolean rejectRowContains(ServerPlayer recipient, String text) {
+        net.minecraft.network.chat.Component row = lastRejectRow(recipient);
+        return row != null && row.getString().contains(text);
     }
 
     private record Snapshot(int ap, double mp, int paid, int cooldown, Map<UUID, Float> health) {}

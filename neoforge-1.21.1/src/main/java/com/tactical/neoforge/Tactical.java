@@ -22,7 +22,13 @@ public final class Tactical {
 
     public Tactical(IEventBus modEventBus, ModContainer modContainer) {
         com.tactical.neoforge.battle.TacticalAttributes.register(modEventBus);
+        // Companion kinds are a plain factory table, not a registry: the built-in wolf adapter is installed
+        // exactly once here, and an add-on may register its own before a battle ever runs.
+        com.tactical.neoforge.registry.companion.CompanionRegistry.registerDefaults();
         com.tactical.neoforge.skill.ManaAttributes.register(modEventBus);
+        // Character growth owns its own registration entry point: the attribute, the lifecycle listeners
+        // and the skill formula variables are all installed exactly once, from here.
+        com.tactical.neoforge.progression.ProgressionHandler.register(modEventBus);
         modEventBus.addListener(TacticalNetwork::register);
         NeoForge.EVENT_BUS.addListener(TacticalCommands::register);
         NeoForge.EVENT_BUS.addListener(BattleManager::onServerTick);
@@ -32,8 +38,16 @@ public final class Tactical {
         NeoForge.EVENT_BUS.addListener(BattleItemLock::onRightClickBlock);
         NeoForge.EVENT_BUS.addListener(BattleItemLock::onLeftClickBlock);
         NeoForge.EVENT_BUS.addListener(BattleItemLock::onUseItem);
+        NeoForge.EVENT_BUS.addListener(BattleItemLock::onEntityInteract);
+        NeoForge.EVENT_BUS.addListener(BattleItemLock::onEntityInteractSpecific);
         NeoForge.EVENT_BUS.addListener(ServerSelfTest::onServerStarted);
         NeoForge.EVENT_BUS.addListener(ServerSelfTest::onServerTick);
+        // Companion fixture: a real server drives the production recruitment, order and release paths.
+        NeoForge.EVENT_BUS.addListener(com.tactical.neoforge.battle.CompanionSelfTest::started);
+        NeoForge.EVENT_BUS.addListener(com.tactical.neoforge.battle.CompanionSelfTest::tick);
+        // Fixture-only entity type for the entity_item server self test: registered only while that
+        // fixture runs, so a normal run and every release never see it.
+        com.tactical.neoforge.battle.EntityItemSelfTest.registerFixtureType(modEventBus);
         modContainer.registerConfig(net.neoforged.fml.config.ModConfig.Type.COMMON,
                 TacticalConfig.SPEC, "%s-common.toml".formatted(MOD_ID));
         LOGGER.info("[Tactical] bootstrap on {} (common: {})",

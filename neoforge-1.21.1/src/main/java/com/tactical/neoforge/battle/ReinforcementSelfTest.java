@@ -145,8 +145,8 @@ public final class ReinforcementSelfTest {
             encounter = BattleManager.current();
             check(encounter.enemyCount() == 2 && encounter.isParticipant(owner), "cap2 counts enemies, excludes owner");
             check(encounter.isParticipant(first) && encounter.isParticipant(second), "nearest initial enemies selected");
-            check(!overflow.isNoAi() && overflow.getTarget() == owner && !encounter.isParticipant(overflow),
-                    "initial overflow retains native AI and aggro");
+            check(!overflow.isNoAi() && !encounter.isParticipant(overflow),
+                    "initial overflow keeps native AI and stays outside the roster");
             check(!otherTarget.isNoAi() && otherTarget.getTarget() == other, "other-player target untouched");
             check(locked.isNoAi() && locked.getTarget() == null, "preexisting bystander AI lock untouched");
             check(!encounter.tryAbsorb(far), "outside-attacker path enforces full cap");
@@ -162,10 +162,12 @@ public final class ReinforcementSelfTest {
             check(encounter.enemyCount() == 2, "overflow refills dead slot");
             check(encounter.phaseName().equals(phase) && encounter.currentAp() == ap, "reinforcement does not reset owner turn/AP");
             snapshot();
-            // All present enemies disappear on one real tick, with a pending native aggro target.
-            late.setNoAi(false); late.setTarget(owner);
+            // All present enemies disappear on one real tick. The legitimate target is assigned
+            // after the slots are freed: while the roster is full the isolation gate suppresses
+            // re-locking, and this fixture must test refill, not suppression.
             second.setHealth(0); second.discard();
             overflow.setHealth(0); overflow.discard();
+            late.setNoAi(false); late.setTarget(owner);
             next();
         } else if (stage == 2) {
             sameEncounter();
@@ -209,7 +211,7 @@ public final class ReinforcementSelfTest {
             check(locked.isNoAi(), "release does not mutate nonparticipant original-true AI");
             check(!otherTarget.isNoAi() && !neutral.isNoAi(), "release does not freeze nonparticipants");
             check(wire(owner).inactiveCount() == inactive + 1 && wire(other).states.isEmpty(), "only owner receives one exit state");
-            Tactical.LOGGER.info("[Tactical] REINFORCEMENT SELFTEST PASSED: real loaded cross-border entities, cap excludes owner, native target autojoin <=10 ticks, untouched overflow/bystanders, duplicate queue protection, dead-slot and last-dead refill without reset, aerial Y, bounded scanning/outside expansion, flee grace, participant-only AI release, owner-only packets");
+            Tactical.LOGGER.info("[Tactical] REINFORCEMENT SELFTEST PASSED: real loaded cross-border entities, cap excludes owner, native target autojoin <=10 ticks, cap-refused overflow keeps native AI without freezing, duplicate queue protection, dead-slot and last-dead refill without reset, aerial Y, bounded scanning/outside expansion, flee grace, participant-only AI release, owner-only packets (cap-refused eviction is covered by IsolationSelfTest)");
             finish(server);
         }
     }

@@ -58,9 +58,12 @@ public final class CombatModifiers {
         if (attacker instanceof Mob mob && !targetProtected && battle.tryAbsorb(mob)) {
             return;
         }
+        // The hit is refused, but a refusal is not an exit: at cap the attacker is handed to this
+        // encounter's isolation, so it leaves the battlefield instead of crowding the members.
+        if (attacker instanceof Mob mob && !targetProtected) battle.isolateIntruder(mob);
         event.setCanceled(true);
         if (attacker instanceof ServerPlayer player) {
-            player.sendSystemMessage(Component.literal("[Tactical] 你不在战场内，无法攻击战场目标"));
+            BattleText.chat(player, Component.translatable(BattleText.KEY_CHAT_OUTSIDER_ATTACK));
         }
     }
 
@@ -78,15 +81,20 @@ public final class CombatModifiers {
         if (!battle.isParticipant(attacker) || !battle.isParticipant(target)) {
             return;
         }
-        // Guard is per defender: one member raising a shield never protects another member.
-        boolean guarding = target instanceof net.minecraft.server.level.ServerPlayer defender
-                && battle.isDefending(defender);
-        double defense = guarding ? (battle.hasShield(target) ? 0.3D : 0.5D) : 1.0D;
+        // Guard is per defender: one participant raising a guard never protects another one, and the same
+        // rule covers a player body and a hand-commanded companion, so neither shields the other.
+        boolean guarding = battle.isDefending(target);
+        double defense = ServerBattle.guardFactor(battle.hasShield(target), guarding);
         double multiplier=defense;
         if(PositionalCombat.eligible(event.getSource(),attacker)){
             var factors=PositionalCombat.evaluate(attacker,target,event.getSource());
             multiplier*=factors.total();
-            if(event.getNewDamage()>0)battle.journal().record("damage",PositionalCombat.summary(factors,defense));
+            // Only the display is filtered: a breakdown whose every modifier is neutral writes no row at all,
+            // while the multipliers, the damage below and the raw combat events are exactly as they were.
+            if(event.getNewDamage()>0) {
+                Component row = PositionalCombat.summary(factors, defense);
+                if (row != null) battle.journal().record("damage", row);
+            }
         }
         if(multiplier!=1.0D){
             double amount=event.getNewDamage()*multiplier;

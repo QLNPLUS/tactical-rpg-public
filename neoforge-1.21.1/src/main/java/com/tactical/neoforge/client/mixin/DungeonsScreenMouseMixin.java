@@ -2,6 +2,7 @@ package com.tactical.neoforge.client.mixin;
 
 import com.tactical.neoforge.client.BattleScreenInput;
 import com.tactical.neoforge.client.DungeonsInputBridge;
+import com.tactical.neoforge.client.WheelTrace;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.MouseHandler;
 import org.spongepowered.asm.mixin.Mixin;
@@ -35,6 +36,9 @@ public abstract class DungeonsScreenMouseMixin {
 
     @Inject(method = "onScroll", at = @At("HEAD"), cancellable = true, require = 0)
     private void tactical$wheel(long window, double x, double y, CallbackInfo ci) {
-        if (window == Minecraft.getInstance().getWindow().getWindow() && BattleScreenInput.scroll(y)) ci.cancel();
+        if (window != Minecraft.getInstance().getWindow().getWindow()) return;
+        boolean consumed = BattleScreenInput.scroll(y);
+        WheelTrace.notch("bridge", y, consumed ? "consumed" : "passed");
+        if (consumed) ci.cancel();
     }
 }

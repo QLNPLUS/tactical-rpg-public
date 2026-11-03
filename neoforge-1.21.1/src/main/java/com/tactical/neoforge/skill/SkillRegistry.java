@@ -23,8 +23,12 @@ public final class SkillRegistry {
     private static volatile Map<ResourceLocation,SkillDefinition> SNAPSHOT=Map.of();
     private static volatile long revision;
     static {
+        // The builtin skill is the one definition this mod itself ships, so it declares an explicit
+        // translation identity; the authored Chinese line stays the fallback of both keys.
         register(SkillDefinition.builder(ResourceLocation.fromNamespaceAndPath("tactical","backstab")).json(JsonParser.parseString("""
             {"name":"背刺","description":"从背后发动原版近战，技能倍率随等级提高。","max_level":5,
+             "name_key":"tactical.skill.backstab.name",
+             "description_key":"tactical.skill.backstab.description",
              "aim":"entity","targets":["enemy"],"range":"1.5","ap_cost":"15","mp_cost":"10","cooldown":"1",
              "conditions":["tactical:melee_weapon","tactical:rear"],
              "damage":{"mode":"weapon","multiplier":"1+0.25*level"},

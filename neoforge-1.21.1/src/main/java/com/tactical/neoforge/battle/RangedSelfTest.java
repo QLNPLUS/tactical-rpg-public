@@ -8,6 +8,7 @@ import com.tactical.neoforge.network.BattleStatePacket;
 import io.netty.channel.embedded.EmbeddedChannel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.Connection;
+import net.minecraft.network.chat.contents.TranslatableContents;
 import net.minecraft.network.PacketSendListener;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
@@ -75,7 +76,7 @@ public final class RangedSelfTest {
         if (arrow.getOwner() == owner) playerShots++;
         if (arrow.getOwner() == skeleton) {
             skeletonShots++;
-            int turn = wire.state == null ? -1 : wire.state.round();
+            int turn = state() == null ? -1 : state().round();
             skeletonShotsByTurn.merge(turn, 1, Integer::sum);
         }
     }
@@ -183,10 +184,11 @@ public final class RangedSelfTest {
     private static void checkPendingEnemyShot() {
         require(!skeletonShotsByTurn.containsKey(-1)
                 && skeletonShotsByTurn.values().stream().allMatch(count -> count == 1),
-                "at most one shot per authoritative skeleton own turn");
+                "at most one shot per authoritative skeleton own turn: shots by round=" + skeletonShotsByTurn
+                        + ", state=" + (state() == null ? "none" : "round " + state().round()));
         if (battle.pendingProjectiles() == 0) return;
         require(!battle.isPlayerTurnNow(), "pending enemy arrow cannot hand control to player");
-        require(wire.state != null && wire.state.actorEntityId() == skeleton.getId(), "pending projectile keeps skeleton as current actor");
+        require(state() != null && state().actorEntityId() == skeleton.getId(), "pending projectile keeps skeleton as current actor");
     }
 
     private static void checkCoverAndRejection() {
@@ -209,13 +211,17 @@ public final class RangedSelfTest {
         }
         int ap = battle.currentAp(), ammo = owner.getOffhandItem().getCount();
         int durability = owner.getMainHandItem().getDamageValue(), shots = playerShots;
-        long sequence = wire.log == null ? 0 : wire.log.sequence();
+        long sequence = log() == null ? 0 : log().sequence();
         battle.tryAttack(skeleton.getUUID());
         require(battle.currentAp() == ap && owner.getOffhandItem().getCount() == ammo
                 && owner.getMainHandItem().getDamageValue() == durability && playerShots == shots
                 && battle.pendingProjectiles() == 0, "sealed-world rejection preserves AP/ammo/durability and creates no arrow");
-        require(wire.log != null && wire.log.sequence() > sequence
-                && wire.log.history().stream().anyMatch(entry -> entry.text().contains("弹道")),
+        // The row is structure now, so the assertion names the key instead of a sentence: the row is the
+        // ballistic obstruction refusal, and the wording itself is resolved by the client in its language.
+        require(log() != null && log().sequence() > sequence
+                && log().history().stream().anyMatch(entry ->
+                        entry.text().getContents() instanceof TranslatableContents contents
+                                && BattleText.KEY_REJECT_NO_BALLISTIC.equals(contents.getKey())),
                 "authoritative rejection records its ballistic obstruction reason");
         for (int x = -1; x <= 1; x++) for (int z = -1; z <= 1; z++) for (int y = 0; y <= 3; y++) {
             level.setBlock(target.offset(x, y, z), Blocks.AIR.defaultBlockState(), 3);
@@ -240,6 +246,9 @@ public final class RangedSelfTest {
         owner = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
         wire = new RecordingConnection();
         wire.channel = new EmbeddedChannel(wire);
+        // Fixture-only publication capture: a snapshot is recorded before it is cut for transport, so the
+        // logical state this fixture reasons about is what the server really attempted to publish.
+        com.tactical.neoforge.network.ServerPackets.startCapture();
         for (String id : List.of("battle_state", "battle_log", "player_step", "creeper_telegraph", "move_choice_offer")) {
             ChannelAttributes.getOrCreateAdHocChannels(wire).add(ResourceLocation.fromNamespaceAndPath(Tactical.MOD_ID, id));
         }
@@ -270,10 +279,31 @@ public final class RangedSelfTest {
         if (skeleton != null) skeleton.discard();
         if (owner != null && !owner.isRemoved()) level.removePlayerImmediately(owner, Entity.RemovalReason.DISCARDED);
         if (wire != null && wire.channel != null) wire.channel.finishAndReleaseAll();
+        com.tactical.neoforge.network.ServerPackets.stopCapture();
         if (level != null) for (BlockPos chunk : forced) level.setChunkForced(chunk.getX(), chunk.getZ(), false);
         forced.clear();
         BattleEffects.clear();
         server.halt(false);
+    }
+
+    /** The last battle snapshot the server attempted to publish to the fixture owner. */
+    private static BattleStatePacket state() {
+        if (owner == null) return null;
+        BattleStatePacket last = null;
+        for (var payload : com.tactical.neoforge.network.ServerPackets.capturedFor(owner.getUUID())) {
+            if (payload instanceof BattleStatePacket snapshot) last = snapshot;
+        }
+        return last;
+    }
+
+    /** The last journal snapshot the server attempted to publish to the fixture owner. */
+    private static BattleLogPacket log() {
+        if (owner == null) return null;
+        BattleLogPacket last = null;
+        for (var payload : com.tactical.neoforge.network.ServerPackets.capturedFor(owner.getUUID())) {
+            if (payload instanceof BattleLogPacket packet) last = packet;
+        }
+        return last;
     }
 
     private static void require(boolean condition, String message) {

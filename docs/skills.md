@@ -72,4 +72,4 @@ SkillRegistry.register(SkillDefinition.builder(id)
 
 ## 许可证与打包
 
-YiRanExpressionLib 通过 Jar-in-Jar 打包，坐标沿用 Advanced-Leveling **for NeoForge 1.21.1 当年内嵌 1.0.1 时**使用的 `com.github.yiran1457:YiRanExpressionLib:1.0.1`，严格区间 `[1.0.1]`。**这不构成与 Advanced Leveling 当前版本的兼容声明**：实测 `AdvancedLeveling-1.21.1-1.0.1-fix` 内嵌另一个库（`version="1.0.0"`、`license="AGPL v3.0"`）并请求区间 `[1.21.1-NeoForge-1.0.0,)`，且要求 NeoForge `[21.1.248,)`；两者在隔离专用服务器同时加载时于启动前以 JarJar `VERSION_RESOLUTION_FAILED` 失败。该实测只说明那两个模组各自的版本请求在该次运行中冲突，不是本库字节替换造成的，也不代表更早版本同样失败；兼容该分发不在本项目目标内。库的来源、校验和和许可证见 [libs/maven/README.md](../libs/maven/README.md) 与 [NOTICE.md](../NOTICE.md)。
+YiRanExpressionLib 按 Advanced-Leveling NeoForge 1.21.1 使用的坐标 `com.github.yiran1457:YiRanExpressionLib:1.0.1` 通过 Jar-in-Jar 打包，严格范围 `[1.0.1]`，保持与同样打包该库的模组兼容。库的来源、校验和和许可证见 [libs/maven/README.md](../libs/maven/README.md) 与 [NOTICE.md](../NOTICE.md)。

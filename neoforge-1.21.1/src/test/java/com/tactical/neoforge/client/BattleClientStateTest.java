@@ -14,10 +14,12 @@ class BattleClientStateTest {
         BattleClientState.ap=77; BattleClientState.maxAp=100; BattleClientState.moveCost=12;
         BattleClientState.playerX=1; BattleClientState.playerY=99; BattleClientState.playerZ=2;
         BattleClientState.reachable.add(new GridPos(1,99,3));
-        BattleClientState.actor="another player's avatar";
-        BattleClientState.order=List.of("owner","enemy");
+        BattleClientState.actor=net.minecraft.network.chat.Component.literal("another player's avatar");
+        BattleClientState.order=List.of(net.minecraft.network.chat.Component.literal("owner"),
+                net.minecraft.network.chat.Component.literal("enemy"));
         BattleClientState.gauges=new int[]{50,100}; BattleClientState.cursor=1;
-        BattleClientState.weapon="bow"; BattleClientState.weaponKind=1; BattleClientState.weaponRange=16;
+        BattleClientState.weapon=net.minecraft.network.chat.Component.literal("bow");
+        BattleClientState.weaponKind=1; BattleClientState.weaponRange=16;
         BattleClientState.centerX=1; BattleClientState.centerY=99; BattleClientState.centerZ=2; BattleClientState.zoneRadius=24;
         BattleClientState.moving=true; BattleClientState.actorEntityId=42; BattleClientState.actionCount=8;
         BattleClientState.defending=true; BattleClientState.mode=BattleMode.MOVE; BattleClientState.selectedSlot=4;
@@ -31,12 +33,14 @@ class BattleClientStateTest {
             assertEquals(0,BattleClientState.ap+BattleClientState.maxAp+BattleClientState.moveCost);
             assertEquals(new GridPos(0,0,0),BattleClientState.playerCell());
             assertTrue(BattleClientState.reachable.isEmpty());assertTrue(BattleClientState.participantHealth.isEmpty());
-            assertEquals("",BattleClientState.actor);assertTrue(BattleClientState.order.isEmpty());assertEquals(0,BattleClientState.gauges.length);
-            assertEquals(0,BattleClientState.cursor);assertEquals("",BattleClientState.weapon);
+            assertEquals("",BattleClientState.actor.getString(),"the mirror keeps structure, not text");
+            assertTrue(BattleClientState.order.isEmpty());assertEquals(0,BattleClientState.gauges.length);
+            assertEquals(0,BattleClientState.cursor);assertEquals("",BattleClientState.weapon.getString());
             assertEquals(0,BattleClientState.weaponKind+BattleClientState.weaponRange);
             assertEquals(0,BattleClientState.centerX+BattleClientState.centerY+BattleClientState.centerZ+BattleClientState.zoneRadius);
             assertFalse(BattleClientState.moving);assertEquals(-1,BattleClientState.actorEntityId);assertEquals(0,BattleClientState.actionCount);
             assertFalse(BattleClientState.defending);assertEquals(BattleMode.NONE,BattleClientState.mode);assertEquals(-1,BattleClientState.selectedSlot);assertTrue(BattleClientState.dirty);
+            assertFalse(BattleClientState.blockEntry,"the main-hand command entry never survives an exit");
             assertEquals(-1,BattleClientState.selfEntityId);assertNull(BattleClientState.sessionId);assertEquals(0L,BattleClientState.turnEpoch);
             assertNull(BattleClientState.stamp());
         }

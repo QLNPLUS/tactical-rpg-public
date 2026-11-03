@@ -18,14 +18,21 @@ import com.tactical.neoforge.battle.multi.BattleRelationPolicy;
 import com.tactical.neoforge.battle.multi.BattleSession;
 import com.tactical.neoforge.battle.multi.PlayerParticipant;
 import com.tactical.neoforge.battle.multi.SessionIndex;
+import com.tactical.neoforge.api.companion.CompanionAbility;
+import com.tactical.neoforge.api.companion.CompanionAdapter;
+import com.tactical.neoforge.battle.terrain.TerrainFall;
 import com.tactical.neoforge.network.MoveChoiceOfferPacket;
+import com.tactical.neoforge.registry.companion.CompanionRegistry;
 import com.tactical.neoforge.battle.ai.*;
 import com.tactical.core.combat.ProjectileAim;
+import com.tactical.core.combat.RangedWeapon;
+import com.tactical.core.combat.ThrowProfile;
 import com.tactical.core.grid.GridPos;
 import com.tactical.neoforge.Tactical;
 import com.tactical.neoforge.TacticalConfig;
 import com.tactical.neoforge.skill.TacticalSkills;
 import com.tactical.neoforge.skill.SkillAvailability;
+import com.tactical.neoforge.skill.SkillText;
 import com.tactical.neoforge.skill.SkillTarget;
 import com.tactical.neoforge.network.BattleStatePacket;
 import com.tactical.neoforge.network.PlayerStepPacket;
@@ -33,39 +40,62 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.network.protocol.game.ClientboundContainerClosePacket;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundSource;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.world.Difficulty;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.ai.attributes.AttributeModifier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.entity.monster.Vindicator;
+import net.minecraft.world.entity.monster.Witch;
+import net.minecraft.world.entity.projectile.ThrownPotion;
+import net.minecraft.world.effect.MobEffect;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.CrossbowItem;
 import net.minecraft.world.item.BowItem;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.alchemy.Potion;
+import net.minecraft.world.item.alchemy.PotionContents;
 import net.minecraft.world.item.component.ChargedProjectiles;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.GameRules;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
+import net.minecraft.util.Mth;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
+import net.neoforged.neoforge.common.CommonHooks;
 import net.neoforged.neoforge.network.PacketDistributor;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 /**
  * One turn-based encounter. Server-authoritative: the client only sends intents
@@ -87,6 +117,11 @@ public final class ServerBattle {
     private static final int PLAYER_STEP_TICKS = 3;
     private static final int ENEMY_STEP_TICKS = 3;
     private static final int AI_TURN_DELAY = 6;
+    /** The shared no-shield guard price, in AP. One constant for every defending actor. */
+    private static final int DEFEND_COST = 25;
+    /** Guard multipliers by holder: a shield narrows the hit, a plain stance halves it. */
+    private static final double DEFEND_SHIELD_FACTOR = 0.3D;
+    private static final double DEFEND_STANCE_FACTOR = 0.5D;
     private static final ResourceLocation REACH_MODIFIER =
             ResourceLocation.fromNamespaceAndPath(Tactical.MOD_ID, "battle_reach");
 
@@ -122,7 +157,15 @@ public final class ServerBattle {
     // Includes both hostile and friendly mobs; side-sensitive rules must use hostileCount().
     private final Map<UUID, EnemyState> enemies = new LinkedHashMap<>();
     private final List<Mob> bystanders = new ArrayList<>();
+    /**
+     * Companions that already left this encounter for a lifecycle reason. They are remembered so a
+     * recruitment scan cannot silently bring the same unit back and hand it a fresh initial AP pool.
+     */
+    private final java.util.Set<UUID> departedCompanions = new java.util.LinkedHashSet<>();
     private int aggroPulse;
+    /** Hostiles the roster cap refuses: evicted from the battlefield and held out while it stays full. */
+    private final MobIsolation isolation = new MobIsolation();
+    private int ticks;
 
     private final int zoneHeight;
     private final int participantCap;
@@ -140,6 +183,21 @@ public final class ServerBattle {
     private boolean awaitingShotResolution;
     private UUID pendingEnemyShot;
     private int shotRecoveryTicks;
+    /**
+     * The one self-drink this encounter is presenting right now, or null.
+     *
+     * <p>It is a bounded, vanilla-styled hold: the borrowed bottle in the hand, vanilla's own drinking flag and
+     * a countdown, held for as many ticks as the potion's own use duration. The turn stays busy for exactly that
+     * window and the dose is settled once, at the end of it - never per tick, and never a second time from
+     * vanilla's own {@code aiStep}, which is skipped while this encounter controls her.</p>
+     */
+    private UUID pendingWitchDrink;
+    private int pendingWitchDrinkTicks;
+    private WitchBrew pendingWitchBrew;
+    /** The stack the presentation borrowed from her hand; given back when the pose ends. */
+    private ItemStack pendingWitchBorrowed = ItemStack.EMPTY;
+    /** The exact bottle this presentation put in her hand, so only that slot is ever written back. */
+    private ItemStack pendingWitchBottle = ItemStack.EMPTY;
 
     private List<GridPos> enemyPath = List.of();
     private int enemyPathIndex;
@@ -253,8 +311,10 @@ public final class ServerBattle {
             return false;
         }
 
-        // Overflow/nonparticipants retain ordinary AI and aggro. They can join as soon as
-        // a roster slot opens; clearing targets here would erase reinforcement intent.
+        // Cap-refused mobs keep their own AI state (no setNoAi, no removal) but not their
+        // relationship with this encounter: MobIsolation moves them out of the battlefield and
+        // clears this encounter's members from their target/Brain memories while the roster stays
+        // full. The moment a slot frees, suppression ends and ordinary recruitment owns them again.
         // The founder is admitted by a different code path than join(), but the contract is the
         // same: nothing may keep a container or a cursor stack open once the player is authoritative.
         settleOpenContainer(creator);
@@ -276,8 +336,10 @@ public final class ServerBattle {
         // The founder enters through the same path as any other member: one authoritative transition,
         // its own full snapshot, the full journal and the full warning snapshot.
         publishActivation(creator, null);
-        journal.record("battle", "战斗开始：" + hostileCount() + " 个敌人加入");
+        journal.record("battle", BattleText.translatable(BattleText.KEY_BATTLE_STARTED, hostileCount()));
         beginTurn(queue.advance());
+        // Only now is there an acting slot, which is what a companion admission needs.
+        recruitCompanions();
         // Fixture-only failure point at the very end of deployment: everything is already acquired.
         fault(FaultPoint.START_AFTER_ADMISSION);
         return true;
@@ -367,13 +429,16 @@ public final class ServerBattle {
     }
 
     public void tick() {
+        ticks++;
         if (finished) {
             return;
         }
         pruneMembers();
         if (finished) return;
+        pruneInvalidCompanions();
+        if (finished) return;
         if (members.isEmpty()) {
-            finish("no participants");
+            finish(BattleText.endReason(BattleText.End.NO_PARTICIPANTS));
             return;
         }
 
@@ -393,6 +458,13 @@ public final class ServerBattle {
                 if(AerialMovement.isClearAir(level,air.mob,held)) air.mob.setPos(held);
                 air.mob.setDeltaMovement(Vec3.ZERO);air.mob.fallDistance=0;
             }
+        }
+        // A presented drink owns the turn for its bounded window; settle it once it runs out.
+        tickWitchDrink();
+        if (finished) return;
+        if (witchDrinking()) {
+            if (projectileChanged || attributesChanged || healthChanged || weaponChanged) sendState();
+            return;
         }
         if (awaitingShotResolution && !projectiles.pending()) {
             if (shotRecoveryTicks < 0) shotRecoveryTicks = hasMovingEnemies() ? 4 : 0;
@@ -415,6 +487,9 @@ public final class ServerBattle {
         }
 
         pulseAggro();
+        // Cap-refused hostiles are held outside the battlefield for as long as the roster stays
+        // full. Release happens inside maintain(), on the same tick a hostile slot frees.
+        isolation.maintain(this);
 
         boolean anyMoving = false;
         for (PlayerMember member : List.copyOf(members.values())) {
@@ -423,23 +498,36 @@ public final class ServerBattle {
             anyMoving = true;
         }
         if (anyMoving) return;
+        // A forced fall owns the encounter until every affected unit has landed: no pinning, no queue
+        // advance and no new command while it runs.
+        if (stepTerrainFall()) return;
         for (PlayerMember member : members.values()) pinPlayer(member);
+        beginTerrainFallIfNeeded();
+        if (terrainFall.busy()) return;
         if (rangedBusy()) return;
 
+        // A mob's own trajectory advances in both mob phases: an automatic enemy turn and a companion turn
+        // that its controller started. Only the automatic phase goes on to plan anything by itself.
+        if (enemyMoving && (phase == BattlePhase.ENEMY_TURN || phase == BattlePhase.COMPANION_TURN)) {
+            stepEnemy();
+            return;
+        }
         if (phase == BattlePhase.ENEMY_TURN) {
             if (aiDelay > 0) {
                 aiDelay--;
                 return;
             }
-            if (enemyMoving) {
-                stepEnemy();
-            } else {
-                planEnemyTurn();
-            }
+            planEnemyTurn();
         }
     }
 
+    /** Legacy form: the reason is already text (an operator or fixture token) and stays literal. */
     public void finish(String reason) {
+        finish(BattleText.literal(reason));
+    }
+
+    /** End this encounter with structure, so every member reads the reason in its own language. */
+    public void finish(Component reason) {
         if (finished || ending) {
             return;
         }
@@ -448,7 +536,9 @@ public final class ServerBattle {
         TacticalSkills.onBattleEnd(this);
         finished = true;
         phase = BattlePhase.ENDED;
+        abortWitchDrink(null);
         projectiles.clear();
+        BattlePotionSplash.clear(this);
         ai.clear();
         // Effects belong to the actor, so they are released per unit of THIS encounter. A global
         // clear would also drop another running encounter's effect clocks, burning baselines and
@@ -458,6 +548,10 @@ public final class ServerBattle {
         for (EnemyState state : enemies.values()) released.add(state.mob);
         awaitingShotResolution = false;
         pendingEnemyShot=null;
+        // No fall may outlive the encounter: its state and its reservations. The client interpolation of
+        // each member is cancelled by releaseMemberVisuals below, on the same exit snapshot.
+        terrainFall.clear();
+        pendingTurnAdvance = false;
         // Dead/disconnected players still own a connection and must receive the exit snapshot.
         for (PlayerMember member : List.copyOf(members.values())) {
             releaseMemberVisuals(member, true);
@@ -469,9 +563,15 @@ public final class ServerBattle {
         enemyMoving = false;
         enemyStepping = false;
         enemyPath = List.of();
-        for (EnemyState state : enemies.values()) {
+        for (EnemyState state : List.copyOf(enemies.values())) {
+            if (state.companionAdapter != null) {
+                // One release path for every exit: the same flags, the same pose, the same claim release.
+                releaseCompanion(state, true);
+                continue;
+            }
             state.mob.setNoAi(state.originalNoAi);
             state.mob.setTarget(null);
+            releaseWitchState(state);
         }
         enemies.clear();
         for (Mob bystander : bystanders) {
@@ -479,6 +579,9 @@ public final class ServerBattle {
             bystander.setTarget(null);
         }
         bystanders.clear();
+        // Isolated hostiles were never mutated (no AI/persistence change) and are not teleported
+        // back; only this encounter's suppression ends with the encounter.
+        isolation.clear();
         for (LivingEntity actor : released) BattleEffects.forget(actor);
         // Drop this encounter's registry entries and ownership claims; other encounters keep theirs.
         BattleManager.onBattleFinished(this);
@@ -627,7 +730,8 @@ public final class ServerBattle {
         BattleSession.InviteResult result = session.invite(requester.getUUID(), target.getUUID(),
                 level.getGameTime(), BattleSession.DEFAULT_INVITE_TTL_TICKS, factsFor(target));
         if (result.accepted()) {
-            journal.record("battle", member.name() + " 邀请 " + target.getGameProfile().getName() + " 参战");
+            journal.record("battle", BattleText.translatable(BattleText.KEY_BATTLE_INVITE,
+                    BattleText.name(member.name()), BattleText.name(target.getGameProfile().getName())));
         }
         return result.denial();
     }
@@ -745,8 +849,11 @@ public final class ServerBattle {
             // Membership is committed: publish the transition, this member's full snapshot, the complete
             // journal history and the complete warning snapshot - in that order - and then tell the
             // remaining members about the new roster.
-            publishActivation(player, member.name() + " 加入战斗");
+            publishActivation(player, BattleText.translatable(BattleText.KEY_BATTLE_JOIN,
+                    BattleText.name(member.name())));
             sendState();
+            // A member that arrives with its companion standing beside it brings that companion along now.
+            recruitCompanions();
             // Fixture-only failure point: the join is fully published at this line.
             fault(FaultPoint.JOIN_AFTER_PUBLISH);
             return BattleEligibility.Denial.NONE;
@@ -848,7 +955,13 @@ public final class ServerBattle {
      * stale and must never regain authority. This removes only that stale member - other members
      * keep the encounter - and never admits the replacement.</p>
      */
+    /** Legacy form: the reason is already text and stays literal. */
     boolean releaseReplacedMember(UUID playerId, ServerPlayer replacement, String reason) {
+        return releaseReplacedMember(playerId, replacement,
+                reason == null ? null : BattleText.literal(reason));
+    }
+
+    boolean releaseReplacedMember(UUID playerId, ServerPlayer replacement, Component reason) {
         PlayerMember member = members.get(playerId);
         if (member == null || member.entity == replacement) return false;
         if (member.entity.isAlive() && !member.entity.isRemoved()) return false;
@@ -856,8 +969,13 @@ public final class ServerBattle {
         return true;
     }
 
-    /** Explicit exit of one player; every other member keeps playing. */
+    /** Legacy form: the reason is already text and stays literal. */
     public boolean leave(ServerPlayer player, String reason) {
+        return leave(player, BattleText.literal(reason));
+    }
+
+    /** Explicit exit of one player; every other member keeps playing. */
+    public boolean leave(ServerPlayer player, Component reason) {
         if (player == null || finished) return false;
         PlayerMember member = members.get(player.getUUID());
         if (member == null || member.entity != player) return false;
@@ -865,27 +983,45 @@ public final class ServerBattle {
         return true;
     }
 
-    private void removeMember(PlayerMember member, String reason) {
+    private void removeMember(PlayerMember member, Component reason) {
         UUID id = member.id();
+        // A dead or departing member stops falling with the encounter, not after it. Its client side
+        // interpolation is cancelled further down by releaseMemberVisuals, which is the one place that
+        // sends the empty trajectory for a member leaving.
+        if (terrainFall.unit(id) != null) terrainFall.end(id);
         boolean acting = id.toString().equals(queue.current());
         boolean wasManager = session.isManager(id);
         members.remove(id);
         queue.remove(id.toString());
+        // A controller that can no longer give orders takes its companions with it. They are never handed to
+        // another player and never quietly turned back into AI, and one of them may be the acting unit.
+        boolean companionWasActing = releaseCompanionsOf(id, false);
         releaseMemberVisuals(member, false);
         BattleSession.LeaveResult result = session.leave(id);
         BattleManager.onMemberLeft(this, id);
         // The exit is a membership transition of its own, so its generation is above the entry's.
         publishExit(member);
         if (!finished) com.tactical.neoforge.network.ServerPackets.sendUncheckedType(member.entity, inactiveState(member));
-        journal.record("battle", member.name() + " 离开战斗 · " + reason
-                + (result.managerChanged() && result.newManager() != null
-                ? " · 管理权移交给 " + nameOf(result.newManager().toString()) : ""));
+        MutableComponent row = BattleText.translatable(BattleText.KEY_BATTLE_LEAVE,
+                BattleText.name(member.name()), reason);
+        if (result.managerChanged() && result.newManager() != null) {
+            // Appended structure, not an assembled sentence: the handover segment resolves on its own.
+            row = row.append(BattleText.translatable(BattleText.KEY_BATTLE_HANDOVER,
+                    BattleText.name(nameOf(result.newManager().toString()))));
+        }
+        journal.record("battle", row);
         if (finished) return;
         if (result.finished() || members.isEmpty()) {
-            finish("all players left");
+            finish(BattleText.endReason(BattleText.End.ALL_PLAYERS_LEFT));
             return;
         }
         if (acting) {
+            advanceTurn();
+            return;
+        }
+        // The departing controller's companion owned the acting slot: give that slot on exactly once, so no
+        // order is ever waited for on behalf of a player the encounter no longer has.
+        if (companionWasActing) {
             advanceTurn();
             return;
         }
@@ -904,14 +1040,60 @@ public final class ServerBattle {
         BattleEffects.forget(member.entity);
     }
 
+    /**
+     * Release every control record that is no longer valid, once per tick.
+     *
+     * <p>Death, removal and a dimension change are already handled by {@link #removeDeadEnemies()}; what this
+     * covers is the relationship itself: an adapter that no longer claims the unit, a controller that changed
+     * hands, a controller that is no longer a member, or a kind that is no longer eligible. Without it the
+     * queue could wait forever on a unit nobody may order, and a live wolf could stay under a stale owner.</p>
+     */
+    private void pruneInvalidCompanions() {
+        if (finished || ending || members.isEmpty()) return;
+        boolean releasedActor = false;
+        for (EnemyState state : List.copyOf(enemies.values())) {
+            if (state.companionAdapter == null) continue;
+            Mob mob = state.mob;
+            // The liveness cases belong to removeDeadEnemies, which also advances the turn.
+            if (!mob.isAlive() || mob.isRemoved() || mob.level() != level) continue;
+            CompanionAdapter adapter = state.companionAdapter;
+            String why = null;
+            try {
+                UUID live = adapter.supports(mob) ? adapter.controllerId(mob) : null;
+                if (live == null) why = "no controller";
+                else if (!live.equals(state.companionOwner)) why = "controller changed";
+                else if (!members.containsKey(live)) why = "controller is not a member";
+                else if (!adapter.canJoin(level, mob, live)) why = "no longer eligible";
+            } catch (RuntimeException failure) {
+                // A broken adapter must not keep the record alive, and must not stop the other candidates.
+                Tactical.LOGGER.error("[Tactical] companion eligibility check failed for {}; releasing it",
+                        mob.getUUID(), failure);
+                why = "adapter failure";
+            }
+            if (why == null) continue;
+            if (mob.getUUID().toString().equals(queue.current())) releasedActor = true;
+            enemies.remove(mob.getUUID());
+            releaseCompanion(state, false);
+            Tactical.LOGGER.info("[Tactical] companion {} released: {}", mob.getUUID(), why);
+            journal.record("battle", BattleText.translatable(BattleText.KEY_BATTLE_COMPANION_RELEASED,
+                    BattleText.name(mob)));
+        }
+        if (releasedActor && !finished) {
+            if (phase == BattlePhase.COMPANION_TURN) advanceTurn();
+            else sendState();
+        }
+    }
+
     private void pruneMembers() {
         for (PlayerMember member : List.copyOf(members.values())) {
-            String reason = null;
-            if (!member.entity.isAlive()) reason = "player defeated";
-            else if (member.entity.isRemoved()) reason = "player removed";
-            else if (member.entity.connection != null && member.entity.hasDisconnected()) reason = "player disconnected";
-            else if (member.entity.level() != level) reason = "player changed level";
-            if (reason == null) continue;
+            // A stable code per exit, so the row's wording is decided at the display boundary only.
+            BattleText.Exit exit = null;
+            if (!member.entity.isAlive()) exit = BattleText.Exit.DEFEATED;
+            else if (member.entity.isRemoved()) exit = BattleText.Exit.REMOVED;
+            else if (member.entity.connection != null && member.entity.hasDisconnected()) exit = BattleText.Exit.DISCONNECTED;
+            else if (member.entity.level() != level) exit = BattleText.Exit.LEVEL_CHANGED;
+            if (exit == null) continue;
+            Component reason = BattleText.exitReason(exit);
             removeMember(member, reason);
             if (finished) return;
         }
@@ -1020,7 +1202,7 @@ public final class ServerBattle {
         if (state == null) return false;
         try {
             queue.add(mob.getUUID().toString(), TacticalAttributes.chargeRate(mob, state.initiative));
-            journal.record("battle", "友方加入战场: " + mob.getDisplayName().getString());
+            journal.record("battle", BattleText.translatable(BattleText.KEY_BATTLE_FRIENDLY, BattleText.name(mob)));
             sendState();
             return true;
         } catch (RuntimeException failure) {
@@ -1056,7 +1238,17 @@ public final class ServerBattle {
         Vec3 originalPosition = mob.position();
         LivingEntity originalTarget = mob.getTarget();
         float originalFallDistance = mob.fallDistance;
+        TacticalWitchAccess.WitchDrink witchDrink = null;
+        WitchBrew pendingDrink = null;
         try {
+            // A witch can already be mid-drink when she is admitted. Taking it out of vanilla belongs to this
+            // admission transaction: nothing may settle it for free on wall-clock time, and if the admission
+            // fails the claim is released with it. Only a real vanilla drinking action is ever taken, so a
+            // witch holding an axe or a spare bottle is left exactly as she is.
+            if (mob instanceof Witch witch) {
+                witchDrink = witchAccess(witch).tactical$takeDrink();
+                if (witchDrink != null) pendingDrink = WitchBrews.brewOf(witchDrink.potion());
+            }
             mob.setNoAi(true);
             mob.setPersistenceRequired();
             mob.getNavigation().stop();
@@ -1072,8 +1264,19 @@ public final class ServerBattle {
                     attribute(mob, Attributes.MOVEMENT_SPEED), level.random.nextInt(10));
             EnemyState state = new EnemyState(mob, cell, initialAp(maxAp), maxAp, moveCost, initiative, side,
                     originalNoAi, originalPersistenceRequired, originalPosition, originalTarget, originalFallDistance);
+            state.witchDrink = witchDrink;
+            state.pendingDrink = pendingDrink;
+            // One cooldown object per unit, so two witches can never advance each other's drink.
+            state.drink = new WitchDrinkCooldown(witchDrinkCooldownTurns());
             enemies.put(mob.getUUID(), state);
             ai.add(mob);
+            if (DeveloperTrace.enabled()) {
+                // Development trace: which exact unit joined which encounter. Needed because a client
+                // mirror cannot tell two same-typed mobs apart.
+                Tactical.LOGGER.info("[Tactical] dev-trace admit session={} tick={} phase={} uuid={} tags={} at={} hostiles={}",
+                        session.sessionId(), ticks, phase, mob.getUUID(), mob.getTags(),
+                        mob.blockPosition(), hostileCount());
+            }
             return state;
         } catch (RuntimeException failure) {
             Tactical.LOGGER.error("[Tactical] admission failed for {}; rolling this unit back",
@@ -1084,6 +1287,9 @@ public final class ServerBattle {
                 ai.remove(mob);
                 restoreUnit(mob, originalNoAi, originalPersistenceRequired, originalPosition, originalTarget,
                         originalFallDistance);
+                if (witchDrink != null && mob instanceof Witch witch) {
+                    witchAccess(witch).tactical$restoreDrink(witchDrink);
+                }
                 BattleManager.releaseActor(this, mob.getUUID());
             }
             return null;
@@ -1141,6 +1347,12 @@ public final class ServerBattle {
         ai.remove(state.mob);
         restoreUnit(state.mob, state.originalNoAi, state.originalPersistenceRequired,
                 state.originalPosition, state.originalTarget, state.originalFallDistance);
+        // A rolled-back admission never charged for the drink it froze, so the unit gets it back untouched.
+        if (state.witchDrink != null && state.mob instanceof Witch witch) {
+            witchAccess(witch).tactical$restoreDrink(state.witchDrink);
+        }
+        state.witchDrink = null;
+        state.pendingDrink = null;
         BattleManager.releaseActor(this, state.mob.getUUID());
     }
 
@@ -1160,9 +1372,59 @@ public final class ServerBattle {
         if (originalPosition != null) mob.setPos(originalPosition.x, originalPosition.y, originalPosition.z);
     }
 
-    private int hostileCount() {
+    int hostileCount() {
         return (int) enemies.values().stream().filter(state -> state.side == BattleSide.HOSTILE
                 && state.mob.isAlive() && !state.mob.isRemoved() && state.mob.level() == level).count();
+    }
+
+    /** Hostile roster limit for this encounter; the only threshold isolation and refill share. */
+    int hostileCapacity() {
+        return participantCap;
+    }
+
+    /** True while a further hostile would be refused; used by the contact-push guard. */
+    boolean hostileAtCap() {
+        return hostileCount() >= participantCap;
+    }
+
+    /** True when this encounter is currently holding {@code mob} outside the battlefield. */
+    boolean holdsOutside(Mob mob) {
+        return isolation.suppresses(mob);
+    }
+
+    /** How many units this encounter is currently holding out; diagnostics and tests only. */
+    int heldCount() {
+        return isolation.size();
+    }
+
+    /**
+     * True when this encounter must keep {@code mob} off its members by physical contact.
+     *
+     * <p>Hostility is deliberately <em>not</em> part of this test. A refused attacker is usually an
+     * {@code Enemy}, but a neutral or plain mob can displace a participant just as well by collision,
+     * so the collision rule covers every unowned mob while the roster is full. Callers
+     * ({@link BattleContactGuard#isolationFor}) already exclude participants, players and any unit
+     * another encounter owns.</p>
+     */
+    boolean protectsFromContact(Mob mob) {
+        if (finished || ending || mob == null) return false;
+        // Fullness is the only switch. A stale exclusion entry must never outlive the fullness
+        // that created it: the instant a slot frees, ordinary contact and recruitment resume.
+        return IsolationPolicy.holdsWhileFull(hostileCount(), participantCap);
+    }
+
+    /**
+     * Exit path for an attack that admission had to refuse. Never evicts while a slot is free:
+     * then the ordinary absorb/refill rules own the mob.
+     */
+    public void isolateIntruder(Mob mob) {
+        if (finished || ending || mob == null) return;
+        if (hostileCount() < participantCap) return;
+        isolation.offer(this, mob);
+    }
+
+    int tickCount() {
+        return ticks;
     }
 
     public boolean isActorTurn(LivingEntity actor) {
@@ -1170,7 +1432,47 @@ public final class ServerBattle {
                 && actor.level() == level && actor.getUUID().toString().equals(queue.current());
     }
 
-    public boolean isBusy() { return anyPlayerMoving() || enemyMoving || rangedBusy(); }
+    public boolean isBusy() {
+        return anyPlayerMoving() || enemyMoving || rangedBusy() || witchDrinking() || terrainFall.busy();
+    }
+
+    /**
+     * Whether this member may change its own growth profile right now.
+     *
+     * <p>Being a participant no longer forbids it: what forbids it is not being able to act. The condition is
+     * the same one every other command of this encounter uses - this player is the acting member of a player
+     * turn and nothing is in flight (no movement, no projectile, no fall, no enemy action). A waiting member, an
+     * enemy turn and an action already underway are all refused; viewing the page is never affected.</p>
+     *
+     * <p>It is a query, not a transaction: nothing here spends a point, opens a turn or moves the queue. The
+     * growth transaction itself stays in {@code ProgressionService}, which asks this question once.</p>
+     */
+    public boolean allowsCharacterMutation(ServerPlayer player) {
+        if (finished || ending || player == null) return false;
+        PlayerMember member = members.get(player.getUUID());
+        if (member == null || member.entity != player) return false;
+        if (!player.isAlive() || player.isRemoved() || player.level() != level) return false;
+        if (phase != BattlePhase.PLAYER_TURN) return false;
+        if (!isActorTurn(player)) return false;
+        return !isBusy();
+    }
+
+    /**
+     * Republishes what a committed allocation changed, without starting a turn.
+     *
+     * <p>A point of endurance moves this member's real max AP and charge rate, and a point of vigor or mind
+     * moves the max health or MP every participant can already see. The caps, the clamp and the queue rate are
+     * therefore re-read through the same refresh the turn flow uses, and the encounter publishes its normal
+     * snapshot. Nothing is granted: AP is never raised to a new maximum (only clamped down to a lowered one),
+     * no recovery is applied, no turn is started and no other member's resources are touched.</p>
+     */
+    public void refreshGrowth(ServerPlayer player) {
+        if (finished || player == null) return;
+        PlayerMember member = members.get(player.getUUID());
+        if (member == null || member.entity != player) return;
+        refreshTacticalAttributes();
+        sendState();
+    }
 
     private boolean anyPlayerMoving() {
         for (PlayerMember member : members.values()) if (member.state.moving()) return true;
@@ -1239,17 +1541,40 @@ public final class ServerBattle {
     }
 
     private LivingEntity nearestOpposedPlayer(Mob actor) {
-        return members.values().stream()
-                .map(member -> member.entity)
-                .filter(p -> p.isAlive() && !p.isRemoved() && p.level() == level)
-                .filter(p -> {
-                    PlayerParticipant state = memberState(p);
-                    return state != null && zone.contains(state.cell());
-                })
-                .filter(p -> opposed(actor, p))
-                .min(Comparator.comparingDouble((ServerPlayer p) -> p.distanceToSqr(actor))
-                        .thenComparing(p -> p.getUUID().toString()))
-                .orElse(null);
+        LivingEntity best = null;
+        double bestDistance = Double.MAX_VALUE;
+        String bestId = null;
+        for (PlayerMember member : members.values()) {
+            ServerPlayer p = member.entity;
+            if (!p.isAlive() || p.isRemoved() || p.level() != level) continue;
+            PlayerParticipant state = memberState(p);
+            if (state == null || !zone.contains(state.cell())) continue;
+            if (!opposed(actor, p)) continue;
+            double distance = p.distanceToSqr(actor);
+            String id = p.getUUID().toString();
+            if (distance < bestDistance || (distance == bestDistance && (bestId == null || id.compareTo(bestId) < 0))) {
+                best = p;
+                bestDistance = distance;
+                bestId = id;
+            }
+        }
+        // Controlled companions are legal targets too, otherwise a companion's guard would never be used.
+        // The older automatic friendly mobs are not in this pool, so their behaviour is unchanged.
+        for (EnemyState state : enemies.values()) {
+            Mob mob = state.mob;
+            if (state.companionAdapter == null || mob == actor) continue;
+            if (!mob.isAlive() || mob.isRemoved() || mob.level() != level) continue;
+            if (!zone.contains(state.cell)) continue;
+            if (!opposed(actor, mob)) continue;
+            double distance = mob.distanceToSqr(actor);
+            String id = mob.getUUID().toString();
+            if (distance < bestDistance || (distance == bestDistance && (bestId == null || id.compareTo(bestId) < 0))) {
+                best = mob;
+                bestDistance = distance;
+                bestId = id;
+            }
+        }
+        return best;
     }
 
     private LivingEntity nearestOpposedEnemy(Mob actor) {
@@ -1348,7 +1673,7 @@ public final class ServerBattle {
             zoneRadius = zone.radius();
             extendReachAll();
             queue.add(mob.getUUID().toString(), TacticalAttributes.chargeRate(mob, state.initiative));
-            message("新的敌人加入战场: " + mob.getDisplayName().getString());
+            message(BattleText.translatable(BattleText.KEY_ENEMY_JOINED, BattleText.name(mob)));
             sendState();
             // Fixture-only failure point: the absorb is fully committed at this line.
             fault(FaultPoint.ABSORB_AFTER_ADMIT);
@@ -1367,7 +1692,7 @@ public final class ServerBattle {
             }
             restoreAdmission(state);
             try {
-                journal.record("battle", "新的敌人未能加入战场，已回滚");
+                journal.record("battle", BattleText.translatable(BattleText.KEY_ENEMY_JOIN_ROLLED_BACK));
             } catch (RuntimeException ignored) {
                 // Journal delivery is best-effort here.
             }
@@ -1451,23 +1776,68 @@ public final class ServerBattle {
         return member != null && canAct(member) ? member : null;
     }
 
+    /**
+     * The companion the connected player is allowed to command right now, or null.
+     *
+     * <p>Nothing in a payload names the actor: the requester comes from the connection, must be this exact
+     * member instance, and the acting slot must be a companion that resolves to this requester - first from
+     * the control record made at recruitment, then again from the adapter's live controller answer, so a
+     * companion that changed hands mid-battle stops answering to its previous owner. Every other gate the
+     * player's own orders pass (live session stamp, turn epoch, alive, this level, nothing in flight) is
+     * re-applied here, so a companion order can never be cheaper than an own-body order.</p>
+     */
+    private EnemyState authorizeCompanion(ServerPlayer requester, ActionStamp stamp) {
+        if (finished || ending || requester == null || stamp == null) return null;
+        if (!session.accepts(stamp)) return null;
+        PlayerMember member = members.get(requester.getUUID());
+        if (member == null || member.entity != requester) return null;
+        if (!requester.isAlive() || requester.isRemoved() || requester.level() != level) return null;
+        if (phase != BattlePhase.COMPANION_TURN) return null;
+        EnemyState state = actingCompanion();
+        if (state == null || !requester.getUUID().equals(state.companionOwner)) return null;
+        // Liveness is checked here, not left to the next battle tick: a dead, removed or dimension-changed
+        // companion must refuse this order instead of charging for it.
+        Mob pet = state.mob;
+        if (!pet.isAlive() || pet.isRemoved() || pet.level() != level) return null;
+        if (isBusy()) return null;
+        // live re-resolution: the adapter owns "who controls this mob", the battle only holds the record
+        CompanionAdapter adapter = state.companionAdapter;
+        if (adapter == null || !adapter.supports(state.mob)) return null;
+        return requester.getUUID().equals(adapter.controllerId(state.mob)) ? state : null;
+    }
+
+    /** The companion that owns the acting slot, or null while the slot belongs to a player or a hostile. */
+    private EnemyState actingCompanion() {
+        String current = queue.current();
+        if (current == null) return null;
+        EnemyState state = enemies.get(UUID.fromString(current));
+        if (state == null || state.companionAdapter == null || state.side != BattleSide.PLAYER) return null;
+        // The projection and every order resolve through this: a stale record for a dead or unloaded unit
+        // must never become "the actor this player commands".
+        Mob pet = state.mob;
+        if (!pet.isAlive() || pet.isRemoved() || pet.level() != level) return null;
+        return state;
+    }
+
     public boolean tryMove(ServerPlayer actor, ActionStamp stamp, GridPos target) {
         PlayerMember member = authorizeActing(actor, stamp);
-        if (member == null) return false;
-        return tryMove(member, target);
+        if (member != null) return tryMove(member, target);
+        EnemyState companion = authorizeCompanion(actor, stamp);
+        return companion != null && companionMove(companion, target);
     }
 
     private boolean tryMove(PlayerMember member, GridPos target) {
         PlayerParticipant state = member.state;
         if (!zone.contains(target) || occupied(target) || !LevelGridWorld.isStandable(level,target.x(),target.y(),target.z())) {
-            reject("落点不可站立、被占用或超出战斗区域"); return false;
+            reject(BattleText.translatable(BattleText.KEY_REJECT_MOVE_TARGET)); return false;
         }
         MovementRoutes.Options options = movementOptions(member, target);
         if (options.choice()) {
             PlayerParticipant.PendingMove offer = new PlayerParticipant.PendingMove(UUID.randomUUID(), state.cell(),
                     target, level.getGameTime()+1200, options.walk().size()*state.moveCost());
             state.pendingMove(offer);
-            journal.record("move", "选择移动方式：绕路 " + offer.walkCost() + " AP / 直接跳下 " + state.moveCost() + " AP");
+            journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_OFFER,
+                    offer.walkCost(), state.moveCost()));
             com.tactical.neoforge.network.ServerPackets.sendUncheckedType(member.entity,
                     new MoveChoiceOfferPacket(offer.token(),target,
                         offer.walkCost(),state.moveCost(),state.cell().y()-target.y()));
@@ -1475,7 +1845,7 @@ public final class ServerBattle {
         }
         if (!options.walk().isEmpty()) return startPlayerMove(member, options.walk(),false);
         if (!options.drop().isEmpty()) return startPlayerMove(member, options.drop(),true);
-        reject("没有可通行且 AP 足够的路线");
+        reject(BattleText.translatable(BattleText.KEY_REJECT_NO_ROUTE));
         return false;
     }
 
@@ -1504,16 +1874,16 @@ public final class ServerBattle {
         if (member == null) return;
         PlayerParticipant state = member.state;
         PlayerParticipant.PendingMove offer = state.pendingMove();
-        if (offer==null || !offer.token().equals(token)) { reject("移动选项已失效"); return; }
+        if (offer==null || !offer.token().equals(token)) { reject(BattleText.translatable(BattleText.KEY_REJECT_PENDING_MOVE)); return; }
         state.pendingMove(null);
-        if(mode==-1) { journal.record("move","取消移动"); return; }
+        if(mode==-1) { journal.record("move",BattleText.translatable(BattleText.KEY_MOVE_CANCELLED)); return; }
         if(!canAct(member) || !offer.from().equals(state.cell()) || level.getGameTime()>offer.expires()
-                || (mode!=0 && mode!=1)) { reject("回合或位置已变化，请重新选择落点"); return; }
+                || (mode!=0 && mode!=1)) { reject(BattleText.translatable(BattleText.KEY_REJECT_MOVE_STALE)); return; }
         // Terrain, occupied cells, AP and zone may all change while the choice is visible.
         MovementRoutes.Options current=movementOptions(member,offer.target());
         List<GridPos> path=mode==1?current.drop():current.walk();
-        if(path.isEmpty()) { reject("所选路线已不可用，请重新选择"); return; }
-        if(mode==0 && path.size()*state.moveCost()!=offer.walkCost()) { reject("地形改变了路线费用，请重新选择落点"); return; }
+        if(path.isEmpty()) { reject(BattleText.translatable(BattleText.KEY_REJECT_ROUTE_GONE)); return; }
+        if(mode==0 && path.size()*state.moveCost()!=offer.walkCost()) { reject(BattleText.translatable(BattleText.KEY_REJECT_ROUTE_COST)); return; }
         startPlayerMove(member,path,mode==1);
     }
 
@@ -1522,16 +1892,16 @@ public final class ServerBattle {
         PlayerMember acting = actingMember();
         if (acting == null) return;
         PlayerParticipant.PendingMove offer = acting.state.pendingMove();
-        if (offer == null || !offer.token().equals(token)) { reject("移动选项已失效"); return; }
+        if (offer == null || !offer.token().equals(token)) { reject(BattleText.translatable(BattleText.KEY_REJECT_PENDING_MOVE)); return; }
         acting.state.pendingMove(null);
-        if (mode == -1) { journal.record("move", "取消移动"); return; }
+        if (mode == -1) { journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_CANCELLED)); return; }
         if (!canAct(acting) || !offer.from().equals(acting.state.cell()) || level.getGameTime() > offer.expires()
-                || (mode != 0 && mode != 1)) { reject("回合或位置已变化，请重新选择落点"); return; }
+                || (mode != 0 && mode != 1)) { reject(BattleText.translatable(BattleText.KEY_REJECT_MOVE_STALE)); return; }
         MovementRoutes.Options current = movementOptions(acting, offer.target());
         List<GridPos> path = mode == 1 ? current.drop() : current.walk();
-        if (path.isEmpty()) { reject("所选路线已不可用，请重新选择"); return; }
+        if (path.isEmpty()) { reject(BattleText.translatable(BattleText.KEY_REJECT_ROUTE_GONE)); return; }
         if (mode == 0 && path.size() * acting.state.moveCost() != offer.walkCost()) {
-            reject("地形改变了路线费用，请重新选择落点"); return;
+            reject(BattleText.translatable(BattleText.KEY_REJECT_ROUTE_COST)); return;
         }
         startPlayerMove(acting, path, mode == 1);
     }
@@ -1540,22 +1910,30 @@ public final class ServerBattle {
         PlayerParticipant state = member.state;
         int unit = state.moveCost();
         int cost = path.size() * unit;
-        if(path.isEmpty()||cost>state.ap()) { reject("AP 不足"); return false; }
+        if(path.isEmpty()||cost>state.ap()) { reject(BattleText.translatable(BattleText.KEY_AP_NOT_ENOUGH)); return false; }
         state.pendingMove(null);
         int dropTicks = Math.max(8,(state.cell().y()-path.get(0).y())*3);
         state.ap(state.ap()-cost);
         state.beginMove(path, drop, stepTicks, dropTicks);
         actionCount++;
-        journal.record("move",member.name()+ (drop?" 直接跳下 ":" 沿路线移动 ")
-                +state.cell()+" → "+path.get(path.size()-1)+"（"+cost+" AP）");
+        journal.record("move", BattleText.translatable(
+                drop ? BattleText.KEY_MOVE_DROP : BattleText.KEY_MOVE_WALK,
+                BattleText.name(member.name()),
+                // Grid coordinates are data, not wording: they stay literal and identical in both languages.
+                BattleText.literal(state.cell().toString()),
+                BattleText.literal(path.get(path.size()-1).toString()), cost));
         sendState(); sendPlayerMotion(member, path);
         return true;
     }
 
     public void tryAttack(ServerPlayer actor, ActionStamp stamp, UUID targetId) {
         PlayerMember member = authorizeActing(actor, stamp);
-        if (member == null) return;
-        tryAttack(member, targetId);
+        if (member != null) {
+            tryAttack(member, targetId);
+            return;
+        }
+        EnemyState companion = authorizeCompanion(actor, stamp);
+        if (companion != null) companionAttack(companion, targetId);
     }
 
     private void tryAttack(PlayerMember member, UUID targetId) {
@@ -1582,21 +1960,22 @@ public final class ServerBattle {
     private void tryMeleeAttack(PlayerMember member, EnemyState enemy) {
         PlayerParticipant state = member.state;
         if (!inMeleeRange(state.cell(), enemy.cell)) {
-            reject("目标不在近战范围内");
+            reject(BattleText.translatable(BattleText.KEY_REJECT_MELEE_RANGE));
             return;
         }
         int cost = currentMeleeCost(member);
         if (state.ap() < cost) {
-            reject("AP 不足");
+            reject(BattleText.translatable(BattleText.KEY_AP_NOT_ENOUGH));
             return;
         }
-        if (!hasLineOfSight(state.cell(), enemy.cell, member.entity)) { reject("目标被障碍物阻挡"); return; }
+        if (!hasLineOfSight(state.cell(), enemy.cell, member.entity)) { reject(BattleText.translatable(BattleText.KEY_REJECT_BLOCKED)); return; }
         faceDirection(member.entity, enemy.cell);
         sendPlayerMotion(member, List.of());
-        journal.record("attack",member.name()+" 近战攻击 "+enemy.mob.getDisplayName().getString());
+        journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_MELEE,
+                BattleText.name(member.name()), BattleText.name(enemy.mob)));
         member.entity.swing(InteractionHand.MAIN_HAND, true);
         if (!NativeAttackReceipt.run(member.entity, enemy.mob, () -> member.entity.attack(enemy.mob))) {
-            reject("近战攻击未生效"); return;
+            reject(BattleText.translatable(BattleText.KEY_REJECT_MELEE_NO_EFFECT)); return;
         }
         state.commitPaidAction(cost);
         actionCount++;
@@ -1610,19 +1989,21 @@ public final class ServerBattle {
         int range = weaponRange(state.cell(), enemy.cell, kind);
         double distance = Math.hypot(state.cell().x() - enemy.cell.x(), state.cell().z() - enemy.cell.z());
         if (distance > range + 0.001D) {
-            reject("超出射程 (" + String.format("%.0f", distance) + "/" + range + ")");
+            // The distance is formatted on the argument side, so the template carries no conversion.
+            reject(BattleText.translatable(BattleText.KEY_REJECT_OUT_OF_RANGE,
+                    BattleText.whole(distance), range));
             return;
         }
         // Facing never gates a ranged intent. Collision is checked along its ballistic arc below.
         int cost = switch (kind) { case 2 -> currentCrossbowCost(member); default -> currentBowCost(member); };
         if (state.ap() < cost) {
-            reject("AP 不足");
+            reject(BattleText.translatable(BattleText.KEY_AP_NOT_ENOUGH));
             return;
         }
         ItemStack weapon = player.getMainHandItem();
         boolean loaded = kind == 2 && CrossbowItem.isCharged(weapon);
         if (!loaded && player.getProjectile(weapon).isEmpty()) {
-            reject("没有箭");
+            reject(BattleText.translatable(BattleText.KEY_REJECT_NO_AMMO));
             return;
         }
         faceDirection(player, enemy.cell);
@@ -1635,15 +2016,18 @@ public final class ServerBattle {
         BallisticShot.Plan plan=BallisticShot.plan(level,player,state.cell(),enemy.mob,speed,!rocket,pierce);
         if(plan==null) {
             sendPlayerMotion(member, List.of());
-            reject("转向后仍无法射中：弹道被方块或生物阻挡，或目标无法到达");
+            reject(BattleText.translatable(BattleText.KEY_REJECT_NO_BALLISTIC));
             sendState();return;
         }
         int count = projectiles.capture(player,plan,() -> fireRanged(member, enemy, weapon, kind,plan));
         if (count <= 0) {
-            reject("射击未发出");
+            reject(BattleText.translatable(BattleText.KEY_REJECT_SHOT_NOT_FIRED));
             return;
         }
-        journal.record("attack",member.name()+" 使用"+(kind==2?"弩":"弓")+"射击 "+enemy.mob.getDisplayName().getString());
+        journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_RANGED,
+                BattleText.name(member.name()),
+                BattleText.translatable(kind == 2 ? BattleText.KEY_WEAPON_CROSSBOW : BattleText.KEY_WEAPON_BOW),
+                BattleText.name(enemy.mob)));
         state.commitPaidAction(cost);
         awaitingShotResolution = true;
         shotRecoveryTicks = -1;
@@ -1678,26 +2062,46 @@ public final class ServerBattle {
 
     /** Raise a guard until the next own turn and end that player's turn. */
     public void tryDefend(ServerPlayer actor, ActionStamp stamp) {
+        EnemyState companion = authorizeCompanion(actor, stamp);
+        if (companion != null) {
+            companionDefend(companion, Math.round(companion.mob.getYRot()));
+            return;
+        }
         tryDefendFacing(actor, stamp, Math.round(actor == null ? 0F : actor.getYRot()));
     }
 
     public void tryDefendFacing(ServerPlayer actor, ActionStamp stamp, int yaw) {
         PlayerMember member = authorizeActing(actor, stamp);
-        if (member == null) return;
-        tryDefendFacing(member, yaw);
+        if (member != null) {
+            tryDefendFacing(member, yaw);
+            return;
+        }
+        EnemyState companion = authorizeCompanion(actor, stamp);
+        if (companion != null) companionDefend(companion, yaw);
     }
 
     private void tryDefendFacing(PlayerMember member, int yaw) {
         PlayerParticipant state = member.state;
-        if (state.ap()<25){reject("AP不足，防御需要25 AP");sendState();return;}
-        if(yaw!=0&&yaw!=90&&yaw!=180&&yaw!=270){reject("无效防御朝向");return;}
+        if (state.ap()<DEFEND_COST){reject(BattleText.translatable(BattleText.KEY_REJECT_DEFEND_AP, DEFEND_COST));sendState();return;}
+        if(yaw!=0&&yaw!=90&&yaw!=180&&yaw!=270){reject(BattleText.translatable(BattleText.KEY_REJECT_DEFEND_FACING));return;}
         ServerPlayer player = member.entity;
-        player.setYRot(yaw);player.setYHeadRot(yaw);player.setYBodyRot(yaw);
-        player.yRotO=player.yHeadRotO=player.yBodyRotO=yaw;
-        state.ap(state.ap()-25);state.defending(true);actionCount++;sendPlayerMotion(member, List.of());
-        journal.record("block",(hasShield(member)?"举盾防御":"进入防御姿态")+" · 消耗25 AP · 朝向"+yaw);
+        setActorFacing(player, yaw);
+        state.ap(state.ap()-DEFEND_COST);state.defending(true);actionCount++;sendPlayerMotion(member, List.of());
+        journal.record("block", BattleText.translatable(BattleText.KEY_BLOCK,
+                BattleText.translatable(hasShield(member) ? BattleText.KEY_BLOCK_SHIELD : BattleText.KEY_BLOCK_STANCE),
+                DEFEND_COST, BattleText.literal(Integer.toString(yaw))));
         advanceTurn();
     }
+
+    /** Write one absolute facing onto any actor, including its interpolation origins. */
+    private static void setActorFacing(LivingEntity actor, int yaw) {
+        actor.setYRot(yaw);
+        actor.setYHeadRot(yaw);
+        actor.setYBodyRot(yaw);
+        actor.yRotO = actor.yHeadRotO = actor.yBodyRotO = yaw;
+    }
+
+
 
     /** Fixture entry point: raises guard for whoever is acting now. */
     public void tryDefend() {
@@ -1720,6 +2124,20 @@ public final class ServerBattle {
     public boolean isDefending(ServerPlayer player) {
         PlayerParticipant state = memberState(player);
         return state != null && state.defending();
+    }
+
+    /** The guard of any actor, so one participant's stance never protects another. */
+    public boolean isDefending(LivingEntity actor) {
+        if (actor == null || finished) return false;
+        if (actor instanceof ServerPlayer player) return isDefending(player);
+        EnemyState state = enemies.get(actor.getUUID());
+        return state != null && state.mob == actor && state.defending;
+    }
+
+    /** Narrower guard factor for a shield holder, wider for a plain stance. */
+    public static double guardFactor(boolean shield, boolean guarding) {
+        if (!guarding) return 1.0D;
+        return shield ? DEFEND_SHIELD_FACTOR : DEFEND_STANCE_FACTOR;
     }
 
     public boolean isPlayerTurnNow() {
@@ -1796,10 +2214,15 @@ public final class ServerBattle {
         return acting != null && hasShield(acting);
     }
 
-    /** True when this exact member holds a shield in its off hand. */
+    /** True when this actor holds a shield in its off hand; a companion's own off hand counts too. */
     public boolean hasShield(LivingEntity actor) {
-        PlayerMember member = actor instanceof ServerPlayer p ? member(p) : null;
-        return member != null && hasShield(member);
+        if (actor == null) return false;
+        if (actor instanceof ServerPlayer player) {
+            PlayerMember member = member(player);
+            return member != null && hasShield(member);
+        }
+        return isCompanion(actor)
+                && actor.getOffhandItem().getItem() instanceof net.minecraft.world.item.ShieldItem;
     }
 
     private boolean hasShield(PlayerMember member) {
@@ -1812,36 +2235,81 @@ public final class ServerBattle {
         if (member != null) placeBlock(member, slot, pos, face, hitLocation);
     }
 
+    /**
+     * Place one block through the target version's own placement chain.
+     *
+     * <p>{@code ItemStack.useOn} is the same entry the vanilla server uses: it runs the placement through
+     * {@code CommonHooks.onPlaceItemIntoWorld}, which asks whether this player may build here, captures
+     * the block snapshot, fires the place event and rolls the world back when a listener cancels it.
+     * Calling {@code BlockItem.place} directly - what this method used to do - skipped all of that, so a
+     * protected position was not protected for placement while it was for breaking.</p>
+     *
+     * <p>Every gate the click used to have is still checked here, in the same order, and the extra ones a
+     * block action needs are added: the world border and the build height. Nothing is charged unless the
+     * world really changed.</p>
+     */
     private void placeBlock(PlayerMember member, int slot, BlockPos pos, Direction face, Vec3 hitLocation) {
         ServerPlayer player = member.entity;
         PlayerParticipant state = member.state;
         int cost = currentPlaceCost(member);
         if (state.ap() < cost) {
-            message("AP 不足");
+            message(BattleText.translatable(BattleText.KEY_AP_NOT_ENOUGH));
             return;
         }
-        if(slot<0||slot>8||slot!=player.getInventory().selected) { reject("主手物品已改变，请重新选择道具");return; }
+        if(slot<0||slot>8||slot!=player.getInventory().selected) { reject(BattleText.translatable(BattleText.KEY_REJECT_HELD_ITEM_CHANGED));return; }
         ItemStack stack = player.getMainHandItem();
         if (!(stack.getItem() instanceof BlockItem blockItem)) {
-            message("该物品不是方块");
+            message(BattleText.translatable(BattleText.KEY_INFO_NOT_A_BLOCK));
             return;
         }
-        if (player.distanceToSqr(pos.getX() + 0.5D, pos.getY() + 0.5D, pos.getZ() + 0.5D) > 256.0D) {
-            message("太远了");
+        // The hit the client reports builds the placement context, so it is input: a finite point that
+        // really lies on the face it names.
+        if (!legalHit(hitLocation, pos, face)) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_PLACE_HIT));
             return;
         }
-        if(!zone.contains(new GridPos(pos.getX(),pos.getY(),pos.getZ()))) {reject("放置位置超出战斗区域");return;}
+        if (player.distanceToSqr(pos.getX() + 0.5D, pos.getY() + 0.5D, pos.getZ() + 0.5D) > BLOCK_REACH_SQR) {
+            message(BattleText.translatable(BattleText.KEY_INFO_TOO_FAR));
+            return;
+        }
+        if(!zone.contains(new GridPos(pos.getX(),pos.getY(),pos.getZ()))) {reject(BattleText.translatable(BattleText.KEY_REJECT_PLACE_OUTSIDE));return;}
+        if (!legalBuildTarget(player, pos)) { reject(BattleText.translatable(BattleText.KEY_REJECT_BUILD_LIMIT)); return; }
+        if (!blockSight(state.cell(), pos, hitLocation, player)) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_BREAK_SIGHT));
+            return;
+        }
         BlockPlaceContext context = new BlockPlaceContext(player, InteractionHand.MAIN_HAND, stack,
                 new BlockHitResult(hitLocation, face, pos, false));
-        if (BattleToolUse.run(player,()->blockItem.place(context)).consumesAction()) {
+        // The anchor is not the destination: a replaceable clicked block is placed into, anything else is
+        // placed against, and an item may move the context again. The cell the block will really occupy is
+        // the one the battle rules must accept - an anchor inside the zone with the block landing outside
+        // it is exactly what this refuses.
+        BlockPlaceContext resolved;
+        try {
+            resolved = blockItem.updatePlacementContext(context);
+        } catch (RuntimeException unsupported) {
+            resolved = null;
+        }
+        if (resolved == null || !legalPlacementCell(player, pos, resolved.getClickedPos())) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_PLACE_DEST));
+            return;
+        }
+        // A single context is checked above; anything the item does beyond it - a second snapshot of a
+        // bed or a door, a chained context update - is checked inside the native place event, whose
+        // cancellation rolls the world and the item back instead of deleting blocks afterwards.
+        InteractionResult placement = BattleToolUse.run(player,
+                () -> BlockPlaceGuard.run(position -> legalPlacementCell(player, pos, position),
+                        () -> stack.useOn(context)));
+        if (placement.consumesAction()) {
             player.swing(InteractionHand.MAIN_HAND, true);
             state.commitPaidAction(cost);
             actionCount++;
             level.playSound(null, pos, blockItem.getBlock().defaultBlockState().getSoundType().getPlaceSound(),
                     SoundSource.PLAYERS, 1.0F, 1.0F);
+            beginTerrainFallIfNeeded();
             sendState();
         } else {
-            message("这里不能放置");
+            message(BattleText.translatable(BattleText.KEY_INFO_CANNOT_PLACE));
         }
     }
 
@@ -1852,10 +2320,343 @@ public final class ServerBattle {
         placeBlock(acting, slot, pos, face, hitLocation);
     }
 
+    // ------------------------------------------------------------------
+    // breaking one block
+    // ------------------------------------------------------------------
+
+    /**
+     * Break the block the actor points at, with whatever the main hand holds.
+     *
+     * <p>The native {@code ServerPlayerGameMode.destroyBlock} does the destruction itself: it fires the
+     * break event, refuses protected and restricted positions, applies the tool's durability and the
+     * tool-destroyed event, and lets the block drop its own loot through {@code playerDestroy}. Nothing
+     * here copies loot or guesses durability - what the vanilla call does not check is added as an
+     * explicit gate in front of it (reach, build limits, world border, spawn protection, line of sight,
+     * difficulty of the block, tool suitability), and nothing is charged unless the world really
+     * changed.</p>
+     */
+    public void breakBlock(ServerPlayer actor, ActionStamp stamp, int slot, BlockPos pos) {
+        PlayerMember member = authorizeActing(actor, stamp);
+        if (member != null) breakBlock(member, slot, pos);
+    }
+
+    private void breakBlock(PlayerMember member, int slot, BlockPos pos) {
+        ServerPlayer player = member.entity;
+        PlayerParticipant state = member.state;
+        int cost = currentBreakCost(member);
+        if (state.ap() < cost) {
+            message(BattleText.translatable(BattleText.KEY_AP_NOT_ENOUGH));
+            return;
+        }
+        // The client's claimed hotbar slot must still be the real one: the price, the tool and the
+        // durability all belong to whatever is really held when the server handles the intent.
+        if (slot < 0 || slot > 8 || slot != player.getInventory().selected) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_HELD_ITEM_CHANGED));
+            return;
+        }
+        // The block command places while a block is held. A break intent that arrives with a block in
+        // the same slot is a stale mode, and the server - not the client's per-frame refresh - is what
+        // refuses it: otherwise the old mode would become a second, unpriced way to break.
+        if (player.getMainHandItem().getItem() instanceof BlockItem) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_BREAK_HELD_BLOCK));
+            return;
+        }
+        if (player.distanceToSqr(pos.getX() + 0.5D, pos.getY() + 0.5D, pos.getZ() + 0.5D) > BLOCK_REACH_SQR) {
+            message(BattleText.translatable(BattleText.KEY_INFO_TOO_FAR));
+            return;
+        }
+        GridPos cell = new GridPos(pos.getX(), pos.getY(), pos.getZ());
+        if (!zone.contains(cell)) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_BREAK_OUTSIDE));
+            return;
+        }
+        if (!legalBuildTarget(player, pos)) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_BUILD_LIMIT));
+            return;
+        }
+        BlockState target = level.getBlockState(pos);
+        if (target.isAir() || target.liquid()) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_BREAK_TARGET));
+            return;
+        }
+        if (target.getDestroySpeed(level, pos) < 0.0F) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_BREAK_UNBREAKABLE));
+            return;
+        }
+        // "A block that needs the right tool" is a property of the block, not of the drop: a block that
+        // can be collected bare-handed stays collectable bare-handed, and one that cannot refuses the
+        // attempt instead of breaking silently without its drop.
+        ItemStack tool = player.getMainHandItem();
+        if (target.requiresCorrectToolForDrops() && !tool.isCorrectToolForDrops(target)) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_BREAK_TOOL));
+            return;
+        }
+        if (!blockSight(state.cell(), pos, nearestVisiblePoint(state.cell(), pos), player)) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_BREAK_SIGHT));
+            return;
+        }
+        // Spawn protection and every other may-interact rule are not part of destroyBlock, so they are
+        // asked here; a refusal costs nothing.
+        if (!level.mayInteract(player, pos)) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_BREAK_PROTECTED));
+            return;
+        }
+        // Everything that stands on this block must have somewhere legal to land inside this zone
+        // before the block goes away; otherwise the unit would be dropped out of the battle.
+        if (!precheckLosingSupport(pos)) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_BREAK_NO_LANDING));
+            return;
+        }
+        boolean destroyed = BattleToolUse.run(player, () -> player.gameMode.destroyBlock(pos));
+        // destroyBlock reports true even when the block itself refused to go (onDestroyedByPlayer), so
+        // the world is the authority: if the state at that position is still the same one, nothing was
+        // broken and nothing may be charged.
+        if (!destroyed || level.getBlockState(pos) == target) {
+            message(BattleText.translatable(BattleText.KEY_INFO_CANNOT_BREAK));
+            return;
+        }
+        player.swing(InteractionHand.MAIN_HAND, true);
+        state.commitPaidAction(cost);
+        actionCount++;
+        beginTerrainFallIfNeeded();
+        sendState();
+    }
+
+    /** Legacy fixture entry point bound to the acting player. */
+    public void breakBlock(int slot, BlockPos pos) {
+        PlayerMember acting = actingMember();
+        if (acting == null || !canAct(acting)) return;
+        breakBlock(acting, slot, pos);
+    }
+
+    /** Both block commands use one tactical reach, measured from the actor to the block's centre. */
+    private static final double BLOCK_REACH_SQR = 256.0D;
+
+    /**
+     * The gates the native placement and break paths do not apply themselves: the world border, the
+     * build height and the may-interact rules of this level (spawn protection).
+     */
+    private boolean legalBuildTarget(ServerPlayer player, BlockPos pos) {
+        if (pos.getY() < level.getMinBuildHeight() || pos.getY() >= level.getMaxBuildHeight()) return false;
+        if (!level.getWorldBorder().isWithinBounds(pos)) return false;
+        return level.mayInteract(player, pos);
+    }
+
+    /**
+     * Whether this battle allows a placed block to occupy exactly this cell.
+     *
+     * <p>It is asked of the destination - the cell the block will really fill - and again from the native
+     * place event for every snapshot of a multi-block placement, so a rule cannot be satisfied by the
+     * clicked block while the block itself lands somewhere else.</p>
+     */
+    private boolean legalPlacementCell(ServerPlayer player, BlockPos anchor, BlockPos destination) {
+        if (destination == null || anchor == null) return false;
+        // A placement may only touch the clicked block's own neighbourhood: an item that wants to write
+        // somewhere else in the world is not this command's business.
+        if (destination.distManhattan(anchor) > 1) return false;
+        if (!zone.contains(new GridPos(destination.getX(), destination.getY(), destination.getZ()))) return false;
+        if (player.distanceToSqr(destination.getX() + 0.5D, destination.getY() + 0.5D,
+                destination.getZ() + 0.5D) > BLOCK_REACH_SQR) return false;
+        return legalBuildTarget(player, destination);
+    }
+
+    /**
+     * The reported hit point must be finite and lie on the target's real outline surface.
+     *
+     * <p>Vanilla builds the placement context from it, so a point far away, NaN or off the block would
+     * let the client choose a cell other than the one it highlighted. The surface is the state's own
+     * shape - the same outline the client's pick uses - and never an assumed unit cube: a slab's top is
+     * half a block up, a stair's tread lives inside the cell, and soil heights differ per block.</p>
+     *
+     * <p>The reported face only has to be one face of that shape at that point. It is the isometric
+     * camera's pick, not the actor's eye ray, so requiring the two to name the same face would refuse
+     * legal side and high placements; the independent check is {@link #blockSight}, which asks whether a
+     * block is the first thing the actor's eye meets.</p>
+     */
+    private boolean legalHit(Vec3 hit, BlockPos pos, Direction face) {
+        if (hit == null || face == null || pos == null) return false;
+        if (!Double.isFinite(hit.x) || !Double.isFinite(hit.y) || !Double.isFinite(hit.z)) return false;
+        // A state's shape is written in its own block space, so it is moved into the world before the hit
+        // point - which is a world position - is compared with it. Comparing the two spaces directly made
+        // every placement of a full cube fail: the top face is 1.0 locally and 80.0 for a block at y=79.
+        VoxelShape shape = level.getBlockState(pos).getShape(level, pos)
+                .move(pos.getX(), pos.getY(), pos.getZ());
+        if (shape.isEmpty()) return false;
+        // The camera's ray lands on a shape surface, so the tolerance only absorbs float rounding.
+        double tolerance = 0.02D;
+        for (AABB box : shape.toAabbs()) {
+            if (!box.inflate(tolerance).contains(hit)) continue;
+            double plane = switch (face) {
+                case UP -> box.maxY;
+                case DOWN -> box.minY;
+                case EAST -> box.maxX;
+                case WEST -> box.minX;
+                case SOUTH -> box.maxZ;
+                case NORTH -> box.minZ;
+            };
+            double value = switch (face) {
+                case UP, DOWN -> hit.y;
+                case EAST, WEST -> hit.x;
+                case SOUTH, NORTH -> hit.z;
+            };
+            if (Math.abs(value - plane) <= tolerance) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Whether a block is the first thing the actor's eye meets.
+     *
+     * <p>It is the block commands' sight test, and deliberately its own: the entity sight test aims at a
+     * one-block-high end point, which refuses a block the actor can plainly see from the side and accepts a
+     * ray that ends early. Here the ray runs to the block's centre and the first collision must be the
+     * target itself - the same block the client highlighted - so a side or high face is visible while
+     * anything standing in front of it is not. The attack and AI sight tests are untouched.</p>
+     */
+    private boolean blockSight(GridPos from, BlockPos target, Vec3 aim, LivingEntity viewer) {
+        Vec3 start = eyeOf(from);
+        // The aim point lies on the target's own surface, so it is nudged just inside before the ray runs:
+        // a ray that stops exactly on a face can be reported as the neighbouring block on a shared edge.
+        Vec3 inside = aim.add(Vec3.atCenterOf(target).subtract(aim).scale(1.0E-3D));
+        BlockHitResult hit = level.clip(new ClipContext(start, inside, ClipContext.Block.COLLIDER,
+                ClipContext.Fluid.NONE, viewer));
+        return hit.getType() == HitResult.Type.MISS || hit.getBlockPos().equals(target);
+    }
+
+    /** Where the actor's eyes are for a block sight test. */
+    private static Vec3 eyeOf(GridPos from) {
+        return new Vec3(from.x() + 0.5D, from.y() + 1.5D, from.z() + 0.5D);
+    }
+
+    /**
+     * The part of the target nearest the actor's eyes, i.e. the piece of it that is actually visible.
+     *
+     * <p>Aiming at the block's centre is too strict for a block set into a floor or a wall: the ray to the
+     * centre of a floor block two cells away grazes the neighbouring block's top edge and the target looks
+     * hidden. Any visible part counts, so the aim is clamped onto the shape's own box; when the eyes are
+     * already inside that box there is nothing to aim at but the centre.</p>
+     */
+    private Vec3 nearestVisiblePoint(GridPos from, BlockPos target) {
+        Vec3 eye = eyeOf(from);
+        VoxelShape shape = level.getBlockState(target).getShape(level, target)
+                .move(target.getX(), target.getY(), target.getZ());
+        if (shape.isEmpty()) return Vec3.atCenterOf(target);
+        AABB box = shape.bounds();
+        Vec3 clamped = new Vec3(Mth.clamp(eye.x, box.minX, box.maxX), Mth.clamp(eye.y, box.minY, box.maxY),
+                Mth.clamp(eye.z, box.minZ, box.maxZ));
+        return clamped.distanceToSqr(eye) < 1.0E-6D ? Vec3.atCenterOf(target) : clamped;
+    }
+
     /** Use one inventory item (food, potions, or the item's own use action). */
     public void useItem(ServerPlayer actor, ActionStamp stamp, int slot) {
+        useItem(actor, stamp, slot, null);
+    }
+
+    /**
+     * Use one inventory item, either on the actor itself (no target) or on one entity.
+     *
+     * <p>The entity path is a separate branch, not a rewrite of the self use: it runs the native
+     * {@code Player.interactOn} inside the already authorized item scope, so the item's own
+     * {@code interactLivingEntity} decides whether it supports an entity at all. There is no path from
+     * here to "give the target anything": a PASS, a cancelled event or a gone target spends nothing.</p>
+     */
+    public void useItem(ServerPlayer actor, ActionStamp stamp, int slot, java.util.UUID target) {
         PlayerMember member = authorizeActing(actor, stamp);
-        if (member != null) useItem(member, slot);
+        if (member == null) return;
+        if (target == null) useItem(member, slot);
+        else useItemOn(member, slot, target);
+    }
+
+    /** Padding the vanilla interact packet uses when it measures the reach of an entity interaction. */
+    private static final double ENTITY_INTERACT_PADDING = 1.0D;
+
+    /**
+     * The entity reach this player has <em>without</em> the encounter's own extension.
+     *
+     * <p>An encounter widens {@code ENTITY_INTERACTION_RANGE} so grid cells can be clicked far away.
+     * That number says nothing about how far an item can be handed to someone, so the item branch
+     * subtracts the encounter's own modifier and keeps the native range (3, or 5 in creative) plus the
+     * one block padding the vanilla interact packet allows.</p>
+     */
+    private static boolean withinItemReach(ServerPlayer player, Entity target) {
+        var instance = player.getAttribute(net.minecraft.world.entity.ai.attributes.Attributes.ENTITY_INTERACTION_RANGE);
+        if (instance == null) return false;
+        double reach = instance.getValue();
+        for (var modifier : instance.getModifiers()) {
+            if (REACH_MODIFIER.equals(modifier.id())
+                    && modifier.operation() == AttributeModifier.Operation.ADD_VALUE) {
+                reach -= modifier.amount();
+            }
+        }
+        double allowed = Math.max(0.0D, reach) + ENTITY_INTERACT_PADDING;
+        return target.getBoundingBox().distanceToSqr(player.getEyePosition()) < allowed * allowed;
+    }
+
+    private void useItemOn(PlayerMember member, int slot, java.util.UUID targetId) {
+        ServerPlayer player = member.entity;
+        PlayerParticipant state = member.state;
+        int cost = currentItemCost(member);
+        if (state.ap() < cost) {
+            message(BattleText.translatable(BattleText.KEY_AP_NOT_ENOUGH));
+            return;
+        }
+        if(slot<0||slot>8||slot!=player.getInventory().selected) {reject(BattleText.translatable(BattleText.KEY_REJECT_HELD_ITEM_CHANGED));return;}
+        ItemStack stack=player.getMainHandItem();
+        if(stack.isEmpty()) {reject(BattleText.translatable(BattleText.KEY_REJECT_NO_ITEM));return;}
+        if(stack.getItem() instanceof BowItem||stack.getItem() instanceof CrossbowItem||stack.getItem() instanceof net.minecraft.world.item.ShieldItem) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_WEAPON_NOT_ITEM));return;
+        }
+        if(stack.getItem() instanceof BlockItem) {
+            // Placing is the block command's job; the item entry must not remain a second, unpriced path
+            // to the same world change.
+            reject(BattleText.translatable(BattleText.KEY_REJECT_ITEM_IS_BLOCK));return;
+        }
+        Entity target = targetId == null ? null : level.getEntity(targetId);
+        if (target == null) { reject(BattleText.translatable(BattleText.KEY_REJECT_TARGET_GONE));return; }
+        ServerBattle owner = BattleManager.containing(target);
+        boolean sameLevel = target.level() == level;
+        // Only this encounter's own participants: a bystander inside the zone, a unit of another fight or
+        // a unit that already left is not an item target.
+        boolean inThisBattle = owner == this;
+        ItemTargetRule.Denial refusal = ItemTargetRule.refusal(sameLevel, target.isAlive(), target.isRemoved(), target == player,
+                owner != null && owner != this,
+                !inThisBattle,
+                target instanceof ServerPlayer other && !isMember(other),
+                // The reach of an item hand-over is the native entity interaction range, never the
+                // battle's extended pick range and never the weapon's range.
+                sameLevel && withinItemReach(player, target),
+                sameLevel && player.hasLineOfSight(target));
+        // The rule layer answers with a stable code; the wording is created here, at the display boundary.
+        if (refusal != ItemTargetRule.Denial.NONE) { reject(BattleText.itemRefusal(refusal));return; }
+        if (player.getMainHandItem().getItem() instanceof BlockItem) {
+            // The item command no longer places blocks, so a block can never be a use-on-entity target
+            // either: this is the server-side half of the entry split, not a client courtesy.
+            reject(BattleText.translatable(BattleText.KEY_REJECT_ITEM_IS_BLOCK));return;
+        }
+        net.minecraft.world.inventory.AbstractContainerMenu menuBefore = player.containerMenu;
+        NativeEntityUseReceipt.Outcome outcome = NativeEntityUseReceipt.run(player, target, InteractionHand.MAIN_HAND,
+                () -> BattleToolUse.run(player, () -> player.interactOn(target, InteractionHand.MAIN_HAND)));
+        // A native entity interaction may try to open its own menu. Battle permissions never covered a
+        // trade or storage screen, so one that appeared is closed again and the action is refused: the
+        // item scope is not a way to escape into vanilla menus. The close goes through the server's own
+        // path (removed() + transferState + close packet), never by swapping the menu field by hand.
+        if (player.containerMenu != menuBefore) {
+            // ServerPlayer.closeContainer() also tells the client; a headless fixture player has no real
+            // connection and uses the same close without the packet.
+            if (player.connection != null) player.closeContainer();
+            else player.doCloseContainer();
+            player.inventoryMenu.broadcastChanges();
+            reject(BattleText.translatable(BattleText.KEY_REJECT_MENU_ESCAPE));return;
+        }
+        if (outcome.cancelled()) { reject(BattleText.translatable(BattleText.KEY_REJECT_ITEM_CANCELLED));return; }
+        if (!outcome.committed()) { reject(BattleText.translatable(BattleText.KEY_REJECT_ITEM_UNSUPPORTED));return; }
+        player.getInventory().setChanged();
+        player.inventoryMenu.broadcastChanges();
+        player.swing(InteractionHand.MAIN_HAND, true);
+        state.commitPaidAction(cost);actionCount++;
+        journal.record("inventory", BattleText.translatable(BattleText.KEY_ITEM_ON_TARGET,
+                BattleText.name(member.name()), BattleText.name(target), cost));
+        sendState();
     }
 
     private void useItem(PlayerMember member, int slot) {
@@ -1863,23 +2664,23 @@ public final class ServerBattle {
         PlayerParticipant state = member.state;
         int cost = currentItemCost(member);
         if (state.ap() < cost) {
-            message("AP 不足");
+            message(BattleText.translatable(BattleText.KEY_AP_NOT_ENOUGH));
             return;
         }
-        if(slot<0||slot>8||slot!=player.getInventory().selected) {reject("主手物品已改变，请重新选择道具");return;}
+        if(slot<0||slot>8||slot!=player.getInventory().selected) {reject(BattleText.translatable(BattleText.KEY_REJECT_HELD_ITEM_CHANGED));return;}
         ItemStack stack=player.getMainHandItem();
-        if(stack.isEmpty()) {reject("主手没有可用道具");return;}
+        if(stack.isEmpty()) {reject(BattleText.translatable(BattleText.KEY_REJECT_NO_ITEM));return;}
         if(stack.getItem() instanceof BowItem||stack.getItem() instanceof CrossbowItem||stack.getItem() instanceof net.minecraft.world.item.ShieldItem) {
-            reject("武器请使用攻击，盾牌请使用防御");return;
+            reject(BattleText.translatable(BattleText.KEY_REJECT_WEAPON_NOT_ITEM));return;
         }
         var result=BattleToolUse.run(player,()->stack.use(level,player,InteractionHand.MAIN_HAND));
-        if(!result.getResult().consumesAction()) {reject("当前主手道具不能使用");return;}
+        if(!result.getResult().consumesAction()) {reject(BattleText.translatable(BattleText.KEY_REJECT_ITEM_CANNOT_USE));return;}
         ItemStack next=result.getObject();
         if (stack.getUseDuration(player) > 0) {
             // A cancelled native Start event can still leave Item.use returning CONSUME.
             // It has not committed an item use and must not consume AP or escalation.
             if (!player.isUsingItem() || player.getUseItem() != stack) {
-                reject("道具使用被取消"); return;
+                reject(BattleText.translatable(BattleText.KEY_REJECT_ITEM_CANCELLED)); return;
             }
             ItemStack before = stack.copy();
             int remaining = player.getUseItemRemainingTicks();
@@ -1891,7 +2692,8 @@ public final class ServerBattle {
         player.inventoryMenu.broadcastChanges();
         player.swing(InteractionHand.MAIN_HAND,true);
         state.commitPaidAction(cost);actionCount++;
-        journal.record("inventory",member.name()+" 使用主手道具（"+cost+" AP）");
+        journal.record("inventory", BattleText.translatable(BattleText.KEY_ITEM_SELF,
+                BattleText.name(member.name()), cost));
         sendState();
     }
 
@@ -1904,14 +2706,23 @@ public final class ServerBattle {
 
     public void endPlayerTurn(ServerPlayer actor, ActionStamp stamp) {
         PlayerMember member = authorizeActing(actor, stamp);
-        if (member != null) advanceTurn();
+        if (member != null) {
+            advanceTurn();
+            return;
+        }
+        EnemyState companion = authorizeCompanion(actor, stamp);
+        if (companion != null) companionEndTurn(companion, null);
     }
 
     /** Face the chosen direction before handing the turn over. */
     public void endPlayerTurnFacing(ServerPlayer actor, ActionStamp stamp, int yaw) {
         PlayerMember member = authorizeActing(actor, stamp);
-        if (member == null) return;
-        endPlayerTurnFacing(member, yaw);
+        if (member != null) {
+            endPlayerTurnFacing(member, yaw);
+            return;
+        }
+        EnemyState companion = authorizeCompanion(actor, stamp);
+        if (companion != null) companionEndTurn(companion, yaw);
     }
 
     private void endPlayerTurnFacing(PlayerMember member, int yaw) {
@@ -1941,7 +2752,7 @@ public final class ServerBattle {
     private boolean tryFlee(PlayerMember member) {
         PlayerParticipant state = member.state;
         if (state.ap() < BattleRules.FLEE_COST) {
-            reject("AP 不足，无法逃跑");
+            reject(BattleText.translatable(BattleText.KEY_REJECT_FLEE_AP));
             return false;
         }
         state.ap(state.ap()-BattleRules.FLEE_COST);
@@ -1952,11 +2763,11 @@ public final class ServerBattle {
         chance = net.minecraft.util.Mth.clamp(chance, 0.1D, 0.9D);
         if (level.random.nextDouble() < chance) {
             BattleManager.grantFleeImmunity(member.entity);
-            removeMember(member, "fled");
+            removeMember(member, BattleText.exitReason(BattleText.Exit.FLED));
             return true;
         }
         state.ap(0);
-        message("逃跑失败（成功率 " + Math.round(chance * 100.0D) + "%）");
+        message(BattleText.translatable(BattleText.KEY_INFO_FLEE_FAILED, Math.round(chance * 100.0D)));
         advanceTurn();
         return false;
     }
@@ -2004,8 +2815,8 @@ public final class ServerBattle {
             state.moving(false);
             state.beginMove(List.of(), false, stepTicks, stepTicks);
             if(DropClearance.clearSegment(level,player,centerOf(state.cell()),centerOf(state.cell()))) snapPlayer(member, state.cell());
-            else { finish("移动路径被动态障碍阻挡"); return; }
-            journal.record("reject","移动途中出现障碍，已停止并退还未完成步数的 AP");
+            else { finish(BattleText.endReason(BattleText.End.PATH_BLOCKED)); return; }
+            journal.record("reject",BattleText.translatable(BattleText.KEY_REJECT_PATH_BLOCKED));
             sendPlayerMotion(member, List.of());sendState();return;
         }
         setPlayerPosition(member, position);
@@ -2033,13 +2844,44 @@ public final class ServerBattle {
             if (enemyPathIndex >= enemyPath.size()) {
                 enemyMoving = false;
                 enemyPath = List.of();
+                enemyStepping = false;
                 if(enemy.flying){enemy.mob.setPos(AerialMovement.feet(enemy.cell,enemy.airOffset));enemy.mob.setDeltaMovement(Vec3.ZERO);}
+                // A commanded companion never continues on its own: the controller decides whether to attack,
+                // step again or hand the turn over. No AI follow-up and no automatic turn advance here.
+                if (enemy.companionAdapter != null) {
+                    enemyDiveAttackIndex = -1;
+                    enemyDiveAttacked = false;
+                    enemyDiveReservedCost = 0;
+                    sendState();
+                    return;
+                }
                 if(enemyDiveAttackIndex>=0){enemyDiveAttackIndex=-1;advanceTurn();}
-                else if (primaryOpponent(enemy.mob) == null) advanceTurn();
-                else resolveAiAction(enemy,ai.afterMovement(aiContext(enemy)));
+                else if (!targetLost(enemy)) resolveAiAction(enemy,ai.afterMovement(aiContext(enemy)));
+                else if (!replanAfterLostTarget(enemy)) advanceTurn();
                 return;
             }
-            enemyStepTarget = enemyPath.get(enemyPathIndex++);
+            GridPos stepTarget = enemyPath.get(enemyPathIndex);
+            // The terrain this route was planned through may have changed under it: somebody closed the door
+            // again, a block went up, a unit stepped in. Only a door-aware actor rechecks its ground steps here,
+            // so no other ground AI changes; the steps it will not walk are given back and the turn ends
+            // instead of walking through a solid cell.
+            DoorRouteTerrain stepTerrain = doorTerrain(enemy);
+            if (stepTerrain != null && !stepTerrain.canEnter(enemy.cell, stepTarget)) {
+                int unused = enemyPath.size() - enemyPathIndex;
+                enemy.ap = Math.min(enemy.maxAp, enemy.ap + unused * enemy.moveCost + enemyDiveReservedCost);
+                enemyDiveReservedCost = 0;
+                enemyMoving = false;
+                enemyStepping = false;
+                enemyPath = List.of();
+                enemyDiveAttackIndex = -1;
+                journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_ROUTE_BLOCKED,
+                        BattleText.name(enemy.mob)));
+                sendState();
+                advanceTurn();
+                return;
+            }
+            enemyStepTarget = stepTarget;
+            enemyPathIndex++;
             enemyStepFrom = enemy.mob.position();
             faceDirection(enemy.mob, enemyStepTarget);
             enemyStepProgress = 0;
@@ -2054,7 +2896,8 @@ public final class ServerBattle {
             enemy.ap=Math.min(enemy.maxAp,enemy.ap+unused*enemy.moveCost+enemyDiveReservedCost);
             enemyDiveReservedCost=0;
             enemyMoving=false;enemyStepping=false;enemyPath=List.of();enemyDiveAttackIndex=-1;
-            journal.record("enemy",enemy.mob.getDisplayName().getString()+" 的飞行路径出现障碍，停止并退还未执行费用");
+            journal.record("enemy",BattleText.translatable(BattleText.KEY_ENEMY_FLIGHT_BLOCKED,
+                    BattleText.name(enemy.mob)));
             advanceTurn();return;
         }
         enemy.mob.setPos(next);
@@ -2070,11 +2913,11 @@ public final class ServerBattle {
                 AiContext strikeContext = aiContext(enemy);
                 if(strikeContext.target() != null && strikeContext.inMeleeRange(enemy.cell,strikeContext.targetCell())
                         && strikeContext.hasLineOfSight(enemy.cell,strikeContext.targetCell())) {
-                    if (performEnemyMelee(enemy)) enemy.paidActions++;
+                    if (performMelee(enemy, strikeContext.target())) enemy.paidActions++;
                     else enemy.ap=Math.min(enemy.maxAp,enemy.ap+reserved);
                 } else {
                     enemy.ap=Math.min(enemy.maxAp,enemy.ap+reserved);
-                    journal.record("enemy","目标已移动，俯冲攻击未命中");
+                    journal.record("enemy",BattleText.translatable(BattleText.KEY_ENEMY_DIVE_MISSED));
                 }
                 sendState();
             }
@@ -2094,49 +2937,1027 @@ public final class ServerBattle {
         mob.yRotO = mob.yHeadRotO = mob.yBodyRotO = yaw;
     }
 
-    private boolean performEnemyMelee(EnemyState enemy) {
-        LivingEntity target = primaryOpponent(enemy.mob);
+    /**
+     * The entity this actor's action must hit: the planned lock while one exists, the legacy current opponent
+     * when the turn never locked one.
+     *
+     * <p>A lock that was established and then lost answers {@code null} instead of quietly picking a new
+     * victim, which is what keeps planning and execution on one UUID.</p>
+     */
+    private LivingEntity actionOpponent(EnemyState state) {
+        LivingEntity locked = lockedOpponent(state);
+        return locked == null && state.lockedTarget == null ? primaryOpponent(state.mob) : locked;
+    }
+
+    /** True when this turn really locked an opponent and that opponent is no longer usable. */
+    private boolean targetLost(EnemyState state) {
+        return state.lockedTarget != null && lockedOpponent(state) == null;
+    }
+
+    /**
+     * The opponent this own turn was planned against, re-validated against the live world.
+     *
+     * <p>Planning and execution have to name the same entity: a plan that says "shoot A" may never resolve
+     * into a fresh nearest-target lookup that shoots B. Anything that makes the locked entity illegal (death,
+     * a removed participant, leaving the field or zone, no longer opposed) yields {@code null}, and the caller
+     * may replan exactly once before the turn ends.</p>
+     */
+    private LivingEntity lockedOpponent(EnemyState state) {
+        if (state.lockedTarget == null) return null;
+        LivingEntity entity = participantEntity(state.lockedTarget);
+        if (entity == null || entity == state.mob || !entity.isAlive() || entity.isRemoved()
+                || entity.level() != level || !opposed(state.mob, entity)) return null;
+        GridPos cell = participantCell(entity);
+        return cell != null && zone.contains(cell) ? entity : null;
+    }
+
+    /**
+     * Establish this own turn's opponent lock; false when the actor has no legal opponent at all.
+     *
+     * <p>The lock is one UUID for the whole turn: planning, the walk and the real strike all name it, and a
+     * lost lock allows exactly one bounded replan.</p>
+     */
+    private boolean lockOpponent(EnemyState state) {
+        LivingEntity next = reachableOpponentFirst(state);
+        state.lockedTarget = next == null ? null : next.getUUID();
+        return next != null;
+    }
+
+    /**
+     * One bounded replan when the opponent a turn was planned against is gone.
+     *
+     * @return true when a new plan was already dispatched, so the caller must not also end the turn
+     */
+    private boolean replanAfterLostTarget(EnemyState state) {
+        if (state.targetReplans >= 1 || finished) return false;
+        LivingEntity next = reachableOpponentFirst(state);
+        if (next == null) return false;
+        state.targetReplans++;
+        state.lockedTarget = next.getUUID();
+        journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_RETARGET,
+                BattleText.name(state.mob), BattleText.name(next)));
+        resolveAiAction(state, ai.planTurn(aiContext(state)));
+        return true;
+    }
+
+    /** A main action that must hit the locked opponent, so losing that opponent cannot be silently re-aimed. */
+    private static boolean targetedAction(AiAction.Kind kind) {
+        return kind == AiAction.Kind.MELEE || kind == AiAction.Kind.RANGED || kind == AiAction.Kind.SKILL
+                || kind == AiAction.Kind.THROW_POTION;
+    }
+
+    /**
+     * The ranged loadout this actor's own adapter fires, resolved against the adapter's declared weapon type.
+     *
+     * <p>An AI actor is only armed with the weapon its adapter can actually fire, in the hand the native
+     * firing code will use. A caster without a registered adapter has nothing declared, so it falls back to the
+     * item-driven rule the preview path always used and never gains a new ability here.</p>
+     */
+    private MobRangedLoadout mobLoadout(Mob actor) {
+        if (actor == null) return null;
+        TacticalMobAi adapter = ai.adapter(actor);
+        RangedWeapon declared = adapter == null ? null : adapter.rangedWeapon();
+        return declared == null ? MobRangedLoadout.of(actor) : MobRangedLoadout.of(declared, actor);
+    }
+    /**
+     * Authoritative legality of this actor's real shot from a hypothetical feet cell.
+     *
+     * <p>The numbers come from the weapon that would fire it, so a crossbow is never validated on bow
+     * parameters. Whether the loaded ammunition is supported is decided at the shot itself, where the refusal
+     * can be recorded and the real charge kept: refusing here would let the actor wander around its own
+     * unsupported rocket with no explanation.</p>
+     */
+    private boolean canShootFrom(EnemyState state, LivingEntity opponent, GridPos from) {
+        if (opponent == null || from == null) return false;
+        MobRangedLoadout loadout = mobLoadout(state.mob);
+        if (loadout == null || !(state.mob instanceof net.minecraft.world.entity.monster.RangedAttackMob)) return false;
+        if (loadout.weapon() == RangedWeapon.CROSSBOW
+                && !(state.mob instanceof net.minecraft.world.entity.monster.CrossbowAttackMob)) return false;
+        GridPos target = participantCell(opponent);
+        if (target == null) return false;
+        ItemStack weapon = loadout.stack(state.mob);
+        ItemStack ammo = ammoFor(state.mob, loadout, weapon);
+        return Math.hypot(from.x()-target.x(), from.z()-target.z()) <= 16.001
+                && BallisticShot.plan(level, state.mob, from, opponent, loadout.weapon(),
+                        piercingOf(weapon, ammo)) != null;
+    }
+
+    /**
+     * One native mob melee against an explicitly chosen target.
+     *
+     * <p>The automatic AI passes its own primary opponent, a commanded companion passes the participant its
+     * controller picked; the damage exit, the sound, the swing, the journal row and the attribution are the
+     * same vanilla ones either way. Returns false when nothing was hurt, so the caller can refuse the action
+     * instead of charging for it.</p>
+     */
+    private boolean performMelee(EnemyState enemy, LivingEntity target) {
         if (target == null || !opposed(enemy.mob, target)
+                || target.level() != level || !target.isAlive() || target.isRemoved()
                 || enemy.mob.getAttribute(Attributes.ATTACK_DAMAGE)==null) return false;
-        faceDirection(enemy.mob, participantCell(target));
-        journal.record("attack", enemy.mob.getDisplayName().getString() + " 攻击 " + target.getDisplayName().getString());
+        GridPos targetCell = participantCell(target);
+        if (targetCell != null) faceDirection(enemy.mob, targetCell);
+        journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_ENEMY_MELEE,
+                BattleText.name(enemy.mob), BattleText.name(target)));
         enemy.mob.swing(InteractionHand.MAIN_HAND);
         enemy.mob.setTarget(target);
         return enemy.mob.doHurtTarget(target);
     }
 
-    /** Legacy name: attacks this actor's primary opponent, never its allied owner. */
+    /** Legacy name: attacks this actor's locked opponent, never its allied owner. */
     private void attackPlayer(EnemyState enemy) {
-        int cost = enemyMeleeCost(enemy);
+        int cost = mobMeleeCost(enemy);
         AiContext context = aiContext(enemy);
         if (context.target() == null || enemy.ap < cost || !context.inMeleeRange(enemy.cell, context.targetCell())
                 || !context.hasLineOfSight(enemy.cell, context.targetCell())) return;
-        if (performEnemyMelee(enemy)) { enemy.ap -= cost; enemy.paidActions++; }
+        if (performMelee(enemy, context.target())) { enemy.ap -= cost; enemy.paidActions++; }
     }
 
-    private void shootPlayer(EnemyState enemy) {
-        int cost = enemyBowCost(enemy);
-        LivingEntity target = primaryOpponent(enemy.mob);
-        if (!(enemy.mob instanceof net.minecraft.world.entity.monster.RangedAttackMob ranged)
-                || target == null || !opposed(enemy.mob, target) || enemy.ap < cost
-                || !(enemy.mob.getMainHandItem().getItem() instanceof BowItem)) return;
-        BallisticShot.Plan shot = BallisticShot.plan(level, enemy.mob, enemy.cell, target, 1.6F, true, 0);
-        if (shot == null) { journal.record("enemy", enemy.mob.getDisplayName().getString() + " 无法射中，寻找新的射击位置"); return; }
+    // ------------------------------------------------------------------
+    // wooden doors: route snapshot and the one real break
+    // ------------------------------------------------------------------
+
+    /** Local door-route search budget. It is bounded, local and never force-loads a chunk. */
+    private static final int DOOR_ROUTE_BUDGET = 2048;
+    /** Fixture-only budget override; 0 keeps the shipped budget. */
+    private static int fixtureDoorRouteBudget;
+
+    /**
+     * Fixture-only: shrink (or restore with 0) the door-route budget.
+     *
+     * <p>The undecided branch - "the search ran out of budget, so nothing is proven" - cannot be reached on a
+     * small fixture map without a fake, because a real battle zone always fits inside the shipped budget. This
+     * is the same kind of fixture-only hook as the injected admission faults, and it never changes behaviour
+     * unless a fixture asks for it.</p>
+     */
+    static void fixtureDoorRouteBudget(int budget) { fixtureDoorRouteBudget = Math.max(0, budget); }
+
+    private static int doorRouteBudget() {
+        return fixtureDoorRouteBudget > 0 ? fixtureDoorRouteBudget : DOOR_ROUTE_BUDGET;
+    }
+
+    /**
+     * Fixture-only: make the real removal call fail, so the transactional recovery can be exercised.
+     *
+     * <p>A door never refuses removal by itself, so the "removal failed after one half was already cleared"
+     * path has no natural trigger. Like the injected admission faults, this changes nothing unless a fixture
+     * asks for it, and the recovery it exercises is the shipped code.</p>
+     */
+    private static boolean fixtureRefuseDoorRemoval;
+
+    /** Fixture-only: refuse (or allow, with false) the next real door removals. */
+    static void fixtureRefuseDoorRemoval(boolean refuse) { fixtureRefuseDoorRemoval = refuse; }
+
+    /**
+     * The door-aware terrain, but only for an actor whose own adapter declares that it breaks doors.
+     *
+     * <p>Every other melee actor keeps the plain navigator, so no other creature gains a door adjacency. The
+     * same view also decides what an <em>already open</em> door means, because the plain terrain adapter refuses
+     * the thin leaf of an open door as well.</p>
+     */
+    private DoorRouteTerrain doorTerrain(EnemyState state) {
+        if (state == null || state.flying) return null;
+        TacticalMobAi adapter = ai.adapter(state.mob);
+        if (adapter == null || !adapter.breaksDoors()) return null;
+        return new DoorRouteTerrain(level, state.mob, zone::contains, this::occupied);
+    }
+
+    /**
+     * Everything the door tactics need, read once from the same terrain the action is charged on.
+     *
+     * <p>The door-free route is asked first and always. The wooden-door route is only asked when the first
+     * answer was a real "no way": a budget or loaded-area limit stays undecided and can never justify a break.
+     * A route is AP-independent on purpose, so a detour this turn cannot finish still counts as a detour.</p>
+     */
+    private VindicatorRoute vindicatorRoute(EnemyState state) {
+        LivingEntity opponent = actionOpponent(state);
+        GridPos target = participantCell(opponent);
+        DoorRouteTerrain terrain = doorTerrain(state);
+        if (opponent == null || target == null || terrain == null) return VindicatorRoute.NONE;
+        int budget = doorRouteBudget();
+        DoorRoutePlanner.Route open = undecided(DoorRoutePlanner.open(terrain, state.cell,
+                engagementCells(state, target, false), budget), terrain);
+        DoorRoutePlanner.Route doors = open.status() == DoorRoutePlanner.Status.UNREACHABLE
+                ? undecided(DoorRoutePlanner.throughDoors(terrain, state.cell,
+                        engagementCells(state, target, true), budget), terrain)
+                : DoorRoutePlanner.Route.UNREACHABLE;
+        return new VindicatorRoute(open, doors, canBreakWoodenDoors(), mobDoorBreakCost(state));
+    }
+
+    /**
+     * The cells from which this actor could really strike that opponent, in the world this search assumes.
+     *
+     * <p>A cell that is merely next to the opponent is not an engagement cell: a wall, a closed door or an
+     * open leaf between the two cells blocks the swing, and planning to a cell the actor cannot actually hit
+     * from would produce a route that ends in nothing. The open search therefore uses the real line of sight.
+     * The door search uses a virtual line in which a closed wooden door is already gone - such a route is only
+     * chosen when that door is the one this turn would break, and the real line of sight is asked again at the
+     * moment the axe really swings.</p>
+     */
+    private Predicate<GridPos> engagementCells(EnemyState state, GridPos target, boolean throughDoors) {
+        return cell -> !cell.equals(target) && !occupied(cell) && inMeleeRange(cell, target)
+                && (throughDoors ? hasLineOfSightThroughDoors(cell, target, state.mob)
+                                 : hasLineOfSight(cell, target, state.mob));
+    }
+
+    /**
+     * Exact native sight in the virtual stance after removing the door the candidate cell stands in.
+     * Doors elsewhere are not part of that stance and keep their real collision shapes.
+     */
+    private boolean hasLineOfSightThroughDoors(GridPos from, GridPos to, LivingEntity viewer) {
+        java.util.Objects.requireNonNull(viewer, "line-of-sight viewer");
+        Vec3 start = new Vec3(from.x() + 0.5D, from.y() + 1.5D, from.z() + 0.5D);
+        Vec3 end = new Vec3(to.x() + 0.5D, to.y() + 1.0D, to.z() + 0.5D);
+        // A sight query must not force-load an otherwise unknown corner chunk.
+        for (int x = (int) Math.floor(Math.min(start.x, end.x)); x <= (int) Math.floor(Math.max(start.x, end.x)); x++) {
+            for (int y = (int) Math.floor(Math.min(start.y, end.y)); y <= (int) Math.floor(Math.max(start.y, end.y)); y++) {
+                for (int z = (int) Math.floor(Math.min(start.z, end.z)); z <= (int) Math.floor(Math.max(start.z, end.z)); z++) {
+                    if (!level.isLoaded(new BlockPos(x, y, z))) return false;
+                }
+            }
+        }
+        BlockPos lower = blockOf(from);
+        BlockPos upper = lower.above();
+        if (!level.isLoaded(lower) || !level.isLoaded(upper)) return false;
+        BlockState lowerState = level.getBlockState(lower);
+        BlockState upperState = level.getBlockState(upper);
+        boolean ignoreCandidateDoor = isClosedWoodenDoor(lowerState, lower, DoubleBlockHalf.LOWER)
+                && isClosedWoodenDoor(upperState, upper, DoubleBlockHalf.UPPER)
+                && upperState.is(lowerState.getBlock());
+        BlockHitResult hit = level.clip(new ClipContext(start, end,
+                ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, viewer) {
+            @Override
+            public net.minecraft.world.phys.shapes.VoxelShape getBlockShape(BlockState blockState,
+                    net.minecraft.world.level.BlockGetter world, BlockPos pos) {
+                if (ignoreCandidateDoor && (pos.equals(lower) || pos.equals(upper))) {
+                    return net.minecraft.world.phys.shapes.Shapes.empty();
+                }
+                return super.getBlockShape(blockState, world, pos);
+            }
+        });
+        return hit.getType() == HitResult.Type.MISS
+                || hit.getLocation().distanceToSqr(start) >= end.distanceToSqr(start) - 0.05D;
+    }
+
+    /**
+     * The same legal hostile pool {@link #primaryOpponent} draws from, nearest first with the UUID tie-break.
+     *
+     * <p>Only the hostile pool is exposed: a door-capable actor may prefer a reachable opponent over a nearer
+     * one that is sealed away, and that is a question about this battle's opponents. The older friendly
+     * target pool and the global aggro rules are not touched.</p>
+     */
+    private List<LivingEntity> hostileOpponentPool(Mob actor) {
+        List<LivingEntity> pool = new ArrayList<>();
+        for (PlayerMember member : members.values()) {
+            ServerPlayer player = member.entity;
+            if (!player.isAlive() || player.isRemoved() || player.level() != level) continue;
+            PlayerParticipant state = memberState(player);
+            if (state == null || !zone.contains(state.cell())) continue;
+            if (!opposed(actor, player)) continue;
+            pool.add(player);
+        }
+        for (EnemyState state : enemies.values()) {
+            Mob mob = state.mob;
+            if (state.companionAdapter == null || mob == actor) continue;
+            if (!mob.isAlive() || mob.isRemoved() || mob.level() != level) continue;
+            if (!zone.contains(state.cell)) continue;
+            if (!opposed(actor, mob)) continue;
+            pool.add(mob);
+        }
+        pool.sort(Comparator.comparingDouble((LivingEntity entity) -> entity.distanceToSqr(actor))
+                .thenComparing(entity -> entity.getUUID().toString()));
+        return pool;
+    }
+
+    /**
+     * Within the same legal pool, take the nearest opponent that can really be reached and hit without
+     * breaking anything; only then fall back to the nearest opponent at all.
+     *
+     * <p>This is the approved "a reachable opponent in the same pool wins over a nearer one behind a wall"
+     * rule, and it is asked only of an actor whose adapter breaks doors - every other actor keeps the plain
+     * nearest rule it always had. The order is distance then UUID, so the choice is stable and cannot
+     * oscillate between two candidates at the same distance.</p>
+     */
+    private LivingEntity reachableOpponentFirst(EnemyState state) {
+        LivingEntity nearest = primaryOpponent(state.mob);
+        if (nearest == null || state.side != BattleSide.HOSTILE) return nearest;
+        DoorRouteTerrain terrain = doorTerrain(state);
+        if (terrain == null) return nearest;
+        for (LivingEntity candidate : hostileOpponentPool(state.mob)) {
+            GridPos target = participantCell(candidate);
+            if (target == null) continue;
+            if (DoorRoutePlanner.open(terrain, state.cell, engagementCells(state, target, false),
+                    doorRouteBudget()).found()) {
+                // The pool is nearest first, so the first reachable candidate is the nearest reachable one -
+                // including the nearest opponent itself when it really can be reached.
+                return candidate;
+            }
+        }
+        return nearest;
+    }
+
+    /** An unloaded column is not a wall: the exhaustive search answer becomes "not decided". */
+    private static DoorRoutePlanner.Route undecided(DoorRoutePlanner.Route route, DoorRouteTerrain terrain) {
+        return route.status() == DoorRoutePlanner.Status.UNREACHABLE && terrain.sawUnloaded()
+                ? DoorRoutePlanner.Route.LIMIT_REACHED : route;
+    }
+
+    /**
+     * Encounter-level permission for a wooden door: ordinary or hard difficulty and mob griefing.
+     *
+     * <p>This is what the plan needs to know. The per-block rule, the entity-griefing event and the cancellable
+     * break event are asked again at the break itself, where a refusal costs nothing.</p>
+     */
+    private boolean canBreakWoodenDoors() {
+        Difficulty difficulty = level.getDifficulty();
+        if (difficulty != Difficulty.NORMAL && difficulty != Difficulty.HARD) return false;
+        return level.getGameRules().getBoolean(GameRules.RULE_MOBGRIEFING);
+    }
+
+    /** One door pair is one object, so one break has exactly one price. */
+    private int mobDoorBreakCost(EnemyState enemy) {
+        return quote(intConfig(TacticalConfig.INSTANCE.breakApCost, ApCalculator.BREAK_COST), enemy.paidActions);
+    }
+
+    /**
+     * Break one closed wooden door pair as this own turn's main action.
+     *
+     * <p>Order matters. Everything is re-checked against the live world after the plan was made: the same pair
+     * is still there, still closed, still wooden, loaded and inside this battle; this actor still stands in
+     * front of it; the real vanilla protection chain allows it; the events did not swap the door out from under
+     * the removal; nothing that stands on the upper half would lose its footing. Only then do the two blocks go
+     * away - as one object, with one drop - and only then is the price committed once. A refusal charges
+     * nothing and keeps the remaining AP, and the turn always ends afterwards so nobody gets a free axe swing
+     * through the new doorway.</p>
+     *
+     * <p>The vanilla chain is {@code CommonHooks.canEntityDestroy}: it already checks the loaded chunk, the
+     * entity-griefing event, the block's own {@code canEntityDestroy} and the cancellable
+     * {@code LivingDestroyBlockEvent}. Nothing is posted a second time here, and the player-only break event is
+     * not borrowed as if it were entity protection.</p>
+     */
+    private boolean breakDoor(EnemyState state, DoorRoutePlanner.Door door) {
+        if (door == null || !(state.mob instanceof Vindicator) || state.flying) return false;
+        if (!isActorTurn(state.mob) || isBusy()) return false;
+        int cost = mobDoorBreakCost(state);
+        if (cost <= 0 || state.ap < cost) return false;
+        BlockPos lower = blockOf(door.lower());
+        BlockPos upper = blockOf(door.upper());
+        if (!zone.contains(door.lower()) || !zone.contains(door.upper())
+                || !level.isLoaded(lower) || !level.isLoaded(upper)) return refuseDoorBreak(state);
+        BlockState lowerState = level.getBlockState(lower);
+        BlockState upperState = level.getBlockState(upper);
+        // The same pair, still closed, still one wooden door - read now, not from the plan.
+        if (!isClosedWoodenDoor(lowerState, lower, DoubleBlockHalf.LOWER)
+                || !isClosedWoodenDoor(upperState, upper, DoubleBlockHalf.UPPER)
+                || !upperState.is(lowerState.getBlock())) return refuseDoorBreak(state);
+        // The approved standing: the actor is in the cell right in front of that door, on its layer.
+        DoorRouteTerrain terrain = doorTerrain(state);
+        if (terrain == null || !terrain.standsInFrontOf(state.cell, door)
+                || !terrain.canEnterThroughDoor(state.cell, door.lower(), door)) return refuseDoorBreak(state);
+        if (!CommonHooks.canEntityDestroy(level, lower, state.mob)
+                || !CommonHooks.canEntityDestroy(level, upper, state.mob)) return refuseDoorBreak(state);
+        // A callback may have replaced either half; the pair this action priced has to still be the pair here.
+        if (level.getBlockState(lower) != lowerState || level.getBlockState(upper) != upperState) {
+            return refuseDoorBreak(state);
+        }
+        // Nothing may be dropped out of the battle: a unit can stand on the upper half, so the same support
+        // gate the block commands use runs first - and it runs on the world where both halves are gone, which
+        // is the object this action really removes.
+        if (!precheckLosingSupport(lower, upper)) return refuseDoorBreak(state);
+
+        // One object, one drop, one transaction. Removing either half with shape updates makes the other half's
+        // own updateShape destroy it - and that nested destroy drops the door's loot a second time. So the upper
+        // half is cleared with the shape switch off (clients are still told) and only the lower half goes
+        // through the real destroy path: that path drops the door's own loot exactly once, plays the real break
+        // particles and still publishes the block-destroy event, and the remaining neighbours of the pair are
+        // updated there.
+        level.setBlock(upper, net.minecraft.world.level.block.Blocks.AIR.defaultBlockState(),
+                Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
+        boolean destroyed = !fixtureRefuseDoorRemoval && level.destroyBlock(lower, true, state.mob, 512);
+        level.levelEvent(1021, lower, 0);
+        // Success is the world's own answer, not one return value: both halves really gone, and no half left
+        // behind. A refusal that already took one half away is repaired before giving up, so the object the
+        // plan priced is never left half open.
+        boolean gone = level.getBlockState(lower).isAir() && level.getBlockState(upper).isAir();
+        if (!destroyed || !gone) {
+            if (level.getBlockState(lower) == lowerState && level.getBlockState(upper).isAir()) {
+                // Give back only the half this call cleared, and only while that position is still empty: an
+                // external callback that put something else there keeps its own block, and nothing is dropped
+                // a second time by this restore.
+                level.setBlock(upper, upperState, Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
+            }
+            return refuseDoorBreak(state);
+        }
+
+        state.ap -= cost;
+        state.paidActions++;
+        journal.record("attack", BattleText.translatable(BattleText.KEY_ENEMY_BREAK_DOOR,
+                BattleText.name(state.mob), BattleText.literal(door.lower().toString())));
+        // The removal may have taken somebody's footing; the existing fall gate and the existing reachability
+        // refresh do the rest on the real world.
+        beginTerrainFallIfNeeded();
+        sendState();
+        return true;
+    }
+
+    /** A refused break changes nothing: no door, no price, no paid action. */
+    private boolean refuseDoorBreak(EnemyState state) {
+        journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_DOOR_REFUSED,
+                BattleText.name(state.mob)));
+        sendState();
+        return false;
+    }
+
+    /** The same "one wooden door half" rule the terrain view uses, stated once for the removal path. */
+    private static boolean isClosedWoodenDoor(BlockState blockState, BlockPos pos, DoubleBlockHalf half) {
+        return blockState.getBlock() instanceof DoorBlock door && blockState.is(BlockTags.WOODEN_DOORS)
+                && door.type().canOpenByHand() && !blockState.getValue(DoorBlock.OPEN)
+                && blockState.getValue(DoorBlock.HALF) == half;
+    }
+
+    private static BlockPos blockOf(GridPos cell) { return new BlockPos(cell.x(), cell.y(), cell.z()); }
+
+
+    /**
+     * One native ranged main action, for the weapon this actor's own adapter fires.
+     *
+     * <p>The price is frozen before any native side effect. A shot that breaks the crossbow used to be
+     * repriced at zero after the fact, which made a real shot free; the quote is read from the weapon the turn
+     * really holds, before loading and before firing, and that same number is committed once a real projectile
+     * exists.</p>
+     *
+     * <p>Loading and firing are one bounded transaction over the two hand stacks, the real charged
+     * projectiles, the charge pose and the actor's own aim. Vanilla clears the charged projectiles and spends
+     * durability before the projectile joins the world, so a cancelled join leaves real changes behind:
+     * producing no projectile at all restores exactly those hand stacks and gives the actor no cost. Anything
+     * that did produce a projectile is final: a later miss, block or cancelled hit refunds nothing.</p>
+     */
+    private void shootOpponent(EnemyState enemy) {
+        MobRangedLoadout loadout = mobLoadout(enemy.mob);
+        LivingEntity target = actionOpponent(enemy);
+        if (loadout == null || target == null
+                || !(enemy.mob instanceof net.minecraft.world.entity.monster.RangedAttackMob ranged)) return;
+        if (loadout.weapon() == RangedWeapon.CROSSBOW
+                && !(enemy.mob instanceof net.minecraft.world.entity.monster.CrossbowAttackMob)) return;
+        // Frozen here, before the load and before the native fire: this is the price that will be committed.
+        int cost = mobRangedCost(enemy);
+        if (cost <= 0 || enemy.ap < cost) return;
+        RangedTransaction transaction = RangedTransaction.begin(enemy.mob, loadout);
+        if (loadout.weapon() == RangedWeapon.CROSSBOW) {
+            ItemStack held = loadout.stack(enemy.mob);
+            if (loadedFirework(held)) {
+                // A loaded rocket is real ammunition this ruleset does not model. Refuse the shot and keep the
+                // real load: firing it on arrow numbers would be a passing fixture with wrong physics.
+                refuseShot(enemy, BattleText.KEY_ENEMY_ROCKET_UNSUPPORTED);
+                return;
+            }
+            if (!CrossbowItem.isCharged(held)) {
+                boolean loaded = false;
+                try {
+                    loaded = loadCrossbow(enemy.mob, loadout);
+                } catch (RuntimeException failure) {
+                    Tactical.LOGGER.error("[Tactical] native crossbow load failed for {}", enemy.mob.getUUID(), failure);
+                }
+                if (!loaded) {
+                    transaction.restore();
+                    refuseShot(enemy, BattleText.KEY_ENEMY_NO_SHOT);
+                    return;
+                }
+            }
+        }
+        // The native load ran on the real stack: re-check that this action still points at the same opponent
+        // and that the hand still holds the weapon this shot was planned for.
+        if (actionOpponent(enemy) != target || !transaction.stillHoldsWeapon()) {
+            transaction.restore();
+            refuseShot(enemy, BattleText.KEY_ENEMY_NO_SHOT);
+            return;
+        }
+        ItemStack weapon = loadout.stack(enemy.mob);
+        ItemStack ammo = ammoFor(enemy.mob, loadout, weapon);
+        BallisticShot.Plan shot = BallisticShot.plan(level, enemy.mob, enemy.cell, target,
+                loadout.weapon(), piercingOf(weapon, ammo));
+        if (shot == null) {
+            transaction.restore();
+            refuseShot(enemy, BattleText.KEY_ENEMY_NO_SHOT);
+            return;
+        }
         enemy.mob.setYRot(shot.yaw()); enemy.mob.setYHeadRot(shot.yaw()); enemy.mob.setYBodyRot(shot.yaw()); enemy.mob.setXRot(shot.pitch());
         enemy.mob.setTarget(target);
-        int fired = projectiles.capture(enemy.mob, shot, () -> ranged.performRangedAttack(target, 1.0F));
-        if (fired <= 0) return;
+        Runnable fire = loadout.weapon() == RangedWeapon.CROSSBOW
+                ? () -> ((net.minecraft.world.entity.monster.CrossbowAttackMob) ranged)
+                        .performCrossbowAttack(enemy.mob, loadout.weapon().speed())
+                : () -> ranged.performRangedAttack(target, 1.0F);
+        // Catch inside the capture scope: a later callback can fail after an earlier salvo projectile joined.
+        // Capture must still finish its authoritative spawned-entity count before deciding whether to refund.
+        RuntimeException[] nativeFailure = new RuntimeException[1];
+        int fired = projectiles.capture(enemy.mob, shot, () -> {
+            try {
+                fire.run();
+            } catch (RuntimeException failure) {
+                nativeFailure[0] = failure;
+            }
+        });
+        if (nativeFailure[0] != null) {
+            Tactical.LOGGER.error("[Tactical] native ranged fire failed for {} after {} projectile(s)",
+                    enemy.mob.getUUID(), fired, nativeFailure[0]);
+        }
+        if (fired <= 0) {
+            transaction.restore();
+            refuseShot(enemy, BattleText.KEY_ENEMY_NO_SHOT);
+            return;
+        }
         enemy.ap -= cost;
         enemy.paidActions++;
         pendingEnemyShot = enemy.mob.getUUID();
         awaitingShotResolution = true;
         shotRecoveryTicks = -1;
-        journal.record("attack", enemy.mob.getDisplayName().getString() + " 拉弓射击 " + target.getDisplayName().getString());
+        journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_ENEMY_RANGED,
+                BattleText.name(enemy.mob), BattleText.name(target)));
         sendState();
     }
 
+    /** Record one ranged refusal as structure; the refusal itself changed nothing and costs nothing. */
+    private void refuseShot(EnemyState enemy, String key) {
+        journal.record("enemy", BattleText.translatable(key, BattleText.name(enemy.mob)));
+        sendState();
+    }
+
+    // ------------------------------------------------------------------
+    // witch: one self-drink, one thrown bottle
+    // ------------------------------------------------------------------
+
+    /** Plan §2.3 defaults; the config exposes all four so a pack can retune without touching the rules. */
+    static final int WITCH_DRINK_COST = 25;
+    static final int WITCH_THROW_COST = 15;
+    /** Vanilla instant health at amplifier 0 restores exactly this much; a smaller gap would waste a dose. */
+    static final float HEAL_DOSE = 4.0F;
+
+    /**
+     * Everything the potion tactics need, read once from the state the action is really charged from.
+     *
+     * <p>The cooldown is the witch's own own-turn counter, never wall-clock time: only her own turn start
+     * advances it, so other units acting, a paused turn or a reopened menu can neither reduce nor re-arm it.
+     * "Fully effective" means at least one whole own-turn cycle of the effect is left, which is the same 200
+     * ticks {@link BattleEffects} settles per cycle; anything shorter is treated as worth replacing.</p>
+     */
+    private WitchState witchState(EnemyState state) {
+        if (!(state.mob instanceof Witch witch)) return WitchState.NONE;
+        LivingEntity opponent = actionOpponent(state);
+        EnumSet<WitchBrew> activeSelf = EnumSet.noneOf(WitchBrew.class);
+        for (WitchBrew brew : WitchBrew.values()) {
+            if (!brew.selfDrink()) continue;
+            net.minecraft.core.Holder<MobEffect> effect = WitchBrews.periodicEffect(brew);
+            if (effect != null && witch.hasEffect(effect)) activeSelf.add(brew);
+        }
+        EnumSet<WitchBrew> activeTarget = EnumSet.noneOf(WitchBrew.class);
+        EnumSet<WitchBrew> receptive = EnumSet.noneOf(WitchBrew.class);
+        if (opponent != null) {
+            for (WitchBrew brew : WitchBrew.values()) {
+                if (!brew.thrown()) continue;
+                net.minecraft.core.Holder<MobEffect> effect = WitchBrews.periodicEffect(brew);
+                if (effect == null) {
+                    // Instant harming would heal an inverted target instead of hurting it, so it is not
+                    // receptive there. Nothing else can make an instant brew fail.
+                    if (!opponent.isInvertedHealAndHarm()) receptive.add(brew);
+                    continue;
+                }
+                MobEffectInstance current = opponent.getEffect(effect);
+                if (current != null && current.getDuration() >= BattleEffects.TICKS_PER_OWN_CYCLE) {
+                    activeTarget.add(brew);
+                }
+                if (opponent.canBeAffected(new MobEffectInstance(effect))) receptive.add(brew);
+            }
+        }
+        float maxHealth = witch.getMaxHealth();
+        boolean burning = witch.isOnFire() || witch.getLastDamageSource() != null
+                && witch.getLastDamageSource().is(net.minecraft.tags.DamageTypeTags.IS_FIRE);
+        boolean ready = isActorTurn(witch) && !isBusy() && state.drink.ready(state.ownTurns);
+        return new WitchState(ready, opponent != null, mobDrinkCost(state), mobThrowCost(state),
+                maxHealth <= 0.0F ? 1.0F : witch.getHealth() / maxHealth,
+                Math.max(0.0F, maxHealth - witch.getHealth()), HEAL_DOSE, (float) witchHealThreshold(),
+                witch.isEyeInFluid(net.minecraft.tags.FluidTags.WATER), burning,
+                opponent == null ? 0.0F : opponent.getHealth(),
+                activeSelf, activeTarget, receptive, state.pendingDrink);
+    }
+
+    private int mobDrinkCost(EnemyState enemy) {
+        return quote(intConfig(TacticalConfig.INSTANCE.witchDrinkApCost, WITCH_DRINK_COST), enemy.paidActions);
+    }
+
+    private int mobThrowCost(EnemyState enemy) {
+        return quote(intConfig(TacticalConfig.INSTANCE.witchThrowApCost, WITCH_THROW_COST), enemy.paidActions);
+    }
+
+    private int witchDrinkCooldownTurns() {
+        return Math.max(1, intConfig(TacticalConfig.INSTANCE.witchDrinkCooldownTurns, 3));
+    }
+
+    private double witchHealThreshold() {
+        try {
+            return TacticalConfig.INSTANCE.witchHealThreshold.get();
+        } catch (RuntimeException unreadable) {
+            Tactical.LOGGER.warn("[Tactical] witch heal threshold unreadable; using the ruled default", unreadable);
+            return WitchTacticalAi.DEFAULT_HEAL_THRESHOLD;
+        }
+    }
+
+    /** Authoritative legality of one thrown bottle from a hypothetical feet cell. */
+    private boolean canThrowFrom(EnemyState state, LivingEntity opponent, GridPos from) {
+        if (opponent == null || from == null || !(state.mob instanceof Witch)) return false;
+        GridPos target = participantCell(opponent);
+        if (target == null) return false;
+        if (Math.hypot(from.x() - target.x(), from.z() - target.z()) > WitchTacticalAi.MAX_THROW_DISTANCE + 0.001D) {
+            return false;
+        }
+        // A potion is not an arrow: it is planned with its own speed, gravity and water drag, and it does not
+        // pierce. A blocked arc is a real refusal, not a shot that flies through cover.
+        return BallisticShot.plan(level, state.mob, from, opponent, ThrowProfile.SPLASH_POTION, 0) != null;
+    }
+
+    /**
+     * Start this own turn's self-drink as a bounded, vanilla-styled presentation.
+     *
+     * <p>The bottle really goes into her hand, vanilla's own drinking flag and countdown are set and her own
+     * drink sound plays, for as many ticks as the potion's own use duration. While that runs the turn stays
+     * busy and nobody else acts. The dose itself is settled exactly once, in {@link #settleWitchDrink()}, from
+     * vanilla's own outlets: an instant brew through {@code applyInstantenousEffect}, a periodic one through
+     * {@code addEffect}. AP, the paid-action count and the shared cooldown move only if that settlement really
+     * changed something.</p>
+     *
+     * @return true when the action was accepted and the presentation started
+     */
+    private boolean drinkPotion(EnemyState state, WitchBrew brew) {
+        if (!(state.mob instanceof Witch witch) || brew == null || !brew.selfDrink()) return false;
+        if (!isActorTurn(witch) || isBusy() || !state.drink.ready(state.ownTurns)) return false;
+        if (mobDrinkCost(state) <= 0 || state.ap < mobDrinkCost(state)) return false;
+        if (!witchState(state).beneficial(brew)) {
+            journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_DRINK_REFUSED,
+                    BattleText.name(witch)));
+            sendState();
+            return false;
+        }
+        ItemStack bottle = WitchBrews.drink(brew);
+        if (bottle.get(DataComponents.POTION_CONTENTS) == null) return false;
+        // Borrow the hand for the presentation. What was there is kept and given back when the pose ends, so
+        // an unrelated item is never destroyed by a drink.
+        pendingWitchBorrowed = witch.getMainHandItem().copy();
+        pendingWitchBottle = bottle.copy();
+        witch.setItemSlot(EquipmentSlot.MAINHAND, bottle);
+        witch.setUsingItem(true);
+        witchAccess(witch).tactical$restoreDrink(new TacticalWitchAccess.WitchDrink(bottle,
+                Math.max(1, bottle.getUseDuration(witch)), true, true));
+        if (!witch.isSilent()) {
+            level.playSound(null, witch.getX(), witch.getY(), witch.getZ(), net.minecraft.sounds.SoundEvents.WITCH_DRINK,
+                    witch.getSoundSource(), 1.0F, 0.8F + level.random.nextFloat() * 0.4F);
+        }
+        pendingWitchDrink = witch.getUUID();
+        pendingWitchBrew = brew;
+        pendingWitchDrinkTicks = Math.max(1, bottle.getUseDuration(witch));
+        sendState();
+        return true;
+    }
+
+    /** True while this encounter is presenting a witch's drink: the turn belongs to that pose, not to anyone else. */
+    private boolean witchDrinking() { return pendingWitchDrink != null; }
+
+    /**
+     * Advance the presented drink by one tick and settle it once at the end of its window.
+     *
+     * <p>Called from the encounter tick before turn flow. It never settles twice: the pose is cleared before the
+     * outlets run, so a callback that re-enters cannot find a half-open drink.</p>
+     */
+    private void tickWitchDrink() {
+        if (pendingWitchDrink == null) return;
+        if (--pendingWitchDrinkTicks > 0) return;
+        settleWitchDrink();
+    }
+
+    /** The single settlement point of one self-drink: dose, price, cooldown and cleanup, in that order. */
+    private void settleWitchDrink() {
+        EnemyState state = enemies.get(pendingWitchDrink);
+        WitchBrew brew = pendingWitchBrew;
+        ItemStack borrowed = pendingWitchBorrowed;
+        ItemStack owned = pendingWitchBottle;
+        Mob actor = state == null ? null : state.mob;
+        pendingWitchDrink = null;
+        pendingWitchBrew = null;
+        pendingWitchBorrowed = ItemStack.EMPTY;
+        pendingWitchBottle = ItemStack.EMPTY;
+        pendingWitchDrinkTicks = 0;
+        if (!(actor instanceof Witch witch) || brew == null) {
+            if (actor != null) sendState();
+            return;
+        }
+        // End the presentation first and give the borrowed hand back: the dose below must not look like a drink
+        // still in progress, and an unrelated item must never be left out of her hand by the pose.
+        witchAccess(witch).tactical$clearDrink();
+        giveBackBorrowedHand(witch, borrowed, owned, actor.isAlive() && !actor.isRemoved());
+        boolean took = applyDrink(witch, brew);
+        if (!took) {
+            journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_DRINK_REFUSED,
+                    BattleText.name(witch)));
+        } else {
+            int cost = mobDrinkCost(state);
+            state.ap = Math.max(0, state.ap - cost);
+            state.paidActions++;
+            state.drink.settle(state.ownTurns);
+            // The drink carried over from admission is now paid for: it can never come back as a second dose.
+            if (state.pendingDrink != null) {
+                if (state.pendingDrink == brew) state.witchDrinkResolved = true;
+                state.pendingDrink = null;
+            }
+            journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_ENEMY_DRINK,
+                    BattleText.name(witch), brewName(brew)));
+        }
+        sendState();
+        if (finished) return;
+        if (actor.getUUID().toString().equals(queue.current())) advanceTurn();
+    }
+
+    /**
+     * Apply one brew through vanilla's own outlets and report whether it really did something.
+     *
+     * <p>This is the distinction {@code PotionItem#finishUsingItem} makes: an instant effect goes through
+     * {@code applyInstantenousEffect} and is only paid for when real health actually moved, a periodic one
+     * through {@code addEffect} and only when the entity really carries it afterwards. A cancelled heal, a
+     * refused effect or a brew with nothing left to give therefore settles as no drink at all.</p>
+     */
+    private boolean applyDrink(Witch witch, WitchBrew brew) {
+        ItemStack bottle = WitchBrews.drink(brew);
+        PotionContents contents = bottle.get(DataComponents.POTION_CONTENTS);
+        if (contents == null) return false;
+        float before = witch.getHealth();
+        boolean[] periodic = new boolean[1];
+        contents.forEachEffect(instance -> {
+            if (instance.getEffect().value().isInstantenous()) {
+                instance.getEffect().value().applyInstantenousEffect(null, null, witch,
+                        instance.getAmplifier(), 1.0);
+            } else {
+                periodic[0] |= witch.addEffect(instance);
+            }
+        });
+        boolean healed = witch.getHealth() > before + 0.01F;
+        witch.gameEvent(net.minecraft.world.level.gameevent.GameEvent.DRINK);
+        if (brew == WitchBrew.HEALING) return healed;
+        net.minecraft.core.Holder<MobEffect> effect = WitchBrews.periodicEffect(brew);
+        return periodic[0] && effect != null && witch.hasEffect(effect);
+    }
+
+    /**
+     * One real vanilla splash potion, thrown at the opponent this own turn locked.
+     *
+     * <p>The bottle is a genuine {@link ThrownPotion} carrying the same registry potion vanilla would have
+     * used, marked as this encounter's bottle so its splash can be filtered, and given the planned flight of a
+     * potion rather than an arrow's. Creating it is the paid event: a bottle that never joins the world costs
+     * nothing and leaves no rule behind, while a bottle that exists is final even if it misses.</p>
+     */
+    private boolean throwPotion(EnemyState state, WitchBrew brew) {
+        if (!(state.mob instanceof Witch witch) || brew == null || !brew.thrown()) return false;
+        if (!isActorTurn(witch) || isBusy()) return false;
+        LivingEntity target = actionOpponent(state);
+        if (target == null || !opposed(witch, target) || target.level() != level) return false;
+        int cost = mobThrowCost(state);
+        if (cost <= 0 || state.ap < cost) return false;
+        if (!canThrowFrom(state, target, state.cell)) {
+            refuseShot(state, BattleText.KEY_ENEMY_NO_THROW);
+            return false;
+        }
+        BallisticShot.Plan shot = BallisticShot.plan(level, witch, state.cell, target,
+                ThrowProfile.SPLASH_POTION, 0);
+        if (shot == null) {
+            refuseShot(state, BattleText.KEY_ENEMY_NO_THROW);
+            return false;
+        }
+        GridPos targetCell = participantCell(target);
+        if (targetCell != null) faceDirection(witch, targetCell);
+        witch.setYRot(shot.yaw());
+        witch.setYHeadRot(shot.yaw());
+        witch.setYBodyRot(shot.yaw());
+        witch.setXRot(shot.pitch());
+        ThrownPotion bottle = new ThrownPotion(level, witch);
+        bottle.setItem(WitchBrews.splash(brew));
+        BattlePotionSplash.mark(bottle, this, witch);
+        // Catch inside the capture scope, exactly as the ranged path does: a throwing join callback must not
+        // escape, and capture still has to finish its authoritative spawned-entity count before any refund.
+        RuntimeException[] nativeFailure = new RuntimeException[1];
+        int fired = projectiles.capture(witch, shot, () -> {
+            try {
+                level.addFreshEntity(bottle);
+            } catch (RuntimeException failure) {
+                nativeFailure[0] = failure;
+            }
+        });
+        if (nativeFailure[0] != null) {
+            Tactical.LOGGER.error("[Tactical] native potion throw failed for {} after {} bottle(s)",
+                    witch.getUUID(), Math.max(0, fired), nativeFailure[0]);
+        }
+        if (fired <= 0) {
+            BattlePotionSplash.forget(bottle);
+            refuseShot(state, BattleText.KEY_ENEMY_NO_THROW);
+            return false;
+        }
+        if (!witch.isSilent()) {
+            level.playSound(null, witch.getX(), witch.getY(), witch.getZ(), net.minecraft.sounds.SoundEvents.WITCH_THROW,
+                    witch.getSoundSource(), 1.0F, 0.8F + level.random.nextFloat() * 0.4F);
+        }
+        state.ap -= cost;
+        state.paidActions++;
+        pendingEnemyShot = witch.getUUID();
+        awaitingShotResolution = true;
+        shotRecoveryTicks = -1;
+        journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_ENEMY_THROW,
+                BattleText.name(witch), BattleText.name(target), brewName(brew)));
+        sendState();
+        return true;
+    }
+
+    /** One brew name as structure, so every client reads it in its own language. */
+    private static Component brewName(WitchBrew brew) {
+        return BattleText.translatable(BattleText.BREW_PREFIX + brew.name().toLowerCase(java.util.Locale.ROOT));
+    }
+
+    /**
+     * Whether one of this encounter's own hostile bottles may affect a candidate at the moment it lands.
+     *
+     * <p>Only this encounter's living, opposed participants count: the throwing witch herself, a same-side
+     * raider, a bystander, an uninvited pet and another encounter's unit are all refused. That single rule
+     * covers instant damage and every periodic effect, so poison and slowness cannot leak where damage cannot.
+     * </p>
+     */
+    public boolean acceptsSplash(LivingEntity thrower, LivingEntity candidate) {
+        if (finished || thrower == null || candidate == null || candidate == thrower) return false;
+        if (candidate.level() != level || !candidate.isAlive() || candidate.isRemoved()) return false;
+        if (!opposed(thrower, candidate)) return false;
+        if (candidate instanceof ServerPlayer player) return members.containsKey(player.getUUID());
+        EnemyState state = enemies.get(candidate.getUUID());
+        return state != null && state.mob == candidate;
+    }
+
+    private static TacticalWitchAccess witchAccess(Mob mob) {
+        if (mob instanceof TacticalWitchAccess access) return access;
+        throw new IllegalStateException("Witch tactical mixin missing: register tactical.witch.mixins.json");
+    }
+
+    /**
+     * Give back a witch's unfinished vanilla drink; a drink this encounter already paid for is never restored.
+     *
+     * <p>Also ends any presentation this encounter still owes her: an unfinished pose is never left holding a
+     * borrowed bottle, and it never settles a dose on the way out.</p>
+     */
+    private void releaseWitchState(EnemyState state) {
+        if (state == null) return;
+        abortWitchDrink(state.mob.getUUID());
+        if (state.witchDrink != null && !state.witchDrinkResolved
+                && state.mob instanceof Witch witch && witch.isAlive() && !witch.isRemoved()) {
+            witchAccess(witch).tactical$restoreDrink(state.witchDrink);
+        }
+        state.witchDrink = null;
+        state.pendingDrink = null;
+    }
+
+    /**
+     * End a presented drink without settling it and give the borrowed stack back.
+     *
+     * <p>Death, departure, a refused encounter end and a finished battle all land here, so a pose can never
+     * outlive its owner and an unrelated hand item is never lost to it.</p>
+     */
+    private void abortWitchDrink(UUID actorId) {
+        if (pendingWitchDrink == null || (actorId != null && !pendingWitchDrink.equals(actorId))) return;
+        EnemyState state = enemies.get(pendingWitchDrink);
+        ItemStack borrowed = pendingWitchBorrowed;
+        ItemStack owned = pendingWitchBottle;
+        pendingWitchDrink = null;
+        pendingWitchBrew = null;
+        pendingWitchBorrowed = ItemStack.EMPTY;
+        pendingWitchBottle = ItemStack.EMPTY;
+        pendingWitchDrinkTicks = 0;
+        if (state == null || !(state.mob instanceof Witch witch)) return;
+        // Vanilla's flag and slowdown are cleared even for a unit that is no longer alive: leaving a pose on a
+        // corpse is exactly the temporary state this encounter promised not to leave behind.
+        witchAccess(witch).tactical$clearDrink();
+        giveBackBorrowedHand(witch, borrowed, owned, witch.isAlive() && !witch.isRemoved());
+    }
+
+    /**
+     * Put the borrowed item back into the hand this presentation borrowed it from - and only if that slot still
+     * holds the bottle this presentation put there.
+     *
+     * <p>An external callback that legitimately replaced the main hand during the pose keeps its new item: it is
+     * neither swallowed nor re-created, and the borrowed stack is never inserted anywhere else, so nothing is
+     * duplicated. A unit that is dead or removed gets no item back - its own death drop has already read the
+     * hand, or will read it after {@link #restoreWitchDrinkBeforeDeath(LivingEntity)} ran.</p>
+     */
+    private void giveBackBorrowedHand(Witch witch, ItemStack borrowed, ItemStack owned, boolean writable) {
+        if (!writable || owned.isEmpty()) return;
+        if (!ItemStack.matches(witch.getMainHandItem(), owned)) return;
+        witch.setItemSlot(EquipmentSlot.MAINHAND, borrowed);
+    }
+
+    /**
+     * Give the borrowed item back before vanilla's own death processing reads the hand for drops.
+     *
+     * <p>Called from the death hook at the lowest priority, so the real item is what drops instead of the
+     * temporary bottle. It settles no dose, heals nothing and moves nothing: only the equip slot and the drink
+     * presentation are touched.</p>
+     *
+     * @return true when this death really ended a drink this encounter was presenting
+     */
+    public boolean restoreWitchDrinkBeforeDeath(LivingEntity actor) {
+        if (actor == null || pendingWitchDrink == null || !pendingWitchDrink.equals(actor.getUUID())) return false;
+        EnemyState state = enemies.get(pendingWitchDrink);
+        ItemStack borrowed = pendingWitchBorrowed;
+        ItemStack owned = pendingWitchBottle;
+        pendingWitchDrink = null;
+        pendingWitchBrew = null;
+        pendingWitchBorrowed = ItemStack.EMPTY;
+        pendingWitchBottle = ItemStack.EMPTY;
+        pendingWitchDrinkTicks = 0;
+        if (state == null || !(state.mob instanceof Witch witch)) return false;
+        witchAccess(witch).tactical$clearDrink();
+        // The unit is dying, so a writable slot is exactly what the drop pass is about to read.
+        giveBackBorrowedHand(witch, borrowed, owned, true);
+        return true;
+    }
+
+    /**
+     * The ammunition the native shot will really draw.
+     *
+     * <p>Read through the same vanilla accessors the firing code uses, so the planned piercing, the planned
+     * flight and the projectile that really leaves cannot describe two different things.</p>
+     */
+    private static ItemStack ammoFor(Mob mob, MobRangedLoadout loadout, ItemStack weapon) {
+        if (loadout.weapon() == RangedWeapon.CROSSBOW) {
+            ChargedProjectiles charged = weapon.get(DataComponents.CHARGED_PROJECTILES);
+            if (charged != null && !charged.isEmpty()) return charged.getItems().get(0);
+        }
+        return mob.getProjectile(weapon);
+    }
+
+    /** The piercing the real arrow will carry: the same vanilla count the projectile applies to itself. */
+    private int piercingOf(ItemStack weapon, ItemStack ammo) {
+        return net.minecraft.world.item.enchantment.EnchantmentHelper.getPiercingCount(level, weapon, ammo);
+    }
+
+    /**
+     * One ranged main action as a bounded transaction over what it can really change.
+     *
+     * <p>Scope is exactly the two hand stacks (the weapon with its real charged projectiles and durability, and
+     * the ammunition stack the shot draws from), the crossbow charging pose and the actor's own aim. A world
+     * change made by some unrelated callback is not this transaction's business and is never replayed.</p>
+     */
+    private record RangedTransaction(Mob mob, MobRangedLoadout loadout, ItemStack weapon, ItemStack other,
+                                     boolean charging, float yRot, float xRot, float yHeadRot, float yBodyRot) {
+        static RangedTransaction begin(Mob mob, MobRangedLoadout loadout) {
+            boolean main = loadout.hand() == InteractionHand.MAIN_HAND;
+            return new RangedTransaction(mob, loadout,
+                    (main ? mob.getMainHandItem() : mob.getOffhandItem()).copy(),
+                    (main ? mob.getOffhandItem() : mob.getMainHandItem()).copy(),
+                    mob instanceof net.minecraft.world.entity.monster.Pillager pillager && pillager.isChargingCrossbow(),
+                    mob.getYRot(), mob.getXRot(), mob.getYHeadRot(), mob.yBodyRot);
+        }
+
+        boolean stillHoldsWeapon() {
+            return loadout.equals(MobRangedLoadout.of(loadout.weapon(),
+                    MobRangedLoadout.carried(mob.getMainHandItem()),
+                    MobRangedLoadout.carried(mob.getOffhandItem())));
+        }
+
+        void restore() {
+            boolean main = loadout.hand() == InteractionHand.MAIN_HAND;
+            mob.setItemSlot(main ? EquipmentSlot.MAINHAND : EquipmentSlot.OFFHAND, weapon);
+            mob.setItemSlot(main ? EquipmentSlot.OFFHAND : EquipmentSlot.MAINHAND, other);
+            if (mob instanceof net.minecraft.world.entity.monster.Pillager pillager) {
+                pillager.setChargingCrossbow(charging);
+            }
+            mob.setYRot(yRot);
+            mob.setYHeadRot(yHeadRot);
+            mob.setYBodyRot(yBodyRot);
+            mob.setXRot(xRot);
+        }
+    }
+
+    /**
+     * Load an empty crossbow through the vanilla item path.
+     *
+     * <p>{@code releaseUsing} at full charge is the exact vanilla load: it draws this actor's own
+     * {@code getProjectile} ammunition (a monster's native default arrow, never a player inventory), applies
+     * real multishot/piercing enchants and stores the real charged projectiles. Nothing is charged here.</p>
+     */
+    private static boolean loadCrossbow(Mob mob, MobRangedLoadout loadout) {
+        ItemStack stack = loadout.stack(mob);
+        if (!(stack.getItem() instanceof CrossbowItem crossbow)) return false;
+        if (CrossbowItem.isCharged(stack)) return true;
+        // getUseDuration - 0 is the full charge duration, so no wall-clock using time is invented.
+        crossbow.releaseUsing(stack, mob.level(), mob, 0);
+        return CrossbowItem.isCharged(stack);
+    }
+
+    private static boolean loadedFirework(ItemStack weapon) {
+        ChargedProjectiles charged = weapon.get(DataComponents.CHARGED_PROJECTILES);
+        return charged != null && !charged.isEmpty() && charged.contains(Items.FIREWORK_ROCKET);
+    }
+
     private AiContext aiContext(EnemyState state) {
-        LivingEntity opponent = primaryOpponent(state.mob);
+        LivingEntity opponent = actionOpponent(state);
         GridPos opponentCell = participantCell(opponent);
         // No-op planning is guarded by planEnemyTurn/afterMovement; retain non-null cells for old adapters.
         GridPos selectedCell = opponentCell == null ? state.cell : opponentCell;
@@ -2163,7 +3984,13 @@ public final class ServerBattle {
                         c -> inMeleeRange(c, selectedCell), c -> c.manhattanDistance(selectedCell))
                         : navigator.path(state.cell, selectedCell, ServerBattle.this::passable, 4096, true);
             }
-            public List<GridPos> standableNeighbors(GridPos cell) { return state.flying ? airNeighbors(cell) : navigator.neighbours(cell); }
+            public List<GridPos> standableNeighbors(GridPos cell) {
+                if (state.flying) return airNeighbors(cell);
+                // A door-capable actor asks the door-aware view, so the cells it was planned through - an
+                // already open doorway included - are exactly the cells its movement is validated against.
+                DoorRouteTerrain terrain = doorTerrain(state);
+                return terrain == null ? navigator.neighbours(cell) : terrain.enterableNeighbours(cell);
+            }
             public boolean occupied(GridPos cell) {
                 for (PlayerMember member : members.values())
                     if (member.state.cell().equals(cell)) return true;
@@ -2173,17 +4000,27 @@ public final class ServerBattle {
             }
             public boolean inMeleeRange(GridPos from, GridPos to) { return state.flying ? Math.abs(from.x()-to.x())<=1 && Math.abs(from.y()-to.y())<=1 && Math.abs(from.z()-to.z())<=1 : ServerBattle.inMeleeRange(from,to); }
             public boolean hasLineOfSight(GridPos from, GridPos to) { return ServerBattle.this.hasLineOfSight(from,to,state.mob); }
-            public int meleeCost() { return enemyMeleeCost(state); }
-            public int rangedCost() { return enemyBowCost(state); }
-            public boolean canRangedAttack(GridPos from) {
-                return opponent != null && state.mob instanceof net.minecraft.world.entity.monster.RangedAttackMob
-                        && state.mob.getMainHandItem().getItem() instanceof BowItem
-                        && Math.hypot(from.x()-selectedCell.x(),from.z()-selectedCell.z())<=16.001
-                        && BallisticShot.plan(level,state.mob,from,opponent,1.6F,true,0)!=null;
-            }
-            public void rangedAttackPlayer() { ServerBattle.this.shootPlayer(state); }
+            public int meleeCost() { return mobMeleeCost(state); }
+            public int rangedCost() { return mobRangedCost(state); }
+            public boolean canRangedAttack(GridPos from) { return canShootFrom(state, opponent, from); }
+            public void rangedAttackPlayer() { ServerBattle.this.shootOpponent(state); }
             public void attackPlayer() { ServerBattle.this.attackPlayer(state); }
+            public WitchState witch() { return witchState(state); }
+            public boolean canThrowFrom(GridPos from) { return ServerBattle.this.canThrowFrom(state, opponent, from); }
+            public boolean drinkPotion(WitchBrew brew) { return ServerBattle.this.drinkPotion(state, brew); }
+            public boolean throwPotion(WitchBrew brew) { return ServerBattle.this.throwPotion(state, brew); }
+            public void clearPendingDrink() { state.pendingDrink = null; }
+            public VindicatorRoute vindicator() { return vindicatorRoute(state); }
+            public boolean breakDoor(DoorRoutePlanner.Door door) { return ServerBattle.this.breakDoor(state, door); }
             public void log(String text) { journal.record("enemy",text); }
+
+            /**
+             * The structured outlet: the row is stored as structure and resolved per client.
+             *
+             * <p>Preferring this over {@link #log(String)} is what keeps an AI warning out of one language:
+             * the producer never turns it into text, so there is nothing to translate back later.</p>
+             */
+            @Override public boolean logLocalized(Component text) { journal.record("enemy", text); return true; }
         };
     }
 
@@ -2191,7 +4028,7 @@ public final class ServerBattle {
         if(action.kind()==AiAction.Kind.MOVE||action.kind()==AiAction.Kind.DIVE) {
             List<GridPos> steps=action.path();
             if(steps.isEmpty()) {advanceTurn();return;}
-            int attackCost=action.kind()==AiAction.Kind.DIVE?enemyMeleeCost(enemy):0;
+            int attackCost=action.kind()==AiAction.Kind.DIVE?mobMeleeCost(enemy):0;
             long total=(long)steps.size()*enemy.moveCost+attackCost;
             if(total>enemy.ap){advanceTurn();return;}
             int cost=(int)total;
@@ -2199,9 +4036,19 @@ public final class ServerBattle {
             enemyDiveReservedCost=attackCost;
             enemyDiveAttackIndex=action.kind()==AiAction.Kind.DIVE?action.attackIndex():-1;enemyDiveAttacked=false;
             enemyPath=List.copyOf(steps);enemyPathIndex=0;enemyStepping=false;enemyMoving=true;
-            if(enemy.flying)journal.record("enemy",enemy.mob.getDisplayName().getString()+" 飞行行动 · "+cost+" AP（含往返与攻击）");
-            journal.record("move",enemy.mob.getDisplayName().getString()+" 移动至 "+steps.get(steps.size()-1));
+            if(enemy.flying)journal.record("enemy",BattleText.translatable(BattleText.KEY_ENEMY_FLIGHT_MOVE,
+                    BattleText.name(enemy.mob), cost));
+            journal.record("move",BattleText.translatable(BattleText.KEY_ENEMY_MOVE,
+                    BattleText.name(enemy.mob), BattleText.literal(steps.get(steps.size()-1).toString())));
             sendState();return;
+        }
+        if (targetedAction(action.kind()) && targetLost(enemy)) {
+            // The opponent this action was planned against is gone. One bounded replan is allowed; anything
+            // more would be an endless search for a new victim inside one turn.
+            if (finished || !enemy.mob.getUUID().toString().equals(queue.current())) return;
+            if (replanAfterLostTarget(enemy)) return;
+            advanceTurn();
+            return;
         }
         AiResolution result=ai.resolveInstant(aiContext(enemy),action);
         if(result==AiResolution.ROSTER_CHANGED) {
@@ -2211,15 +4058,491 @@ public final class ServerBattle {
         }
         if (finished || !enemy.mob.getUUID().toString().equals(queue.current())) return;
         if(pendingEnemyShot!=null && rangedBusy()) return;
+        // The presented drink settles itself and only then hands the turn over.
+        if (witchDrinking()) return;
         advanceTurn();
     }
 
     private void planEnemyTurn() {
         String id=queue.current();
-        if(id==null) {finish("empty turn queue");return;}
+        if(id==null) {finish(BattleText.endReason(BattleText.End.EMPTY_QUEUE));return;}
         EnemyState enemy=enemies.get(UUID.fromString(id));
-        if(enemy==null || primaryOpponent(enemy.mob) == null) {advanceTurn();return;}
+        // A commanded companion is never played by the AI: its slot waits for its controller's order.
+        if(enemy==null || enemy.companionAdapter != null) {if(enemy==null)advanceTurn();return;}
+        if(!lockOpponent(enemy)) {advanceTurn();return;}
         resolveAiAction(enemy,ai.planTurn(aiContext(enemy)));
+    }
+
+    // ------------------------------------------------------------------
+    // hand-commanded companions
+    // ------------------------------------------------------------------
+
+    /** True when this exact entity is a hand-commanded companion of this encounter. */
+    public boolean isCompanion(LivingEntity actor) {
+        if (actor == null || actor instanceof ServerPlayer || finished) return false;
+        EnemyState state = enemies.get(actor.getUUID());
+        return state != null && state.mob == actor && state.companionAdapter != null;
+    }
+
+    /** The controller of that companion, or null when the actor is not one. */
+    public UUID companionOwner(LivingEntity actor) {
+        if (actor == null) return null;
+        EnemyState state = enemies.get(actor.getUUID());
+        return state != null && state.mob == actor ? state.companionOwner : null;
+    }
+
+    /** Living companions of one controller, in recruitment order. */
+    public List<Mob> companionsOf(UUID ownerId) {
+        if (ownerId == null || finished) return List.of();
+        List<Mob> result = new ArrayList<>();
+        for (EnemyState state : enemies.values()) {
+            if (state.companionAdapter == null || !ownerId.equals(state.companionOwner)) continue;
+            if (state.mob.isAlive() && !state.mob.isRemoved() && state.mob.level() == level) result.add(state.mob);
+        }
+        return List.copyOf(result);
+    }
+
+    public int companionCount() {
+        if (finished) return 0;
+        int count = 0;
+        for (EnemyState state : enemies.values()) {
+            if (state.companionAdapter == null) continue;
+            if (state.mob.isAlive() && !state.mob.isRemoved() && state.mob.level() == level) count++;
+        }
+        return count;
+    }
+
+    /**
+     * Whether this companion's adapter declares one order right now.
+     *
+     * <p>Read live on every intent from the adapter, never from a client payload and never from the snapshot
+     * the client was shown: a companion that offers fewer orders cannot be talked into one it did not declare,
+     * and an adapter that changes its mind takes effect on the next order.</p>
+     */
+    private boolean companionAllows(EnemyState state, CompanionAbility ability) {
+        if (state == null || state.companionAdapter == null || ability == null) return false;
+        int abilities;
+        try {
+            abilities = state.companionAdapter.abilities(state.mob);
+        } catch (RuntimeException failure) {
+            Tactical.LOGGER.error("[Tactical] companion ability query failed for {}; refusing the order",
+                    state.mob.getUUID(), failure);
+            return false;
+        }
+        return (abilities & ability.mask()) != 0;
+    }
+
+    /** One refusal line per undeclared order, so a player learns why instead of seeing nothing happen. */
+    private void rejectUndeclared(EnemyState state, CompanionAbility ability) {
+        Tactical.LOGGER.info("[Tactical] companion {} has no {} order", state.mob.getUUID(), ability);
+        reject(BattleText.translatable(BattleText.KEY_REJECT_COMPANION_ORDER));
+    }
+
+    /** The orders this companion offers, as a {@link CompanionAbility} mask; 0 for anything else. */
+    public int companionAbilities(LivingEntity actor) {
+        EnemyState state = actor == null ? null : enemies.get(actor.getUUID());
+        if (state == null || state.mob != actor || state.companionAdapter == null) return 0;
+        return state.companionAdapter.abilities(state.mob);
+    }
+
+    /** The companion acting right now, if it is this member's: the only actor that member may order. */
+    public LivingEntity commandCompanionOf(ServerPlayer player) {
+        if (player == null || finished) return null;
+        EnemyState state = actingCompanion();
+        return state != null && player.getUUID().equals(state.companionOwner) ? state.mob : null;
+    }
+
+    /**
+     * True while this player may issue an order at all: their own turn, or the turn of the companion that
+     * resolves to them right now. Inventory, growth, blocks and fleeing keep using their own stricter gates.
+     */
+    public boolean isCommandTurn(ServerPlayer player) {
+        if (player == null || finished) return false;
+        EnemyState state = actingCompanion();
+        if (state != null) return player.getUUID().equals(state.companionOwner);
+        return isPlayerTurnNow(player);
+    }
+
+    /** The feet cell of whatever actor this player currently commands (their body, or their companion). */
+    public GridPos commandCell(ServerPlayer player) {
+        LivingEntity companion = commandCompanionOf(player);
+        return companion == null ? playerCell(player) : currentActorCell(companion);
+    }
+
+    /** Reach of the active command; companion ATTACK is melee-only in this version. */
+    public int commandWeaponRange(ServerPlayer player, GridPos target) {
+        return commandCompanionOf(player) != null ? 1 : weaponRangeFor(player, target);
+    }
+
+    /** Preview exactly the native melee that a companion command can execute, not an unimplemented shot. */
+    public boolean commandAttackAllowed(ServerPlayer player, LivingEntity target) {
+        LivingEntity companion = commandCompanionOf(player);
+        if (companion == null) return weaponAttackAllowed(player, target);
+        EnemyState state = enemies.get(companion.getUUID());
+        EnemyState victim = target == null ? null : enemies.get(target.getUUID());
+        if (state == null || state.mob != companion || victim == null || victim.mob != target
+                || victim.side != BattleSide.HOSTILE || !target.isAlive() || target.isRemoved()
+                || target.level() != level || !opposed(companion, target)
+                || companion.getAttribute(Attributes.ATTACK_DAMAGE) == null
+                || !companionAllows(state, CompanionAbility.ATTACK)) return false;
+        return inMeleeRange(state.cell, victim.cell) && hasLineOfSight(state.cell, victim.cell, companion);
+    }
+
+    /** Companion ATTACK is native melee even when an adapter's mob happens to hold a ranged item. */
+    public int commandWeaponKind(ServerPlayer player) {
+        return commandCompanionOf(player) != null ? 0 : weaponKind(player);
+    }
+
+    /** Friendly roster budget: the older automatic friends and the controlled companions share it. */
+    int friendlyCount() {
+        int count = 0;
+        for (EnemyState state : enemies.values()) {
+            if (state.side != BattleSide.PLAYER) continue;
+            if (state.mob.isAlive() && !state.mob.isRemoved() && state.mob.level() == level) count++;
+        }
+        return count;
+    }
+
+    private boolean friendlySlotsFull() {
+        return friendlyCount() >= BattleParticipation.MAX_FRIENDLIES;
+    }
+
+    /**
+     * Admit one hand-commanded companion. Explicit entry only: the older {@link #tryAddFriendly(Mob)} keeps
+     * its automatic behaviour and is never converted into a controlled unit.
+     *
+     * <p>The controller comes from the adapter, and must already be a member of this encounter, so a
+     * companion can never pull its owner into somebody else's battle. Everything the admission commits is
+     * rolled back together when a later step throws.</p>
+     */
+    public boolean tryAddCompanion(Mob mob, CompanionAdapter adapter) {
+        if (mob == null || adapter == null || finished || ending || queue.current() == null || members.isEmpty()
+                || mob.level() != level || !mob.isAlive() || mob.isRemoved()
+                || enemies.containsKey(mob.getUUID()) || departedCompanions.contains(mob.getUUID())
+                || friendlySlotsFull()) return false;
+        if (!adapter.supports(mob)) return false;
+        // Every formal entry point proves the candidate is already inside this encounter's zone: a wolf
+        // standing outside the battlefield is never pulled in merely by being admitted.
+        if (!zone.contains(cellOf(mob))) return false;
+        UUID ownerId = adapter.controllerId(mob);
+        if (ownerId == null || !members.containsKey(ownerId) || !adapter.canJoin(level, mob, ownerId)) return false;
+        if (BattleManager.ownerOf(mob.getUUID()) != null) return false;
+        // The capture happens before anything is mutated, so a throwing adapter cannot leave a half-admitted
+        // unit behind: there is nothing to roll back yet.
+        Object pose;
+        try {
+            pose = adapter.capturePose(mob);
+        } catch (RuntimeException failure) {
+            Tactical.LOGGER.error("[Tactical] companion pose capture failed for {}; nothing was admitted",
+                    mob.getUUID(), failure);
+            return false;
+        }
+        var safe = deploymentPosition(mob,
+                pos -> occupied(new GridPos(pos.getX(), pos.getY(), pos.getZ())),
+                pos -> zone.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ())));
+        if (safe.isEmpty()) return false;
+        Vec3 position = safe.get();
+        GridPos cell = new GridPos(net.minecraft.util.Mth.floor(position.x), net.minecraft.util.Mth.floor(position.y), net.minecraft.util.Mth.floor(position.z));
+        EnemyState state = admit(mob, cell, position, BattleSide.PLAYER);
+        if (state == null) return false;
+        // Recorded after the admission transaction succeeded, so a rolled-back admission leaves no record.
+        state.companionAdapter = adapter;
+        state.companionOwner = ownerId;
+        state.companionPose = pose;
+        // Durable restore record: written here, after the admission transaction committed and before control
+        // changes the entity further, so a save or unload during the fight cannot keep a battle's AI lock.
+        CompanionRestoreMarker.write(mob, state.originalNoAi, state.originalPersistenceRequired,
+                session.sessionId(), ownerId);
+        // END_TURN is part of the contract: without it the companion could never hand its own slot over, and
+        // every further order would be refused by the same mask. Reported once, at admission.
+        if (!companionAllows(state, CompanionAbility.END_TURN)) {
+            Tactical.LOGGER.warn("[Tactical] companion adapter {} declares no end-turn order for {}; that kind "
+                    + "cannot leave its own turn", adapter.id(), mob.getUUID());
+        }
+        try {
+            adapter.beginControl(mob);
+            queue.add(mob.getUUID().toString(), TacticalAttributes.chargeRate(mob, state.initiative));
+            journal.record("battle", BattleText.translatable(BattleText.KEY_BATTLE_COMPANION,
+                    BattleText.name(mob), BattleText.name(nameOf(ownerId.toString()))));
+            sendState();
+            return true;
+        } catch (RuntimeException failure) {
+            Tactical.LOGGER.error("[Tactical] companion admission failed for {}; rolling it back",
+                    mob.getUUID(), failure);
+            queue.remove(mob.getUUID().toString());
+            enemies.remove(mob.getUUID());
+            try {
+                adapter.restorePose(mob, state.companionPose);
+            } catch (RuntimeException ignored) {
+                // The admit rollback below still has to run.
+            }
+            state.companionAdapter = null;
+            state.companionOwner = null;
+            CompanionRestoreMarker.clear(mob);
+            restoreAdmission(state);
+            try {
+                sendState();
+            } catch (RuntimeException ignored) {
+                // A failed correction must not block the rollback that already happened.
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Bring in every eligible companion of the current members that stands inside the zone right now.
+     *
+     * <p>Runs on the encounter's own bounded cadence (battle start, a member joining, and the existing
+     * reinforcement pulse), never on a global scan, and always resolves the candidate against the exact
+     * battle its controller belongs to - which is this one by construction.</p>
+     */
+    private void recruitCompanions() {
+        if (finished || ending || members.isEmpty() || queue.current() == null) return;
+        if (friendlySlotsFull()) return;
+        List<Mob> candidates;
+        try {
+            candidates = level.getEntitiesOfClass(Mob.class, zoneBounds(),
+                    mob -> mob.isAlive() && !mob.isRemoved() && mob.level() == level
+                            && zone.contains(cellOf(mob))
+                            && !enemies.containsKey(mob.getUUID())
+                            && !departedCompanions.contains(mob.getUUID())
+                            && CompanionRegistry.find(mob) != null);
+        } catch (RuntimeException failure) {
+            Tactical.LOGGER.error("[Tactical] companion scan failed; keeping the current roster", failure);
+            return;
+        }
+        if (candidates.isEmpty()) return;
+        candidates.sort(Comparator.comparingDouble((Mob mob) -> mob.distanceToSqr(centerOf(center)))
+                .thenComparing(mob -> mob.getUUID().toString()));
+        for (Mob mob : candidates) {
+            if (friendlySlotsFull()) return;
+            CompanionAdapter adapter = CompanionRegistry.find(mob);
+            if (adapter == null) continue;
+            UUID ownerId = adapter.controllerId(mob);
+            if (ownerId == null || !members.containsKey(ownerId)) continue;
+            if (BattleManager.ownerOf(mob.getUUID()) != null) continue;
+            try {
+                tryAddCompanion(mob, adapter);
+            } catch (RuntimeException failure) {
+                // One broken candidate or adapter never stops the rest of the scan.
+                Tactical.LOGGER.error("[Tactical] companion recruitment failed for {}; continuing",
+                        mob.getUUID(), failure);
+            }
+        }
+    }
+
+    /**
+     * Give a companion back only what control took over: the AI lock, persistence, its target and its pose.
+     *
+     * <p>Deliberately not the admission rollback: a normal exit keeps the real final cell, the real damage,
+     * the equipment and the fall distance of that moment. Position, target and fall distance are given back
+     * only by a transaction that never committed.</p>
+     */
+    private void restoreControlFlags(EnemyState state) {
+        Mob mob = state.mob;
+        BattleEffects.forget(mob);
+        mob.getNavigation().stop();
+        mob.setNoAi(state.originalNoAi);
+        // Vanilla has no "set false"; the accessor restores the exact original flag in both directions.
+        ((com.tactical.neoforge.mixin.BattleMobPersistenceAccess) mob)
+                .tactical$persistenceRequired(state.originalPersistenceRequired);
+        // The control relationship ends with the control, so no stale target is left behind.
+        mob.setTarget(null);
+        mob.setDeltaMovement(Vec3.ZERO);
+        // And the durable record of that control goes with it: a unit that is released now needs no restore
+        // after its next save.
+        CompanionRestoreMarker.clear(mob);
+    }
+
+    /** Give one companion back: its control flags and pose, its slot, its claim. Idempotent. */
+    private void releaseCompanion(EnemyState state, boolean battleEnd) {
+        if (state == null || state.mob == null) return;
+        Mob mob = state.mob;
+        UUID id = mob.getUUID();
+        restoreControlFlags(state);
+        if (state.companionAdapter != null) {
+            try {
+                state.companionAdapter.restorePose(mob, state.companionPose);
+            } catch (RuntimeException failure) {
+                Tactical.LOGGER.error("[Tactical] companion pose restore failed for {}", id, failure);
+            }
+        }
+        state.companionAdapter = null;
+        state.companionOwner = null;
+        state.companionPose = null;
+        state.defending = false;
+        departedCompanions.add(id);
+        terrainFall.end(id);
+        queue.remove(id.toString());
+        BattleEffects.forget(mob);
+        ai.remove(mob);
+        BattleManager.releaseActor(this, id);
+        Tactical.LOGGER.info("[Tactical] companion released {} (battleEnd={})", id, battleEnd);
+    }
+
+    /**
+     * Release every companion of one controller, because that controller can no longer give orders.
+     *
+     * @return true when the released companion was the acting unit, so the caller advances the turn once.
+     */
+    private boolean releaseCompanionsOf(UUID ownerId, boolean battleEnd) {
+        if (ownerId == null) return false;
+        boolean removedActor = false;
+        for (EnemyState state : List.copyOf(enemies.values())) {
+            if (state.companionAdapter == null || !ownerId.equals(state.companionOwner)) continue;
+            if (state.mob.getUUID().toString().equals(queue.current())) removedActor = true;
+            enemies.remove(state.mob.getUUID());
+            releaseCompanion(state, battleEnd);
+        }
+        return removedActor;
+    }
+
+    /** Path cells this companion may walk to right now, using its own AP and its own move price. */
+    public List<GridPos> companionReachable(LivingEntity companion) {
+        EnemyState state = companion == null ? null : enemies.get(companion.getUUID());
+        if (state == null || state.mob != companion || finished) return List.of();
+        int maxSteps = state.moveCost <= 0 ? 0 : state.ap / state.moveCost;
+        if (maxSteps <= 0) return List.of();
+        try {
+            return new ArrayList<>(navigator.reachable(state.cell, maxSteps, this::passable, (from, to) -> true).keySet());
+        } catch (RuntimeException failure) {
+            Tactical.LOGGER.error("[Tactical] companion reachable scan failed for {}", companion.getUUID(), failure);
+            return List.of();
+        }
+    }
+
+    /**
+     * Move one companion along the existing ground grid path.
+     *
+     * <p>This is the AI's own path and its own per-cell animation, without the drop/leap shortcut the player
+     * body offers, and it charges this companion's AP for the real number of cells. Completion keeps the turn
+     * open: the controller decides whether to attack, move again or hand the turn over.</p>
+     */
+    private boolean companionMove(EnemyState companion, GridPos target) {
+        if (!companionAllows(companion, CompanionAbility.MOVE)) {
+            rejectUndeclared(companion, CompanionAbility.MOVE);
+            return false;
+        }
+        if (target == null) return false;
+        if (!zone.contains(target) || occupied(target)
+                || !LevelGridWorld.isStandable(level, target.x(), target.y(), target.z())) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_MOVE_TARGET));
+            return false;
+        }
+        if (companion.moveCost <= 0) {
+            reject(BattleText.translatable(BattleText.KEY_AP_NOT_ENOUGH));
+            return false;
+        }
+        List<GridPos> path;
+        try {
+            path = navigator.path(companion.cell, target, this::passable, 8192, true);
+        } catch (RuntimeException failure) {
+            Tactical.LOGGER.error("[Tactical] companion path failed for {}", companion.mob.getUUID(), failure);
+            reject(BattleText.translatable(BattleText.KEY_REJECT_NO_ROUTE));
+            return false;
+        }
+        if (path.isEmpty()) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_NO_ROUTE));
+            return false;
+        }
+        // Two ints multiplied could overflow into a refund; the price is compared as a long and only then
+        // narrowed, and the path never exceeds what the companion can pay.
+        long total = (long) path.size() * (long) companion.moveCost;
+        if (total > companion.ap || total > Integer.MAX_VALUE) {
+            reject(BattleText.translatable(BattleText.KEY_AP_NOT_ENOUGH));
+            return false;
+        }
+        int cost = (int) total;
+        companion.ap -= cost;
+        actionCount++;
+        enemyDiveAttackIndex = -1;
+        enemyDiveAttacked = false;
+        enemyDiveReservedCost = 0;
+        enemyPath = List.copyOf(path);
+        enemyPathIndex = 0;
+        enemyStepping = false;
+        enemyMoving = true;
+        journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_WALK,
+                BattleText.name(companion.mob),
+                BattleText.literal(companion.cell.toString()),
+                BattleText.literal(path.get(path.size() - 1).toString()), cost));
+        sendState();
+        return true;
+    }
+
+    /** Attack one explicitly chosen legal hostile participant with the companion's own native attack. */
+    private void companionAttack(EnemyState companion, UUID targetId) {
+        if (!companionAllows(companion, CompanionAbility.ATTACK)) {
+            rejectUndeclared(companion, CompanionAbility.ATTACK);
+            return;
+        }
+        if (finished || rangedBusy()) return;
+        EnemyState target = targetId == null ? null : enemies.get(targetId);
+        if (target == null || target == companion || target.side == BattleSide.PLAYER
+                || !target.mob.isAlive() || target.mob.isRemoved()
+                || !opposed(companion.mob, target.mob)) return;
+        if (!inMeleeRange(companion.cell, target.cell)) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_MELEE_RANGE));
+            return;
+        }
+        int cost = mobMeleeCost(companion);
+        if (companion.ap < cost) {
+            reject(BattleText.translatable(BattleText.KEY_AP_NOT_ENOUGH));
+            return;
+        }
+        if (!hasLineOfSight(companion.cell, target.cell, companion.mob)) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_BLOCKED));
+            return;
+        }
+        // The single melee exit below already records the blow and swings the arm, so nothing is
+        // written or swung twice here; only the order's own cost and bookkeeping follow it.
+        faceDirection(companion.mob, target.cell);
+        if (!performMelee(companion, target.mob)) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_MELEE_NO_EFFECT));
+            return;
+        }
+        companion.ap -= cost;
+        companion.paidActions++;
+        actionCount++;
+        removeDeadEnemies();
+        if (!finished) sendState();
+    }
+
+    /** The shared guard: 25 AP, one of four facings, then the turn goes over. */
+    private void companionDefend(EnemyState companion, int yaw) {
+        if (!companionAllows(companion, CompanionAbility.DEFEND)) {
+            rejectUndeclared(companion, CompanionAbility.DEFEND);
+            return;
+        }
+        if (companion.ap < DEFEND_COST) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_DEFEND_AP, DEFEND_COST));
+            sendState();
+            return;
+        }
+        if (yaw != 0 && yaw != 90 && yaw != 180 && yaw != 270) {
+            reject(BattleText.translatable(BattleText.KEY_REJECT_DEFEND_FACING));
+            return;
+        }
+        setActorFacing(companion.mob, yaw);
+        companion.ap -= DEFEND_COST;
+        companion.defending = true;
+        actionCount++;
+        journal.record("block", BattleText.translatable(BattleText.KEY_BLOCK,
+                BattleText.translatable(BattleText.KEY_BLOCK_STANCE),
+                DEFEND_COST, BattleText.literal(Integer.toString(yaw))));
+        advanceTurn();
+    }
+
+    /** Hand the companion's turn over, optionally after facing a chosen direction. Costs nothing. */
+    private void companionEndTurn(EnemyState companion, Integer yaw) {
+        if (!companionAllows(companion, CompanionAbility.END_TURN)) {
+            // The order set is a rule, so an undeclared end-turn is refused like any other order and the turn
+            // does not move. Declaring it is part of the adapter contract, which the admission warns about.
+            rejectUndeclared(companion, CompanionAbility.END_TURN);
+            return;
+        }
+        if (yaw != null) setActorFacing(companion.mob, yaw);
+        advanceTurn();
     }
 
     // ------------------------------------------------------------------
@@ -2228,7 +4551,7 @@ public final class ServerBattle {
 
     private void beginTurn(String actorId) {
         if (actorId == null) {
-            finish("empty turn queue");
+            finish(BattleText.endReason(BattleText.End.EMPTY_QUEUE));
             return;
         }
         // Every authoritative turn start invalidates all intents from the previous turn.
@@ -2245,13 +4568,13 @@ public final class ServerBattle {
         PlayerMember member = members.get(id);
         if (member != null) {
             if (!member.entity.isAlive() || member.entity.isRemoved() || member.entity.level() != level) {
-                removeMember(member, "player defeated");
+                removeMember(member, BattleText.exitReason(BattleText.Exit.DEFEATED));
                 return;
             }
             phase = BattlePhase.PLAYER_TURN;
             TacticalSkills.onTurnStart(this, member.entity);
             BattleEffects.onTurnStart(member.entity);
-            if(!member.entity.isAlive()) { removeMember(member, "player defeated"); return; }
+            if(!member.entity.isAlive()) { removeMember(member, BattleText.exitReason(BattleText.Exit.DEFEATED)); return; }
             PlayerParticipant state = member.state;
             state.maxAp(TacticalAttributes.maxAp(member.entity));
             state.moveCost(ApCalculator.moveCost(attribute(member.entity,Attributes.MOVEMENT_SPEED)));
@@ -2267,8 +4590,14 @@ public final class ServerBattle {
                 advanceTurn();
                 return;
             }
-            phase = BattlePhase.ENEMY_TURN;
+            boolean companion = enemy.companionAdapter != null;
+            phase = companion ? BattlePhase.COMPANION_TURN : BattlePhase.ENEMY_TURN;
+            // A new own turn starts with no target lock and no replan allowance from the previous turn.
+            enemy.lockedTarget = null;
+            enemy.targetReplans = 0;
             if (enemy.mob.isAlive() && !enemy.mob.isRemoved() && enemy.mob.level() == level) {
+                // One own turn really began: this is the only thing that advances the witch drink cooldown.
+                enemy.ownTurns++;
                 TacticalSkills.onTurnStart(this, enemy.mob);
                 BattleEffects.onTurnStart(enemy.mob);
                 if(!enemy.mob.isAlive()) {removeDeadEnemies();return;}
@@ -2278,21 +4607,36 @@ public final class ServerBattle {
                 enemy.hasTakenTurn=true;
                 enemy.paidActions=0;
                 enemy.skillUsed=false;
+                // A guard lasts until this actor's own next turn begins, for every actor that can raise one.
+                enemy.defending=false;
             }
-            aiDelay = AI_TURN_DELAY;
+            aiDelay = companion ? 0 : AI_TURN_DELAY;
             enemyMoving = false;
             enemyStepping = false;
             enemyPath = List.of();
         }
-        String name=nameOf(actorId);
-        journal.record("turn", name+" 的回合");
+        // The turn row names the actor as structure, so a vanilla mob keeps its registry key here too.
+        journal.record("turn", BattleText.translatable(BattleText.KEY_TURN, nameComponent(actorId)));
         sendState();
         net.neoforged.neoforge.common.NeoForge.EVENT_BUS.post(
                 new com.tactical.neoforge.skill.SkillStateChangedEvent(this, true));
     }
 
+    /**
+     * Advance the turn queue, unless units are still in the air.
+     *
+     * <p>A forced fall is a barrier for turn flow, not only for commands: nobody may start a new turn and
+     * collect its recovery while a combatant is mid-fall. A death or an exit that happens during the fall
+     * still takes effect immediately - the member is removed - but the new turn waits until the last fall
+     * has settled, which is what keeps the queue and the resources in one order.</p>
+     */
     private void advanceTurn() {
         if (finished) return;
+        if (terrainFall.busy()) {
+            pendingTurnAdvance = true;
+            return;
+        }
+        pendingTurnAdvance = false;
         refreshTacticalAttributes();
         String next = queue.advance();
         beginTurn(next);
@@ -2307,6 +4651,8 @@ public final class ServerBattle {
         if(--aggroPulse>0)return;
         aggroPulse=10;
         recruitNearbyAggro();
+        // The same bounded cadence picks up a companion that walked into the zone or was tamed mid-battle.
+        recruitCompanions();
     }
 
     private void recruitNearbyAggro() {
@@ -2343,15 +4689,26 @@ public final class ServerBattle {
             Map.Entry<UUID, EnemyState> entry = iterator.next();
             if (entry.getValue().mob.isDeadOrDying() || !entry.getValue().mob.isAlive() || entry.getValue().mob.isRemoved() || entry.getValue().mob.level() != level) {
                 if (current != null && current.equals(entry.getKey().toString())) removedCurrent = true;
-                queue.remove(entry.getKey().toString());
-                BattleEffects.forget(entry.getValue().mob);
-                ai.remove(entry.getValue().mob);
-                // A departed unit gives up its ownership claim, but only this encounter's: another
-                // encounter's identical UUID or a same-UUID respawn must keep its own routing.
-                BattleManager.releaseActor(this, entry.getKey());
-                entry.getValue().mob.setNoAi(entry.getValue().originalNoAi);
-                entry.getValue().mob.setTarget(null);
+                EnemyState departed = entry.getValue();
                 iterator.remove();
+                if (departed.companionAdapter != null) {
+                    // Death, removal and an unloaded chunk all end this companion's control. The release path
+                    // is idempotent and gives the unit's own flags back without teleporting or healing it.
+                    releaseCompanion(departed, false);
+                } else {
+                    terrainFall.end(entry.getKey());
+                    queue.remove(entry.getKey().toString());
+                    BattleEffects.forget(departed.mob);
+                    ai.remove(departed.mob);
+                    // A departed unit gives up its ownership claim, but only this encounter's: another
+                    // encounter's identical UUID or a same-UUID respawn must keep its own routing.
+                    BattleManager.releaseActor(this, entry.getKey());
+                    departed.mob.setNoAi(departed.originalNoAi);
+                    departed.mob.setTarget(null);
+                    // Death and removal only drop this mod's transient potion state; a dead unit is given no
+                    // potion back, so leaving a battle never invents an item that vanilla would not drop.
+                    releaseWitchState(departed);
+                }
                 changed = true;
             }
         }
@@ -2359,8 +4716,9 @@ public final class ServerBattle {
         // roster was emptied in this tick. Do not force a player into a second battle.
         if(changed)recruitNearbyAggro();
         if (hostileCount() == 0) {
-            finish("all enemies defeated");
-        } else if (removedCurrent && phase == BattlePhase.ENEMY_TURN && !finished) {
+            finish(BattleText.endReason(BattleText.End.ENEMIES_DEFEATED));
+        } else if (removedCurrent && !finished
+                && (phase == BattlePhase.ENEMY_TURN || phase == BattlePhase.COMPANION_TURN)) {
             advanceTurn();
         } else if (changed && !finished) {
             // Occupancy, queue, HP and reachable overlay change in the same
@@ -2423,7 +4781,7 @@ public final class ServerBattle {
         refreshTacticalAttributes();
         PlayerParticipant state=member.state;int before=state.ap();
         state.ap((int)Math.max(0,Math.min((long)state.maxAp(),(long)before+delta)));
-        journal.record("action","管理员调整 AP："+before+" → "+state.ap());
+        journal.record("action",BattleText.translatable(BattleText.KEY_ADMIN_AP, before, state.ap()));
         sendState();return state.ap();
     }
 
@@ -2463,9 +4821,26 @@ public final class ServerBattle {
 
     private static int quote(int base,int count) { return ApCalculator.paidActionCost(base,count); }
 
-    private int enemyMeleeCost(EnemyState enemy) { return quote(intConfig(TacticalConfig.INSTANCE.meleeApCost,ApCalculator.MELEE_COST),enemy.paidActions); }
+    private int mobMeleeCost(EnemyState enemy) { return quote(intConfig(TacticalConfig.INSTANCE.meleeApCost,ApCalculator.MELEE_COST),enemy.paidActions); }
 
-    private int enemyBowCost(EnemyState enemy) { return quote(intConfig(TacticalConfig.INSTANCE.bowApCost,BattleRules.BOW_COST),enemy.paidActions); }
+    private int mobBowCost(EnemyState enemy) { return quote(intConfig(TacticalConfig.INSTANCE.bowApCost,BattleRules.BOW_COST),enemy.paidActions); }
+
+    private int mobCrossbowCost(EnemyState enemy) { return quote(intConfig(TacticalConfig.INSTANCE.crossbowApCost,BattleRules.CROSSBOW_COST),enemy.paidActions); }
+
+    /**
+     * Quoted price of this actor's next ranged main action, for the weapon it really holds.
+     *
+     * <p>0 means it has no ranged weapon at all, so a shot is never affordable; the actor falls back to its
+     * original melee instead of being given a weapon by entity type.</p>
+     */
+    private int mobRangedCost(EnemyState enemy) {
+        MobRangedLoadout loadout = mobLoadout(enemy.mob);
+        if (loadout == null) return 0;
+        return switch (loadout.weapon()) {
+            case BOW -> mobBowCost(enemy);
+            case CROSSBOW -> mobCrossbowCost(enemy);
+        };
+    }
 
     /** Read-only quotes; previewing an intent never reserves AP or advances the counter. */
     private int currentMeleeCost(PlayerMember member) { return quote(intConfig(TacticalConfig.INSTANCE.meleeApCost,ApCalculator.MELEE_COST),member.state.paidActions()); }
@@ -2473,6 +4848,7 @@ public final class ServerBattle {
     private int currentCrossbowCost(PlayerMember member) { return quote(intConfig(TacticalConfig.INSTANCE.crossbowApCost,BattleRules.CROSSBOW_COST),member.state.paidActions()); }
     private int currentItemCost(PlayerMember member) { return quote(intConfig(TacticalConfig.INSTANCE.itemApCost,ApCalculator.ITEM_COST),member.state.paidActions()); }
     private int currentPlaceCost(PlayerMember member) { return quote(intConfig(TacticalConfig.INSTANCE.placeApCost,ApCalculator.PLACE_COST),member.state.paidActions()); }
+    private int currentBreakCost(PlayerMember member) { return quote(intConfig(TacticalConfig.INSTANCE.breakApCost,ApCalculator.BREAK_COST),member.state.paidActions()); }
 
     public int currentAttackCost(ServerPlayer player) {
         int kind = weaponKind(player);
@@ -2491,12 +4867,14 @@ public final class ServerBattle {
     public int currentCrossbowCost() { PlayerMember m=actingMember(); return m==null?0:currentCrossbowCost(m); }
     public int currentItemCost() { PlayerMember m=actingMember(); return m==null?0:currentItemCost(m); }
     public int currentPlaceCost() { PlayerMember m=actingMember(); return m==null?0:currentPlaceCost(m); }
+    public int currentBreakCost() { PlayerMember m=actingMember(); return m==null?0:currentBreakCost(m); }
     public int currentAttackCost() { PlayerMember m=actingMember(); return m==null?0:currentAttackCost(m.entity); }
     public int successfulPaidActions() { PlayerMember m=actingMember(); return m==null?0:m.state.paidActions(); }
     public int successfulPaidActions(ServerPlayer player) { return paidActions(player); }
     public int quoteAttackCost() { return currentAttackCost(); }
     public int quoteItemCost() { return currentItemCost(); }
     public int quotePlaceCost() { return currentPlaceCost(); }
+    public int quoteBreakCost() { return currentBreakCost(); }
     public int paidActionCount() { return successfulPaidActions(); }
 
     private boolean rangedBusy() {
@@ -2616,20 +4994,29 @@ public final class ServerBattle {
 
     public int weaponRangeFor(GridPos target) { return weaponKind() == 0 ? 1 : weaponRange(playerCell(), target, weaponKind()); }
 
-    /** Empty string means native weapon geometry/ballistics permit this opposing participant. */
-    public String previewWeaponAttack(LivingEntity caster, LivingEntity target) {
+    /**
+     * The native legality of one weapon attack, as display structure.
+     *
+     * <p>Every check below is the same decision as before; only the wording became structure, so a
+     * rejection that reaches a player (through the skill reason chain or the attack-range list) is
+     * resolved on that player's client. An empty component means "permitted".</p>
+     */
+    public net.minecraft.network.chat.Component previewWeaponAttack(LivingEntity caster, LivingEntity target) {
         BattleSide casterSide = sideOf(caster), targetSide = sideOf(target);
         if (casterSide == null || targetSide == null || !caster.isAlive() || !target.isAlive()
-                || caster.isRemoved() || target.isRemoved() || caster.level() != level || target.level() != level) return "目标不在战斗中";
+                || caster.isRemoved() || target.isRemoved() || caster.level() != level || target.level() != level)
+            return refusal(SkillText.KEY_REJECT_NOT_IN_BATTLE);
         // Identity-bearing opposition: never side-only, so a faction policy applies here too.
-        if (!opposed(caster, target)) return "不能攻击友方";
+        if (!opposed(caster, target)) return refusal(SkillText.KEY_REJECT_FRIENDLY_FIRE);
         GridPos from = participantCell(caster), to = participantCell(target);
         if (caster instanceof ServerPlayer player) {
             PlayerMember member = member(player);
-            if (member == null || from == null) return "目标不在战斗中";
+            if (member == null || from == null) return refusal(SkillText.KEY_REJECT_NOT_IN_BATTLE);
             int kind = weaponKind(player);
-            if (kind == 0) return inMeleeRange(from,to) && hasLineOfSight(from,to,caster) ? "" : "目标不在近战范围内或被阻挡";
-            if (Math.hypot(from.x()-to.x(),from.z()-to.z()) > weaponRange(from, to, kind)+.001) return "超出射程";
+            if (kind == 0) return inMeleeRange(from,to) && hasLineOfSight(from,to,caster)
+                    ? allowedAttack() : refusal(SkillText.KEY_REJECT_MELEE_BLOCKED);
+            if (Math.hypot(from.x()-to.x(),from.z()-to.z()) > weaponRange(from, to, kind)+.001)
+                return refusal(SkillText.KEY_REJECT_OUT_OF_RANGE);
             ItemStack weapon = player.getMainHandItem();
             boolean loaded = kind == 2 && CrossbowItem.isCharged(weapon);
             ChargedProjectiles charged = weapon.getOrDefault(DataComponents.CHARGED_PROJECTILES,ChargedProjectiles.EMPTY);
@@ -2637,15 +5024,37 @@ public final class ServerBattle {
             int pierce = kind == 2 ? net.minecraft.world.item.enchantment.EnchantmentHelper.getItemEnchantmentLevel(
                     level.registryAccess().lookupOrThrow(net.minecraft.core.registries.Registries.ENCHANTMENT)
                             .getOrThrow(net.minecraft.world.item.enchantment.Enchantments.PIERCING), weapon) : 0;
-            return BallisticShot.plan(level,player,from,target,kind==2?(rocket?1.6F:3.15F):3F,!rocket,pierce) != null ? "" : "弹道被阻挡";
+            return BallisticShot.plan(level,player,from,target,kind==2?(rocket?1.6F:3.15F):3F,!rocket,pierce) != null
+                    ? allowedAttack() : refusal(SkillText.KEY_REJECT_BALLISTIC_BLOCKED);
         }
         Mob mob = (Mob) caster;
-        if (mob instanceof net.minecraft.world.entity.monster.RangedAttackMob && mob.getMainHandItem().getItem() instanceof BowItem)
-            return Math.hypot(from.x()-to.x(),from.z()-to.z()) <= 16.001
-                    && BallisticShot.plan(level,mob,from,target,1.6F,true,0) != null ? "" : "超出射程或弹道被阻挡";
         EnemyState state = enemies.get(mob.getUUID());
-        return aiContext(state).inMeleeRange(from,to) && hasLineOfSight(from,to,caster) ? "" : "目标不在近战范围内或被阻挡";
+        MobRangedLoadout loadout = mobLoadout(mob);
+        if (loadout != null && state != null) {
+            // Same lock and the same weapon parameters the real shot will use.
+            return canShootFrom(state, target, from) ? allowedAttack()
+                    : refusal(SkillText.KEY_REJECT_OUT_OF_RANGE_OR_BLOCKED);
+        }
+        if (loadout != null) {
+            // Not a participant of this encounter: there is no target lock and no battle cost, so only the
+            // world checks of its own weapon apply.
+            ItemStack held = loadout.stack(mob);
+            return Math.hypot(from.x()-to.x(),from.z()-to.z()) <= 16.001
+                    && BallisticShot.plan(level, mob, from, target, loadout.weapon(),
+                            piercingOf(held, ammoFor(mob, loadout, held))) != null
+                    ? allowedAttack() : refusal(SkillText.KEY_REJECT_OUT_OF_RANGE_OR_BLOCKED);
+        }
+        return aiContext(state).inMeleeRange(from,to) && hasLineOfSight(from,to,caster)
+                ? allowedAttack() : refusal(SkillText.KEY_REJECT_MELEE_BLOCKED);
     }
+
+    /** Whether the native weapon checks permit this attack; never decided by resolved text. */
+    public boolean weaponAttackAllowed(LivingEntity caster, LivingEntity target) {
+        return SkillText.isEmpty(previewWeaponAttack(caster, target));
+    }
+
+    private static net.minecraft.network.chat.Component allowedAttack() {return SkillText.none();}
+    private static net.minecraft.network.chat.Component refusal(String key) {return SkillText.translatable(key);}
 
     private int weaponRange(GridPos from, GridPos target, int kind) {
         int base = kind == 2 ? 24 : 16;
@@ -2708,23 +5117,515 @@ public final class ServerBattle {
         mob.setDeltaMovement(Vec3.ZERO);
     }
 
+    // ------------------------------------------------------------------
+    // forced fall: the block under a unit is gone
+    // ------------------------------------------------------------------
+
+    /**
+     * One encounter's own falling units.
+     *
+     * <p>A member is pinned to its grid cell every tick, so a removed support would otherwise leave it
+     * hovering in the air forever. The fall is its own state, never a paid move: it charges no AP, counts
+     * no successful action and restores nothing. While any unit of this encounter is falling the
+     * encounter is busy, so no new command is accepted and the turn queue does not advance.</p>
+     */
+    private final com.tactical.neoforge.battle.terrain.TerrainFall terrainFall =
+            new com.tactical.neoforge.battle.terrain.TerrainFall();
+
+    /** True while some unit of this encounter is still falling. */
+    public boolean terrainFallActive() { return terrainFall.busy(); }
+
+    /** A turn advance that arrived while a unit was falling; it runs once the last fall settles. */
+    private boolean pendingTurnAdvance;
+
+    /**
+     * Start a fall for every unit of this encounter that has really lost its support.
+     *
+     * <p>Only this encounter's own units are inspected - never the whole world - and a unit that holds
+     * itself up (it flies, swims, climbs, rides or glides) is left alone: its own movement rules already
+     * answer what happens next.</p>
+     */
+    private void beginTerrainFallIfNeeded() {
+        for (PlayerMember member : List.copyOf(members.values())) {
+            if (member.state.moving()) continue;
+            startFallIfUnsupported(member.id(), true, member.state.cell(), member.entity);
+        }
+        for (EnemyState enemy : List.copyOf(enemies.values())) {
+            if (enemyMoving && enemy.mob.getUUID().toString().equals(queue.current())) continue;
+            startFallIfUnsupported(enemy.mob.getUUID(), false, enemy.cell, enemy.mob);
+        }
+    }
+
+    private void startFallIfUnsupported(UUID id, boolean player, GridPos cell, LivingEntity unit) {
+        if (id == null || unit == null || cell == null) return;
+        if (!unit.isAlive() || unit.isRemoved() || unit.level() != level) return;
+        if (terrainFall.unit(id) != null) return;
+        if (!zone.contains(cell)) return;
+        if (holdsItselfUp(unit)) return;
+        if (hasSupportBelow(cell)) return;
+        TerrainFall.Unit falling = terrainFall.begin(id, player, cell);
+        // The landing is a reservation that keeps two falling units apart, and it is recomputed from the
+        // live world for as long as the descent lasts.
+        refreshFallLanding(falling);
+        journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL_BEGIN,
+                BattleText.name(unit), BattleText.literal(cell.toString())));
+        sendState();
+    }
+
+    /** A unit that carries itself - flight, water, a ladder, a glider, a mount - is not affected. */
+    private static boolean holdsItselfUp(LivingEntity unit) {
+        if (unit == null) return true;
+        if (AerialMovement.supports(unit)) return true;
+        if (unit.isPassenger() || unit.isFallFlying()) return true;
+        if (unit.isInWater() || unit.isInLava() || unit.onClimbable()) return true;
+        return unit instanceof ServerPlayer player && player.getAbilities().flying;
+    }
+
+    private boolean hasSupportBelow(GridPos cell) {
+        BlockPos ground = new BlockPos(cell.x(), cell.y() - 1, cell.z());
+        return !level.getBlockState(ground).getCollisionShape(level, ground).isEmpty();
+    }
+
+    private boolean standableCell(GridPos cell) {
+        return standableIgnoring(cell, null);
+    }
+
+    /**
+     * {@link LevelGridWorld#isStandable} with one position treated as already removed.
+     *
+     * <p>The pre-check of a break has to answer "what will be standable once this block is gone" while the
+     * block is still there, and the descent has to answer the same question against the real world. One
+     * implementation for both, so the promise made before the break is the promise the fall keeps.</p>
+     */
+    private boolean standableIgnoring(GridPos cell, BlockPos removed) {
+        return standableIgnoring(cell, removed, null);
+    }
+
+    /**
+     * The same question for an action that removes <em>two</em> blocks at once.
+     *
+     * <p>A door pair is one object, so the fall question has to be asked of the world in which both halves are
+     * already gone. Asking it about one half would let the other half still count as somebody's landing
+     * support, which is exactly what the removal then takes away.</p>
+     */
+    private boolean standableIgnoring(GridPos cell, BlockPos removed, BlockPos alsoRemoved) {
+        if (cell.y() <= level.getMinBuildHeight() || cell.y() >= level.getMaxBuildHeight() - 1) return false;
+        BlockPos feet = new BlockPos(cell.x(), cell.y(), cell.z());
+        BlockPos head = feet.above();
+        if (!collides(feet.below(), removed, alsoRemoved)) return false;
+        if (collides(feet, removed, alsoRemoved)) return false;
+        if (collides(head, removed, alsoRemoved)) return false;
+        return level.getFluidState(feet).isEmpty() && level.getFluidState(head).isEmpty();
+    }
+
+    private boolean collides(BlockPos pos, BlockPos removed) {
+        return collides(pos, removed, null);
+    }
+
+    private boolean collides(BlockPos pos, BlockPos removed, BlockPos alsoRemoved) {
+        if (removed != null && removed.equals(pos)) return false;
+        if (alsoRemoved != null && alsoRemoved.equals(pos)) return false;
+        return !level.getBlockState(pos).getCollisionShape(level, pos).isEmpty();
+    }
+
+    private boolean enterableCell(GridPos cell) {
+        BlockPos feet = new BlockPos(cell.x(), cell.y(), cell.z());
+        BlockPos head = feet.above();
+        return level.getBlockState(feet).getCollisionShape(level, feet).isEmpty()
+                && level.getBlockState(head).getCollisionShape(level, head).isEmpty();
+    }
+
+    private boolean occupiedByOther(GridPos cell, UUID except) {
+        for (PlayerMember member : members.values()) {
+            if (member.id().equals(except)) continue;
+            if (member.state.cell().equals(cell)) return true;
+        }
+        for (EnemyState enemy : enemies.values()) {
+            if (enemy.mob.getUUID().equals(except)) continue;
+            if (enemy.mob.isAlive() && !enemy.mob.isRemoved() && enemy.cell.equals(cell)) return true;
+        }
+        return false;
+    }
+
+    /** The units standing on exactly this block; a grid cell holds one unit, so this is at most one. */
+    private List<UUID> unitsStandingOn(BlockPos broken) {
+        return unitsStandingOn(broken, null);
+    }
+
+    /** The units standing on either block, for an action that removes both of them. */
+    private List<UUID> unitsStandingOn(BlockPos broken, BlockPos alsoBroken) {
+        List<UUID> ids = new ArrayList<>(2);
+        for (BlockPos block : alsoBroken == null ? List.of(broken) : List.of(broken, alsoBroken)) {
+            GridPos above = new GridPos(block.getX(), block.getY() + 1, block.getZ());
+            for (PlayerMember member : members.values()) {
+                if (member.state.cell().equals(above) && !ids.contains(member.id())) ids.add(member.id());
+            }
+            for (EnemyState enemy : enemies.values()) {
+                if (enemy.mob.isAlive() && !enemy.mob.isRemoved() && enemy.cell.equals(above)
+                        && !ids.contains(enemy.mob.getUUID())) {
+                    ids.add(enemy.mob.getUUID());
+                }
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * Before a support goes away: every unit that would lose it must have a legal landing in this zone.
+     *
+     * <p>It refuses instead of acting when a column has no landing at all, ends outside the zone or ends
+     * on a cell another unit already holds - a break may not drop somebody out of the battle, and two
+     * falling units may not arrive in the same cell.</p>
+     */
+    private boolean precheckLosingSupport(BlockPos broken) {
+        return precheckLosingSupport(broken, null);
+    }
+
+    /**
+     * Before one action removes <em>both</em> blocks: every unit that would lose its footing must have a legal
+     * landing in this zone, in the world where both are already gone.
+     *
+     * <p>A door pair is one object here as well: simulating only the upper half disappear would leave the
+     * lower half standing in the simulated world and let it count as a landing spot that this action then
+     * takes away too.</p>
+     */
+    private boolean precheckLosingSupport(BlockPos broken, BlockPos alsoBroken) {
+        for (UUID id : unitsStandingOn(broken, alsoBroken)) {
+            LivingEntity unit = participantEntity(id);
+            if (unit == null || holdsItselfUp(unit)) continue;
+            GridPos from = participantCellOf(id);
+            if (from == null) continue;
+            boolean found = com.tactical.neoforge.battle.terrain.FallPlanner.resolve(from,
+                    cell -> standableIgnoring(cell, broken, alsoBroken), zone::contains,
+                    cell -> occupiedByOther(cell, id) || terrainFall.claimedByOther(cell, id)).isPresent();
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    private LivingEntity participantEntity(UUID id) {
+        PlayerMember member = members.get(id);
+        if (member != null) return member.entity;
+        EnemyState enemy = enemies.get(id);
+        return enemy == null ? null : enemy.mob;
+    }
+
+    private GridPos participantCellOf(UUID id) {
+        PlayerMember member = members.get(id);
+        if (member != null) return member.state.cell();
+        EnemyState enemy = enemies.get(id);
+        return enemy == null ? null : enemy.cell;
+    }
+
+    /** One tick of every fall in flight; true while the encounter must stay busy. */
+    private boolean stepTerrainFall() {
+        if (!terrainFall.busy()) return false;
+        for (TerrainFall.Unit unit : terrainFall.units()) {
+            unit.advance();
+            if (unit.expired()) {
+                abandonTerrainFall(unit);
+                continue;
+            }
+            if (unit.player()) stepFallingPlayer(unit);
+            else stepFallingEnemy(unit);
+        }
+        if (!terrainFall.busy()) {
+            if (pendingTurnAdvance) {
+                // The barrier lifts: a turn advance that was refused while units were in the air runs now,
+                // in the same tick the last one landed, so the queue never stalls on a removed actor.
+                // beginTurn broadcasts the cleared flag itself.
+                pendingTurnAdvance = false;
+                if (!finished) advanceTurn();
+                else sendState();
+                return true;
+            }
+            // The last unit landed: the snapshot carries the busy flag, so one broadcast clears "waiting for
+            // the units to land" for every client in this same tick. The tick then continues normally, which
+            // is what re-pins the landed body at the cell it actually reached.
+            sendState();
+            return false;
+        }
+        return true;
+    }
+
+    private void stepFallingPlayer(TerrainFall.Unit unit) {
+        PlayerMember member = members.get(unit.id());
+        if (member == null) { terrainFall.end(unit.id()); return; }
+        ServerPlayer player = member.entity;
+        if (!player.isAlive() || player.isRemoved() || player.level() != level) { terrainFall.end(unit.id()); return; }
+        if (unit.stepTo() == null) {
+            // Terrain and the roster can both change while a unit is in the air, so the landing is asked
+            // again before every decision instead of trusting the one the pre-check promised.
+            refreshFallLanding(unit);
+            com.tactical.neoforge.battle.terrain.FallPlanner.Step step =
+                    com.tactical.neoforge.battle.terrain.FallPlanner.next(unit.cell(), this::hasSupportBelow,
+                            cell -> enterableForFall(cell, unit.id()));
+            if (step == com.tactical.neoforge.battle.terrain.FallPlanner.Step.LAND) {
+                settlePlayerFall(unit, member);
+                return;
+            }
+            if (step == com.tactical.neoforge.battle.terrain.FallPlanner.Step.STUCK) {
+                // No floor under the unit and the cell below refuses it (a block or another combatant):
+                // waiting is not landing. The deadline keeps running, so a column that stays blocked ends
+                // in the explicit exception path instead of a fake landing that re-pins the body and
+                // restarts the timer.
+                return;
+            }
+            GridPos next = below(unit.cell());
+            if (!zone.contains(next)) { abandonTerrainFall(unit); return; }
+            unit.beginStep(unit.cell(), next, fallStepTicks());
+            // The owning client follows this one-cell descent through the fall's own trajectory packet:
+            // never the paid move's state, which a player who has not moved this turn has not filled in.
+            sendFallMotion(member, unit.stepFrom(), unit.stepTo(), fallStepTicks());
+        }
+        double sliceFrom = fallFraction(unit, unit.progress());
+        double sliceTo = fallFraction(unit, unit.progress() + 1);
+        if (!clearFallSlice(unit, player, sliceFrom, sliceTo)) {
+            // Blocked mid-step: terrain or a combatant entered the segment the body was already moving
+            // through. The body stays at its last verified sample, the client stops interpolating a target
+            // that no longer holds, and the next tick re-plans from the integer cell it still occupies -
+            // the fall keeps its own deadline instead of being restarted.
+            unit.endStep();
+            cancelFallMotion(member);
+            return;
+        }
+        unit.progress(unit.progress() + 1);
+        setPlayerPosition(member, DropClearance.sample(unit.stepFrom(), unit.stepTo(), unit.fraction()));
+        if (unit.fraction() >= 1.0D) {
+            GridPos arrived = unit.stepTo();
+            unit.stepLanded(arrived);
+            member.state.cell(arrived);
+        }
+    }
+
+    private void stepFallingEnemy(TerrainFall.Unit unit) {
+        EnemyState enemy = enemies.get(unit.id());
+        if (enemy == null || !enemy.mob.isAlive() || enemy.mob.isRemoved()) { terrainFall.end(unit.id()); return; }
+        if (unit.stepTo() == null) {
+            refreshFallLanding(unit);
+            com.tactical.neoforge.battle.terrain.FallPlanner.Step step =
+                    com.tactical.neoforge.battle.terrain.FallPlanner.next(unit.cell(), this::hasSupportBelow,
+                            cell -> enterableForFall(cell, unit.id()));
+            if (step == com.tactical.neoforge.battle.terrain.FallPlanner.Step.LAND) {
+                settleEnemyFall(unit, enemy);
+                return;
+            }
+            if (step == com.tactical.neoforge.battle.terrain.FallPlanner.Step.STUCK) return;
+            GridPos next = below(unit.cell());
+            if (!zone.contains(next)) { abandonTerrainFall(unit); return; }
+            unit.beginStep(unit.cell(), next, fallStepTicks());
+        }
+        double sliceFrom = fallFraction(unit, unit.progress());
+        double sliceTo = fallFraction(unit, unit.progress() + 1);
+        if (!clearFallSlice(unit, enemy.mob, sliceFrom, sliceTo)) {
+            // The same sweep the player path runs: a mob may not be pushed through a block or another
+            // unit that entered its segment, and its fall keeps the same deadline while it re-plans.
+            unit.endStep();
+            return;
+        }
+        unit.progress(unit.progress() + 1);
+        Vec3 position = DropClearance.sample(unit.stepFrom(), unit.stepTo(), unit.fraction());
+        enemy.mob.setPos(position.x, position.y, position.z);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        if (unit.fraction() >= 1.0D) {
+            GridPos arrived = unit.stepTo();
+            unit.stepLanded(arrived);
+            enemy.cell = arrived;
+        }
+    }
+
+    private void settlePlayerFall(TerrainFall.Unit unit, PlayerMember member) {
+        GridPos landing = unit.cell();
+        GridPos origin = unit.origin();
+        int cells = unit.cells();
+        terrainFall.end(unit.id());
+        member.state.cell(landing);
+        snapPlayer(member, landing);
+        settleFallDamage(member.entity, landing, cells);
+        journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL,
+                BattleText.name(member.entity), BattleText.literal(origin.toString()),
+                BattleText.literal(landing.toString()), cells));
+        // A landing can kill: the existing death path decides the turn, and no fall state may outlive it.
+        removeDeadEnemies();
+        if (!finished) sendState();
+    }
+
+    private void settleEnemyFall(TerrainFall.Unit unit, EnemyState enemy) {
+        GridPos landing = unit.cell();
+        GridPos origin = unit.origin();
+        int cells = unit.cells();
+        terrainFall.end(unit.id());
+        enemy.cell = landing;
+        moveEntity(enemy.mob, landing);
+        settleFallDamage(enemy.mob, landing, cells);
+        journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL,
+                BattleText.name(enemy.mob), BattleText.literal(origin.toString()),
+                BattleText.literal(landing.toString()), cells));
+        removeDeadEnemies();
+        if (!finished) sendState();
+    }
+
+    /**
+     * Settle a scripted landing through the vanilla chain.
+     *
+     * <p>Nothing here decides a threshold. The block that receives the unit gets its own {@code fallOn} -
+     * where hay, slime, beds and every other landing rule live - and that call reaches
+     * {@code causeFallDamage}, which applies the fall event, the safe-fall-distance and fall-multiplier
+     * attributes, and armour/enchantment reduction inside {@code hurt}. Only what vanilla decides outside
+     * that call is decided here: slow falling and levitation, which in vanilla reset the fall distance
+     * while travelling, and a player's own flight.</p>
+     */
+    private void settleFallDamage(LivingEntity unit, GridPos landing, int cells) {
+        boolean immune = com.tactical.neoforge.battle.terrain.FallPlanner.immuneToFallDamage(
+                unit.hasEffect(net.minecraft.world.effect.MobEffects.SLOW_FALLING),
+                unit.hasEffect(net.minecraft.world.effect.MobEffects.LEVITATION),
+                unit instanceof ServerPlayer player && (player.getAbilities().flying || player.getAbilities().mayfly),
+                unit.isFallFlying());
+        double distance = com.tactical.neoforge.battle.terrain.FallPlanner.settlementDistance(cells, immune);
+        // The descent was scripted, so the vanilla accumulator is not what says how far the unit fell.
+        unit.fallDistance = 0.0F;
+        if (distance <= 0.0D) return;
+        BlockPos ground = new BlockPos(landing.x(), landing.y() - 1, landing.z());
+        BlockState landedOn = level.getBlockState(ground);
+        landedOn.getBlock().fallOn(level, landedOn, ground, unit, (float) distance);
+    }
+
+    /**
+     * A fall that outlived its deadline is an exception, not a landing.
+     *
+     * <p>It is logged, broadcast to the encounter, and the affected unit is taken out of this encounter -
+     * roster, queue and occupancy - so vanilla physics owns its position again. The break that started it
+     * stays paid: nothing is refunded and no item is duplicated.</p>
+     */
+    private void abandonTerrainFall(TerrainFall.Unit unit) {
+        terrainFall.end(unit.id());
+        Tactical.LOGGER.error("[Tactical] forced fall did not settle within {} ticks: {} {} from {} at {} ({} cells); "
+                        + "releasing it to vanilla physics", TerrainFall.TIMEOUT_TICKS,
+                unit.player() ? "player" : "mob", unit.id(), unit.origin(), unit.cell(), unit.cells());
+        Component reason = BattleText.translatable(BattleText.KEY_FALL_ABANDONED);
+        journal.record("reject", reason);
+        if (unit.player()) {
+            PlayerMember member = members.get(unit.id());
+            if (member != null) removeMember(member, reason);
+        } else {
+            EnemyState enemy = enemies.get(unit.id());
+            if (enemy != null) {
+                String id = unit.id().toString();
+                boolean acting = id.equals(queue.current());
+                enemies.remove(unit.id());
+                queue.remove(id);
+                BattleEffects.forget(enemy.mob);
+                ai.remove(enemy.mob);
+                BattleManager.releaseActor(this, unit.id());
+                enemy.mob.setNoAi(enemy.originalNoAi);
+                enemy.mob.setTarget(null);
+                if (acting && !finished) advanceTurn();
+            }
+        }
+        if (!finished) sendState();
+    }
+
+    /**
+     * Re-resolve a fall's landing against the live world and the live roster.
+     *
+     * <p>Only a reservation: it keeps two falling units from choosing one cell, and a landing that has
+     * become impossible is simply dropped rather than remembered.</p>
+     */
+    private void refreshFallLanding(TerrainFall.Unit unit) {
+        unit.landing(com.tactical.neoforge.battle.terrain.FallPlanner
+                .resolve(unit.cell(), this::standableCell, zone::contains,
+                        cell -> occupiedByOther(cell, unit.id()) || terrainFall.claimedByOther(cell, unit.id()))
+                .map(com.tactical.neoforge.battle.terrain.FallPlanner.Landing::cell).orElse(null));
+    }
+
+    /**
+     * Whether a falling body may move into this cell.
+     *
+     * <p>Blocks alone are not enough: another combatant, a member already animating into that cell, and
+     * another fall's reservation all make it unusable, which is what stops a fall from passing through or
+     * stacking onto somebody.</p>
+     */
+    private boolean enterableForFall(GridPos cell, UUID unitId) {
+        return enterableCell(cell) && !reserved(cell) && !terrainFall.claimedByOther(cell, unitId);
+    }
+
+    /**
+     * The forced fall's own trajectory packet.
+     *
+     * <p>It is built from the fall state, never from the paid-move fields: a member that has not moved
+     * this turn has {@code motionTicks == 0}, which {@code PlayerStepPacket} refuses outright, and the fall
+     * is a drop with its own per-cell duration. Start cell, single entered cell and duration all come from
+     * the same numbers the server samples, so the client animates exactly the server's trajectory.</p>
+     */
+    private void sendFallMotion(PlayerMember member, GridPos from, GridPos to, int ticks) {
+        if (member == null || from == null || to == null) return;
+        ServerPlayer player = member.entity;
+        com.tactical.neoforge.network.ServerPackets.sendUncheckedType(player,
+                new PlayerStepPacket(from, List.of(to), Math.max(1, Math.min(200, ticks)), player.getYRot(), true));
+    }
+
+    /**
+     * Sweep this tick's slice of the fall's real trajectory.
+     *
+     * <p>The integer plan is not the whole truth: a block or another combatant can enter the segment a
+     * body is already moving through, and a cell-by-cell plan would keep setting the position straight
+     * through it. This is the same collision sweep - real bounding boxes, living entities excluded except
+     * the mover - that the client's drop animation mirrors, so the checked curve and the drawn curve are
+     * one curve.</p>
+     */
+    private boolean clearFallSlice(TerrainFall.Unit unit, LivingEntity body, double from, double to) {
+        if (unit.stepFrom() == null || unit.stepTo() == null) return true;
+        return DropClearance.clearTrajectorySegment(level, body, unit.stepFrom(), unit.stepTo(), from, to, true);
+    }
+
+    /** How far through the current one-cell descent that tick count is, clamped to the segment. */
+    private static double fallFraction(TerrainFall.Unit unit, int progress) {
+        int motion = Math.max(1, unit.motionTicks());
+        return Math.min(1.0D, progress / (double) motion);
+    }
+
+    /**
+     * Cancel what the owning client is still interpolating for this member.
+     *
+     * <p>Used when the segment it was told to animate stops being legal: the client must not keep flying
+     * on to a target the server has already refused.</p>
+     */
+    private void cancelFallMotion(PlayerMember member) {
+        if (member == null) return;
+        ServerPlayer player = member.entity;
+        GridPos cell = member.state.cell();
+        if (cell == null) return;
+        com.tactical.neoforge.network.ServerPackets.sendUncheckedType(player,
+                new PlayerStepPacket(cell, List.of(), Math.max(1, Math.min(200, stepTicks)), player.getYRot(), false));
+    }
+
+    private static GridPos below(GridPos cell) {
+        return new GridPos(cell.x(), cell.y() - 1, cell.z());
+    }
+
+    /** Two ticks per cell keeps a zone-deep fall inside the deadline while the descent stays visible. */
+    private int fallStepTicks() {
+        return Math.max(2, stepTicks - 1);
+    }
+
     private static double attribute(LivingEntity entity,
                                     net.minecraft.core.Holder<net.minecraft.world.entity.ai.attributes.Attribute> attribute) {
         var instance = entity.getAttribute(attribute);
         return instance == null ? (attribute == Attributes.MOVEMENT_SPEED ? 0.1D : 1.0D) : instance.getValue();
     }
 
-    private void reject(String message) {
+    private void reject(Component message) {
         journal.record("reject",message);
     }
 
-    private void message(String text) { journal.record("info",text); }
+    private void message(Component text) { journal.record("info",text); }
 
     public BattleJournal journal() { return journal; }
     public BattleZone zone() { return zone; }
     public com.tactical.neoforge.network.CreeperTelegraphPacket creeperSnapshot() { return ai.snapshot(); }
     private static GridPos cellOf(Entity entity) { return new GridPos(entity.getBlockX(),entity.getBlockY(),entity.getBlockZ()); }
-    private AABB zoneBounds() {
+    AABB zoneBounds() {
         var b=zone.bounds();return new AABB(b.minX(),b.minY(),b.minZ(),b.maxX()+1,b.maxY()+1,b.maxZ()+1);
     }
 
@@ -2804,9 +5705,9 @@ public final class ServerBattle {
      */
     private BattleStatePacket inactiveState(PlayerMember member) {
         return new BattleStatePacket(false, BattlePhase.ENDED.ordinal(), 1, 0, 0, 0,
-                0, 0, 0, new int[0], "", List.of(), 0, "", 0, 0,
+                0, 0, 0, new int[0], Component.empty(), List.of(), 0, Component.empty(), 0, 0,
                 center.x(), center.y(), center.z(), zoneRadius, false, -1, new int[0], new int[0], 0, false,
-                new int[0], 0, 0, 0, 0, 0, session.sessionId(), 0L, 0L, 0L);
+                new int[0], 0, 0, 0, 0, 0, 0, false, session.sessionId(), 0L, 0L, 0L);
     }
 
     private String nameOf(String id) {
@@ -2820,6 +5721,30 @@ public final class ServerBattle {
         return state == null ? "?" : state.mob.getDisplayName().getString();
     }
 
+    /**
+     * The same actor identity as {@link #nameOf}, but as the structure the client will read.
+     *
+     * <p>A player's profile name is the text somebody chose, so it stays a literal. A mob keeps its native
+     * name component - its registry key when nobody renamed it, its own component (including nested
+     * structure) when somebody did - so nothing is resolved here and a client that never had the entity in
+     * tracking range still shows a readable name.</p>
+     */
+    private Component nameComponent(String id) {
+        if (id == null) {
+            return Component.empty();
+        }
+        UUID uuid;
+        try {
+            uuid = UUID.fromString(id);
+        } catch (IllegalArgumentException invalid) {
+            return Component.empty();
+        }
+        PlayerMember member = members.get(uuid);
+        if (member != null) return BattleText.name(member.name());
+        EnemyState state = enemies.get(uuid);
+        return state == null ? Component.literal("?") : BattleText.entityName(state.mob);
+    }
+
     private int entityIdOf(UUID uuid) {
         PlayerMember member = members.get(uuid);
         if (member != null) return member.entity.getId();
@@ -2828,23 +5753,24 @@ public final class ServerBattle {
     }
 
     /** The parts of a snapshot every member shares; the per-member parts are added per recipient. */
-    private record SharedSnapshot(List<String> order, int[] gauges, int[] turnEntityIds, String actorName,
+    private record SharedSnapshot(List<Component> order, int[] gauges, int[] turnEntityIds, Component actorName,
                                   int actorEntityId, int[] participants, boolean anyMoving,
                                   UUID sessionId, long epoch) {
     }
 
     private SharedSnapshot sharedSnapshot() {
-        List<String> order = new ArrayList<>();
+        List<Component> order = new ArrayList<>();
         int[] gauges = new int[queue.order().size()];
         int[] turnEntityIds = new int[queue.order().size()];
         int gaugeIndex = 0;
         for (String id : queue.order()) {
             UUID uuid = UUID.fromString(id);
-            order.add(nameOf(id));
+            order.add(nameComponent(id));
             turnEntityIds[gaugeIndex] = entityIdOf(uuid);
             gauges[gaugeIndex++] = (int) Math.round(queue.gaugeOf(id) * 100.0D);
         }
-        String actorName = nameOf(queue.current());
+        String actorId = queue.current();
+        Component actorName = actorId == null ? Component.empty() : nameComponent(actorId);
         UUID actorUuid = queue.current() == null ? null : UUID.fromString(queue.current());
         int actorEntityId = actorUuid == null ? -1 : entityIdOf(actorUuid);
 
@@ -2861,7 +5787,8 @@ public final class ServerBattle {
             participants[participantIndex++] = (int) Math.ceil(state.mob.getMaxHealth());
         }
         return new SharedSnapshot(order, gauges, turnEntityIds, actorName, actorEntityId, participants,
-                anyPlayerMoving() || enemyMoving || rangedBusy(), session.sessionId(), session.turnEpoch());
+                anyPlayerMoving() || enemyMoving || rangedBusy() || terrainFall.busy(),
+                session.sessionId(), session.turnEpoch());
     }
 
     private void sendState() {
@@ -2894,8 +5821,13 @@ public final class ServerBattle {
         if (!deliver && !com.tactical.neoforge.network.ServerPackets.isCapturing()) return;
         PlayerParticipant state = member.state;
         member.lastSyncedWeapon = player.getMainHandItem().copy();
-        // Own resources, own reachable set, own equipment and own quote counters.
-        List<GridPos> reachable = reachableCells(player);
+        // The command projection is per recipient: only the controller of the acting companion gets one, and
+        // nobody else is ever told which companion they could order.
+        EnemyState commandState = actingCompanion();
+        boolean commandsCompanion = commandState != null && member.id().equals(commandState.companionOwner);
+        // Own resources, own reachable set, own equipment and own quote counters. While commanding, the one
+        // reachable set on the wire is the companion's - never a second array.
+        List<GridPos> reachable = commandsCompanion ? companionReachable(commandState.mob) : reachableCells(player);
         int[] flattened = new int[reachable.size() * 3];
         int index = 0;
         for (GridPos cell : reachable) {
@@ -2904,8 +5836,8 @@ public final class ServerBattle {
             flattened[index++] = cell.z();
         }
         int kind = weaponKind(player);
-        String weapon = player.getMainHandItem().isEmpty()
-                ? "空手" : player.getMainHandItem().getHoverName().getString();
+        // The held item travels as its own name component; an empty hand is a key, not a frozen word.
+        Component weapon = BattleText.itemName(player.getMainHandItem());
         GridPos ownCell = state.cell();
         BattleStatePacket packet = new BattleStatePacket(
                 true, phase.ordinal(), queue.turnCount(), state.ap(), state.maxAp(), state.moveCost(),
@@ -2915,13 +5847,33 @@ public final class ServerBattle {
                 state.moving() || shared.anyMoving(), shared.actorEntityId(), shared.participants(),
                 shared.gauges(), actionCount, state.defending(), shared.turnEntityIds(),
                 currentAttackCost(player), currentItemCost(member), currentPlaceCost(member),
-                TacticalAttributes.apRecovery(player), state.paidActions(),
-                shared.sessionId(), shared.epoch(),
+                currentBreakCost(member), TacticalAttributes.apRecovery(player), state.paidActions(),
+                terrainFall.busy(), shared.sessionId(), shared.epoch(),
                 // Stamped by ServerPackets for this recipient at delivery time.
-                0L, 0L);
+                0L, 0L,
+                commandsCompanion ? commandProjection(commandState) : BattleStatePacket.Command.NONE);
         // Through the single publication choke point, so this recipient's membership generation is
         // stamped at this very moment and a fixture sees exactly what was attempted.
         com.tactical.neoforge.network.ServerPackets.sendUncheckedType(player, packet);
+    }
+
+    /** The bounded command projection of one companion: its own numbers, never its controller's. */
+    private BattleStatePacket.Command commandProjection(EnemyState state) {
+        Mob mob = state.mob;
+        ItemStack held = mob.getMainHandItem();
+        // All hand-commanded companion attacks are melee in this release; a held bow is not a ranged order.
+        int kind = 0;
+        Component weapon = held.isEmpty()
+                ? BattleText.translatable(BattleText.KEY_NATURAL_WEAPON)
+                : BattleText.itemName(held);
+        int abilities = state.companionAdapter == null ? 0 : state.companionAdapter.abilities(mob);
+        return new BattleStatePacket.Command(true, mob.getUUID(), mob.getId(), BattleText.name(mob),
+                (int) Math.ceil(mob.getHealth()), (int) Math.ceil(mob.getMaxHealth()),
+                state.ap, state.maxAp, state.moveCost, mobMeleeCost(state),
+                TacticalAttributes.apRecovery(mob), state.paidActions, state.defending,
+                enemyMoving && mob.getUUID().toString().equals(queue.current()),
+                kind, kind == 0 ? 1 : weaponRangeForDisplay(kind), weapon, abilities,
+                state.cell.x(), state.cell.y(), state.cell.z());
     }
 
     /**
@@ -2932,7 +5884,7 @@ public final class ServerBattle {
      * Nothing here is allowed to fail the join: a failed publication is corrected by a newer exit
      * generation instead of silently rolling back a membership the server already committed.</p>
      */
-    private void publishActivation(ServerPlayer player, String journalLine) {
+    private void publishActivation(ServerPlayer player, Component journalLine) {
         com.tactical.neoforge.battle.multi.MembershipGenerations.activate(player, sessionId());
         com.tactical.neoforge.battle.AttackRangeService.forget(player);
         // The transition and the member's own full snapshot.
@@ -2963,7 +5915,7 @@ public final class ServerBattle {
     }
 
     /** The parts of an entry that follow the transition: journal history, warnings, skills. */
-    private void publishBootstrap(ServerPlayer player, String journalLine) {
+    private void publishBootstrap(ServerPlayer player, Component journalLine) {
         // The journal is the part that carries the entry itself, so it goes first; what can fail here
         // is the rest, and that is exactly what the bounded retry owes afterwards.
         if (journalLine != null) journal.record("battle", journalLine);
@@ -3035,6 +5987,38 @@ public final class ServerBattle {
         final int initiative;
         final boolean flying;
         Vec3 airOffset;
+        /**
+         * Set only for a hand-commanded companion: the adapter that claimed it and the controller it answers
+         * to right now. Automatic hostiles and the older automatic friendlies keep both fields null, which is
+         * what preserves their untouched AI behaviour.
+         */
+        CompanionAdapter companionAdapter;
+        UUID companionOwner;
+        /** Kind-specific presentation state control changed and has to give back (the wolf's sitting pose). */
+        Object companionPose;
+        /** Guard raised by the shared defend order; cleared at this actor's next own turn. */
+        boolean defending;
+        /**
+         * The opponent this own turn was planned against, plus how many times target loss has already been
+         * replanned inside this same turn. Both reset when the actor's own turn begins.
+         */
+        UUID lockedTarget;
+        int targetReplans;
+        /**
+         * How many own turns this actor has had, counted only at its own turn start.
+         *
+         * <p>The witch drink cooldown is expressed against this number instead of wall-clock ticks, so waiting
+         * in real time, another unit acting or reopening a menu can never make a drink available again.</p>
+         */
+        int ownTurns;
+        /** This witch's own shared drink cooldown; one instance per unit, never shared between witches. */
+        WitchDrinkCooldown drink = new WitchDrinkCooldown(3);
+        /** A drink this witch had already started when the encounter admitted her, still to be paid for. */
+        com.tactical.neoforge.battle.ai.WitchBrew pendingDrink;
+        /** The raw vanilla drink that was frozen at admission, kept to give back if it never gets paid for. */
+        TacticalWitchAccess.WitchDrink witchDrink;
+        /** True once this encounter really settled that carried-over drink, so it is never recreated. */
+        boolean witchDrinkResolved;
 
         EnemyState(Mob mob, GridPos cell, int ap, int maxAp, int moveCost, int initiative, BattleSide side,
                    boolean originalNoAi, boolean originalPersistenceRequired, Vec3 originalPosition,

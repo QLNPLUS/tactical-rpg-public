@@ -11,6 +11,7 @@ import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.client.event.RenderLevelStageEvent;
 import com.tactical.neoforge.Tactical;
+import com.tactical.neoforge.client.ui.screen.TacticalSurface;
 
 /** Hover focus is render-only and cannot change turn, player pose or server ownership. */
 @EventBusSubscriber(modid=Tactical.MOD_ID,value=Dist.CLIENT)
@@ -36,7 +37,7 @@ public final class BattleEntityLocator {
  public static Entity target() {
   var mc=Minecraft.getInstance();
   if(!BattleClientState.active||mc.level==null||mc.player==null||!mc.player.isAlive()
-          ||mc.screen!=null&&!(mc.screen instanceof TacticalScreen)||!BattleClientState.participantHealth.containsKey(hovered)) {clear();return null;}
+          ||mc.screen!=null&&!(mc.screen instanceof TacticalSurface)||!BattleClientState.participantHealth.containsKey(hovered)) {clear();return null;}
   Entity entity=mc.level.getEntity(hovered);
   if(entity==null||!entity.isAlive()||entity.isRemoved()){clear();return null;}
   return entity;

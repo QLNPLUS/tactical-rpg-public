@@ -110,8 +110,8 @@ class ClientSessionRouteTest {
                 com.tactical.neoforge.battle.multi.BattleEligibility.Denial.NOT_A_SAFE_BOUNDARY,
                 "战斗正在结算动作，请稍后再试"));
         assertNull(BattleDiscoveryClientState.joining(), "the confirmed row is no longer pending");
-        assertEquals("战斗正在结算动作，请稍后再试", BattleDiscoveryClientState.lastMessage(),
-                "the refusal reason stays visible");
+        assertEquals("战斗正在结算动作，请稍后再试", BattleDiscoveryClientState.lastMessage().getString(),
+                "the refusal reason stays visible, as the structure the server sent");
         assertTrue(transport.joins.contains(target), "the join intent was sent");
 
         assertEquals(requestsBeforeRefusal + 1, transport.requests,
@@ -144,7 +144,7 @@ class ClientSessionRouteTest {
                 "a result for another row neither completes nor cancels this request");
         assertEquals(2, BattleDiscoveryClientState.entries().size(),
                 "and it does not refresh or clear the list behind the request");
-        assertEquals("", BattleDiscoveryClientState.lastMessage());
+        assertEquals("", BattleDiscoveryClientState.lastMessage().getString());
     }
 
     @Test
@@ -295,7 +295,8 @@ class ClientSessionRouteTest {
         BattleDiscoveryClientState.accept(new JoinBattleResultPacket(target,
                 com.tactical.neoforge.battle.multi.BattleEligibility.Denial.OUTSIDE_ZONE,
                 "只能加入同一维度的战斗"));
-        assertEquals("只能加入同一维度的战斗", BattleDiscoveryClientState.lastMessage());
+        assertEquals("只能加入同一维度的战斗", BattleDiscoveryClientState.lastMessage().getString(),
+                "the reason is kept as structure and only resolved where it is drawn");
         assertTrue(BattleDiscoveryClientState.revision() > start);
     }
 

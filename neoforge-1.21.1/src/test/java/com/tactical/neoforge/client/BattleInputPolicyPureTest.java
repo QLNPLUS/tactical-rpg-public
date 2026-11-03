@@ -38,6 +38,18 @@ public final class BattleInputPolicyPureTest {
             check(BattleInputPolicy.wheel(true, surface, true, false, false) == BattleInputPolicy.Wheel.IGNORE, "UI-origin wheel outside blocked");
             checks += 3;
         }
+        for (BattleInputPolicy.Surface surface : BattleInputPolicy.Surface.values()) {
+            // A visible interface control is the upper layer: it keeps its press on every surface, and
+            // only an open tactical page may deliver it (consuming it here would drop or double it).
+            check(BattleInputPolicy.pressOwner(true, surface)
+                    == (surface == BattleInputPolicy.Surface.TACTICAL
+                    ? BattleInputPolicy.PressOwner.PAGE : BattleInputPolicy.PressOwner.HUD),
+                    "interface press ownership " + surface);
+            // Everywhere else the hotbar and the world keep their order.
+            check(BattleInputPolicy.pressOwner(false, surface) == BattleInputPolicy.PressOwner.LOWER,
+                    "unclaimed press keeps the lower order " + surface);
+            checks += 2;
+        }
         System.out.println("BattleInputPolicyPureTest: " + checks + " checks passed");
     }
     private static void check(boolean condition, String message) {

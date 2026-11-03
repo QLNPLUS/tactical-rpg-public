@@ -11,6 +11,7 @@ import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
+import com.tactical.neoforge.client.ui.screen.TacticalSurface;
 
 /** Only this client's local avatar defines its lifecycle; other players' death is irrelevant. */
 @EventBusSubscriber(modid = Tactical.MOD_ID, value = Dist.CLIENT)
@@ -62,7 +63,7 @@ public final class BattleClientLifecycle {
             BattleHud.close();
             Minecraft minecraft = Minecraft.getInstance();
             // Do not close DeathScreen, pause/chat, or another mod's screen.
-            if (minecraft != null && minecraft.screen instanceof TacticalScreen) minecraft.setScreen(null);
+            if (minecraft != null && minecraft.screen instanceof TacticalSurface) minecraft.setScreen(null);
         }
     };
 
@@ -73,41 +74,52 @@ public final class BattleClientLifecycle {
         environment = replacement == null ? MINECRAFT_ENVIRONMENT : replacement;
     }
 
-    public static void accept(BattleStatePacket packet) {
-        if (packet == null) return;
+    /**
+     * Apply one complete snapshot.
+     *
+     * @return true only when this client really took it (a new membership was shown, or an identical replay
+     *         of the current one was confirmed). A snapshot that was refused, or one that arrived while the
+     *         client could not display it, answers false so a caller never reports an application it did not
+     *         get.
+     */
+    public static boolean accept(BattleStatePacket packet) {
+        if (packet == null) return false;
         if (!packet.active()) {
             // The server's own exit transition: the only thing that may stop showing an encounter.
             BattleMembership.Decision decision = BattleClientState.applyInactive(packet);
-            if (decision == null) return;
+            if (decision == null) return false;
             // Only the transition itself tears the UI down. A repeated replay of the same exit is
             // idempotent, and doing it twice would close a menu or the nearby list the player just
             // opened after leaving.
-            if (decision != BattleMembership.Decision.ACCEPT_TRANSITION) return;
+            if (decision != BattleMembership.Decision.ACCEPT_TRANSITION) return BattleMembership.decided(decision);
             BattleLog.retire(packet.sessionId(), packet.membershipGeneration());
             teardownUiOnly();
-            return;
+            return true;
         }
         if (!environment.ready() || !environment.alive()) {
             // A snapshot this client cannot display still must not survive as state. The membership is
             // not touched: only a server transition ends it, and the next snapshot (or exit) carries one.
             BattleClientState.clear();
             teardownUiOnly();
-            return;
+            return false;
         }
         // Own identity comes from the local avatar, so another player's turn is never treated as ours.
         BattleClientState.selfEntityId = environment.selfEntityId();
         boolean quotesChanged = BattleClientState.quotesChanged(packet);
-        if (BattleClientState.apply(packet)) {
-            owner = Minecraft.getInstance() == null ? null : Minecraft.getInstance().player;
-            level = Minecraft.getInstance() == null ? null : Minecraft.getInstance().level;
-            if (quotesChanged) environment.refreshActionLabels();
-            BattleDiscoveryClientState.clearRows();
-        }
+        if (!BattleClientState.apply(packet)) return false;
+        owner = Minecraft.getInstance() == null ? null : Minecraft.getInstance().player;
+        level = Minecraft.getInstance() == null ? null : Minecraft.getInstance().level;
+        if (quotesChanged) environment.refreshActionLabels();
+        BattleDiscoveryClientState.clearRows();
+        return true;
     }
 
     /** Stop rendering and drop per-encounter caches while the membership record is kept. */
     private static void teardownUiOnly() {
         environment.teardownUi();
+        // A scoped exit drops any partial body, but stays on this connection: keep the settled
+        // publication watermark so replaying the exit cannot allocate and decode it again.
+        BattleStateAssembler.discardPending();
         CreeperTelegraphClientState.clear();
         owner = null;
         level = null;
@@ -131,6 +143,7 @@ public final class BattleClientLifecycle {
      */
     public static void end() {
         BattleClientState.clear();
+        BattleStateAssembler.reset();
         BattleMembership.beginConnection();
         BattleLog.disconnect();
         // Everything UI-shaped lives behind the environment, so the state/lifecycle decisions above are
@@ -139,6 +152,10 @@ public final class BattleClientLifecycle {
         CreeperTelegraphClientState.clear();
         BattleDiscoveryClientState.clear();
         NearbyHint.close();
+        // The character page is per-connection: its cache, its draft and the page itself never survive a
+        // logout, a reconnect or a world change.
+        com.tactical.neoforge.client.progression.CharacterClientState.reset();
+        com.tactical.neoforge.client.ui.character.CharacterScreen.closeForLifecycle();
         owner = null;
         level = null;
     }

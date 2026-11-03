@@ -5,8 +5,17 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.EquipmentSlot;
 import java.util.*;
 
-/** Immutable compiled skill definition. Java builders and JSON resources share this schema. */
-public record SkillDefinition(ResourceLocation id,String name,String description,int maxLevel,Aim aim,
+/**
+ * Immutable compiled skill definition. Java builders and JSON resources share this schema.
+ *
+ * <p>{@code name}/{@code description} are <em>literal</em> text with their original 128/2048 character
+ * contract: a Java integration or a data pack can always supply finished text, and text that merely looks
+ * like a translation key is never looked up. {@code nameKey}/{@code descriptionKey} are the separate,
+ * optional translation identity - only a definition that declares one is translated, and the authored
+ * literal stays its fallback, so an unsupported language still reads the original wording.</p>
+ */
+public record SkillDefinition(ResourceLocation id,String name,String description,String nameKey,String descriptionKey,
+        int maxLevel,Aim aim,
         Set<Relation> targets,Anchor anchor,boolean area,SkillAreas.Compiled region,
         SkillFormula.Compiled range,SkillFormula.Compiled minRange,SkillFormula.Compiled verticalMin,
         SkillFormula.Compiled verticalMax,boolean lineOfSight,boolean apRamp,SkillFormula.Compiled apCost,
@@ -33,11 +42,22 @@ public record SkillDefinition(ResourceLocation id,String name,String description
         Objects.requireNonNull(id);Objects.requireNonNull(name);Objects.requireNonNull(description);
         if(maxLevel<1||maxLevel>1024)throw new IllegalArgumentException("Skill max level must be 1..1024");
         if(name.length()>128||description.length()>2048)throw new IllegalArgumentException("Skill text too long");
+        if(nameKey!=null&&(nameKey.isBlank()||nameKey.length()>256))throw new IllegalArgumentException("Skill name key must be 1..256 characters");
+        if(descriptionKey!=null&&(descriptionKey.isBlank()||descriptionKey.length()>256))throw new IllegalArgumentException("Skill description key must be 1..256 characters");
         targets=Set.copyOf(targets);effects=List.copyOf(effects);conditions=List.copyOf(conditions);
         attributes=Map.copyOf(attributes);enchantments=List.copyOf(enchantments);
         if(targets.isEmpty())throw new IllegalArgumentException("Skill requires allowed target relations");
         if(effects.size()>32||conditions.size()>32)throw new IllegalArgumentException("Skill action list exceeds limit");
     }
+    /**
+     * The name a client displays: the explicit key with the authored literal as fallback, else the literal.
+     *
+     * <p>Never resolved here - the value travels as structure and each client answers in its own
+     * language.</p>
+     */
+    public net.minecraft.network.chat.Component displayName() {return SkillText.definition(nameKey,name);}
+    /** The description a client displays, by the same rule as {@link #displayName()}. */
+    public net.minecraft.network.chat.Component displayDescription() {return SkillText.definition(descriptionKey,description);}
     public static Builder builder(ResourceLocation id) {return new Builder(id);}
     public static SkillDefinition parse(ResourceLocation id,JsonObject json) {return parse(id,json,null);}
     private static SkillDefinition parse(ResourceLocation id,JsonObject j,Action action) {
@@ -71,7 +91,10 @@ public record SkillDefinition(ResourceLocation id,String name,String description
             grants.add(new EnchantmentGrant(ResourceLocation.parse(text(e,"id","")),slots));
         }
         JsonObject point=new JsonObject();point.addProperty("type","circle");point.addProperty("radius",0);
-        return new SkillDefinition(id,text(j,"name",id.toString()),text(j,"description",""),j.has("max_level")?j.get("max_level").getAsInt():1,
+        String nameKey=j.has("name_key")?j.get("name_key").getAsString():null;
+        String descriptionKey=j.has("description_key")?j.get("description_key").getAsString():null;
+        return new SkillDefinition(id,text(j,"name",id.toString()),text(j,"description",""),nameKey,descriptionKey,
+                j.has("max_level")?j.get("max_level").getAsInt():1,
                 Aim.valueOf(text(j,"aim","entity").toUpperCase(Locale.ROOT)),relations,Anchor.valueOf(text(j,"anchor","target").toUpperCase(Locale.ROOT)),
                 bool(j,"area",false),SkillAreas.compile(j.has("shape")?j.get("shape"):point,variables),formula(j,"range","10",variables),
                 formula(j,"min_range","0",variables),formula(j,"vertical_min","-1",variables),formula(j,"vertical_max","1",variables),
@@ -98,6 +121,10 @@ public record SkillDefinition(ResourceLocation id,String name,String description
         public Builder json(JsonObject definition) {json=definition.deepCopy();return this;}
         public Builder name(String name) {json.addProperty("name",name);return this;}
         public Builder description(String description) {json.addProperty("description",description);return this;}
+        /** Explicit translation identity; the authored literal stays the fallback of the key. */
+        public Builder nameKey(String key) {json.addProperty("name_key",key);return this;}
+        /** Explicit translation identity; the authored literal stays the fallback of the key. */
+        public Builder descriptionKey(String key) {json.addProperty("description_key",key);return this;}
         public Builder maxLevel(int level) {json.addProperty("max_level",level);return this;}
         public Builder targets(Relation... allowed) {JsonArray a=new JsonArray();for(var t:allowed)a.add(t.name().toLowerCase(Locale.ROOT));json.add("targets",a);return this;}
         public Builder aim(Aim aim) {json.addProperty("aim",aim.name().toLowerCase(Locale.ROOT));return this;}

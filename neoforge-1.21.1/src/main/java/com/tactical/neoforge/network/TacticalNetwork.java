@@ -10,15 +10,22 @@ import net.neoforged.neoforge.network.registration.PayloadRegistrar;
 /**
  * Packet registration and handlers.
  *
- * <p>Protocol 8: every client intent carries a session/turn stamp and is resolved against
- * the real connection identity. No payload can name the actor, and the nearby-list/join
- * payloads carry only a target session id. An old client that still speaks protocol 7 is
- * refused instead of silently mixing.</p>
+ * <p>Protocol 12: the battle snapshot carries the bounded command projection of the companion this recipient
+ * may order right now, so a client still speaking protocol 11 is refused instead of reading a body whose
+ * last block is missing, and a protocol-12 client never has to guess who is acting. Everything from protocol
+ * 11 stands: breaking a block is its own intent and its own price, the snapshot carries native components and
+ * every action quote, it is published as bounded parts, the use-item intent carries an optional entity
+ * target, every client intent carries a session/turn stamp and is resolved against the real connection
+ * identity, no payload can name the actor, and the nearby-list/join payloads carry only a target session
+ * id.</p>
+ *
+ * <p>The skill channel (protocol 4) and the journal channel (protocol 2) keep their own versions: neither
+ * wire changed here, and bumping them would refuse clients for no reason.</p>
  */
 public final class TacticalNetwork {
 
-    /** Bumped 7 -> 8 for nearby discovery and direct opt-in joining. */
-    public static final String PROTOCOL = "8";
+    /** Bumped 11 -> 12 for the companion command projection in the snapshot. */
+    public static final String PROTOCOL = "12";
 
     private TacticalNetwork() {
     }
@@ -39,11 +46,14 @@ public final class TacticalNetwork {
                         BattleManager.chooseMove(player,packet.stamp(),packet.token(),packet.mode());
                 }));
 
-        registrar.playToClient(BattleStatePacket.TYPE, BattleStatePacket.STREAM_CODEC,
+        // A snapshot has exactly one way onto the wire: bounded parts. The logical payload type is kept as
+        // the model (and as what a fixture captures) but is deliberately not registered, so no unparted
+        // snapshot path exists to be preferred over the parted one.
+        registrar.playToClient(BattleStateFragmentPacket.TYPE, BattleStateFragmentPacket.STREAM_CODEC,
                 (packet, context) -> {
                     Object arrived = context.connection();
                     context.enqueueWork(() -> com.tactical.neoforge.client.ClientPayloadGate.apply(arrived,
-                            () -> com.tactical.neoforge.client.BattleClientLifecycle.accept(packet)));
+                            () -> com.tactical.neoforge.client.BattleStateAssembler.accept(packet)));
                 });
 
         registrar.playToServer(MoveIntentPacket.TYPE, MoveIntentPacket.STREAM_CODEC,
@@ -88,10 +98,17 @@ public final class TacticalNetwork {
                     }
                 }));
 
+        registrar.playToServer(BreakBlockPacket.TYPE, BreakBlockPacket.STREAM_CODEC,
+                (packet, context) -> context.enqueueWork(() -> {
+                    if (context.player() instanceof ServerPlayer player) {
+                        BattleManager.breakBlock(player, packet.stamp(), packet.slot(), packet.pos());
+                    }
+                }));
+
         registrar.playToServer(UseItemPacket.TYPE, UseItemPacket.STREAM_CODEC,
                 (packet, context) -> context.enqueueWork(() -> {
                     if (context.player() instanceof ServerPlayer player) {
-                        BattleManager.useItem(player, packet.stamp(), packet.slot());
+                        BattleManager.useItem(player, packet.stamp(), packet.slot(), packet.target());
                     }
                 }));
 
@@ -154,6 +171,54 @@ public final class TacticalNetwork {
                             () -> com.tactical.neoforge.client.BattleDiscoveryClientState.accept(packet)));
                 });
 
-        Tactical.LOGGER.info("[Tactical] registered {} network payloads at protocol {}", 16, PROTOCOL);
+        // Character growth: every intent names only a request id (and, where it must, the revision the
+        // client already holds). The server resolves the player from the connection and answers with the
+        // authoritative snapshot, so no payload can name another actor, a price or a final attribute.
+        registrar.playToServer(CharacterRequestPacket.TYPE, CharacterRequestPacket.STREAM_CODEC,
+                (packet, context) -> context.enqueueWork(() -> {
+                    if (context.player() instanceof ServerPlayer player) {
+                        com.tactical.neoforge.network.ServerPackets.sendUncheckedType(player,
+                                com.tactical.neoforge.progression.ProgressionService.snapshot(player,
+                                        packet.requestId(), packet.openScreen()));
+                    }
+                }));
+
+        registrar.playToServer(CharacterPreviewPacket.TYPE, CharacterPreviewPacket.STREAM_CODEC,
+                (packet, context) -> context.enqueueWork(() -> {
+                    if (context.player() instanceof ServerPlayer player) {
+                        com.tactical.neoforge.network.ServerPackets.sendUncheckedType(player,
+                                com.tactical.neoforge.progression.ProgressionService.preview(player,
+                                        packet.requestId(), packet.expectedRevision(), packet.increments()));
+                    }
+                }));
+
+        registrar.playToServer(CharacterUpgradePacket.TYPE, CharacterUpgradePacket.STREAM_CODEC,
+                (packet, context) -> context.enqueueWork(() -> {
+                    if (context.player() instanceof ServerPlayer player) {
+                        com.tactical.neoforge.network.ServerPackets.sendUncheckedType(player,
+                                com.tactical.neoforge.progression.ProgressionService.upgrade(player,
+                                        packet.requestId(), packet.expectedRevision()));
+                    }
+                }));
+
+        registrar.playToServer(CharacterAllocatePacket.TYPE, CharacterAllocatePacket.STREAM_CODEC,
+                (packet, context) -> context.enqueueWork(() -> {
+                    if (context.player() instanceof ServerPlayer player) {
+                        com.tactical.neoforge.network.ServerPackets.sendUncheckedType(player,
+                                com.tactical.neoforge.progression.ProgressionService.allocate(player,
+                                        packet.requestId(), packet.expectedRevision(), packet.increments()));
+                    }
+                }));
+
+        // The character snapshot is a client cache, so it goes through the same connection-generation
+        // gate every other S2C payload uses; a payload of a previous connection changes nothing.
+        registrar.playToClient(CharacterStatePacket.TYPE, CharacterStatePacket.STREAM_CODEC,
+                (packet, context) -> {
+                    Object arrived = context.connection();
+                    context.enqueueWork(() -> com.tactical.neoforge.client.ClientPayloadGate.apply(arrived,
+                            () -> com.tactical.neoforge.client.progression.CharacterClientState.accept(packet)));
+                });
+
+        Tactical.LOGGER.info("[Tactical] registered {} network payloads at protocol {}", 24, PROTOCOL);
     }
 }

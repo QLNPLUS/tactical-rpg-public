@@ -154,32 +154,111 @@ def positive_id(value, name):
     return value
 
 
+CHANGELOG_LIMIT = 8000
+
+
+def release_changelog(text, version, limit=CHANGELOG_LIMIT):
+    """Return only this version's release notes, bounded in size.
+
+    CurseForge takes the changelog inline in the upload metadata and answers an
+    oversized payload with HTTP 400, so the full historical file must never be
+    sent. The section for ``version`` is used as-is; a missing section falls back
+    to the whole text, and either way the result is clipped to ``limit``.
+    """
+    marker = f'## {version}'
+    start = text.find(marker)
+    if start < 0:
+        chosen = text.strip()
+    else:
+        rest = text.find('\n## ', start + len(marker))
+        chosen = (text[start:] if rest < 0 else text[start:rest]).strip()
+    if len(chosen) > limit:
+        chosen = chosen[:limit].rstrip() + '\n\n(truncated for upload)'
+    return chosen
+
+
+def release_notes(changelog, version, output=None):
+    """Write this version's release notes - and nothing else - for a release page.
+
+    The GitHub release used to attach the whole CHANGELOG.md, which publishes the
+    complete history of every older version. This reuses ``release_changelog`` so
+    both services receive exactly the same section, and refuses a changelog that
+    has no section for ``version`` instead of silently falling back to the full
+    file. The file is written outside any release bundle.
+    """
+    text = changelog.read_text(encoding='utf-8')
+    if re.search(rf'^##\s+{re.escape(version)}\b', text, re.M) is None:
+        raise ValueError(f'{changelog} has no section for version {version}')
+    notes = release_changelog(text, version)
+    if output is None:
+        print(notes)
+    else:
+        output.write_text(notes + '\n', encoding='utf-8')
+        print(f'Release notes for {version} written to {output}')
+    return notes
+
+
 def cf_config(env):
     project = positive_id(required_env(env, 'CURSEFORGE_PROJECT_ID'), 'CURSEFORGE_PROJECT_ID')
     token = required_env(env, 'CURSEFORGE_API_TOKEN')
     if not re.fullmatch(r'[!-~]+', token):
         raise ValueError('CURSEFORGE_API_TOKEN must contain only visible ASCII characters')
+    # One relation remains: the camera mod that real acceptance runs load. The client UI framework
+    # that used to be a required relation was removed with the native interface, so the upload must
+    # not carry a dependency on it any more.
     relations = []
-    for prefix, relation in [('APRICITYUI', 'requiredDependency'), ('DUNGEONS_PERSPECTIVE', 'optionalDependency')]:
+    for prefix, relation in [('DUNGEONS_PERSPECTIVE', 'optionalDependency')]:
         slug = required_env(env, f'CURSEFORGE_{prefix}_SLUG')
         if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', slug):
             raise ValueError(f'CURSEFORGE_{prefix}_SLUG must be a confirmed CurseForge slug')
         project_id = positive_id(required_env(env, f'CURSEFORGE_{prefix}_PROJECT_ID'), prefix)
         if project_id == project:
             raise ValueError('Dependency project must differ from release project')
-        relations.append({'slug': slug, 'projectID': project_id, 'type': relation})
-    if relations[0]['projectID'] == relations[1]['projectID']:
+        relations.append({'slug': slug, 'projectID': int(project_id), 'type': relation})
+    if len({entry['projectID'] for entry in relations}) != len(relations):
         raise ValueError('Dependency projects must be distinct')
     return project, token, relations
 
 
-def request_json(request, opener=urllib.request.urlopen):
+def error_detail(error, secrets=(), limit=512):
+    """Return CurseForge's own error message, credential-free and bounded.
+
+    The upload API rejects a request with a JSON document carrying ``errorCode``
+    and ``errorMessage``; that message names the offending field (for example
+    ``relations.projects[0].projectID``) and is the only way to diagnose a 400.
+    It contains no credentials, but only that field is admitted: never raw
+    bodies, headers or URLs. Every known secret is redacted as a second guard.
+    """
+    try:
+        raw = error.read(16385) or b''
+    except Exception:
+        return ''
+    if len(raw) > 16384:
+        return ''
+    try:
+        document = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return ''
+    if not isinstance(document, dict):
+        return ''
+    message = document.get('errorMessage') or document.get('message')
+    if not isinstance(message, str):
+        return ''
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, '[redacted]')
+    message = ' '.join(message.split())[:limit]
+    return f' ({message})' if message else ''
+
+
+def request_json(request, opener=urllib.request.urlopen, secrets=()):
     # No redirects: avoid forwarding X-Api-Token or payload to another origin.
     try:
         with opener(request, timeout=120) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
-        raise ValueError(f'CurseForge HTTP {error.code}; inspect project/token configuration (body suppressed)') from None
+        detail = error_detail(error, secrets)
+        raise ValueError(f'CurseForge HTTP {error.code}{detail}; inspect project/token configuration') from None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
         raise ValueError('CurseForge transport/JSON error; response suppressed; no automatic retry') from None
 
@@ -193,72 +272,68 @@ def safe_opener(request, timeout):
     return urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout)
 
 
-LEVEL_TWO = re.compile(r'^##\s+')
-RELEASE_HEADING = re.compile(r'^##\s+\[?(?P<version>[0-9A-Za-z][0-9A-Za-z.+\-]*)\]?(?=$|[\s—–:(-])')
+def game_version_id(entry):
+    value = entry.get('id')
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def release_notes(text, version):
-    """Return only the level-two section for `version` (bracketed or plain heading).
+# CurseForge requires a game version, a loader and at least one environment entry.
+# Each name is only unique inside its own version-type group.
+GAME_VERSION_GROUPS = (
+    ('1.21.1', 'Minecraft'),
+    ('NeoForge', 'Modloader'),
+    ('Client', 'Environment'),
+    ('Server', 'Environment'),
+)
 
-    CurseForge and the GitHub release must receive the current release notes, not the whole
-    history. A missing, duplicated or empty section is an error: uploading the full changelog or an
-    empty body would silently publish the wrong text.
+
+def type_ids(types, prefix):
+    return {game_version_id(item) for item in types if str(item.get('name', '')).startswith(prefix)} - {None}
+
+
+def resolve_game_versions(versions, types):
+    """Resolve the game version, loader and environment ids from CurseForge metadata.
+
+    CurseForge lists the same version name under several version types (the game
+    version, ``Addons``, further categories), so a plain name match is ambiguous
+    and an upload missing the environment group is rejected with "You must select
+    at least one version from the environment group of versions". Every entry is
+    therefore resolved inside its own version-type group and anything ambiguous
+    fails closed instead of guessing an id.
     """
-    lines = text.splitlines()
-    starts = []
-    for index, line in enumerate(lines):
-        match = RELEASE_HEADING.match(line)
-        if match and match.group('version') == version:
-            starts.append(index)
-    if not starts:
-        raise ValueError(f'CHANGELOG.md has no level-two section for version {version}')
-    if len(starts) > 1:
-        raise ValueError(f'CHANGELOG.md has {len(starts)} level-two sections for version {version}')
-    body_start = starts[0] + 1
-    body_end = len(lines)
-    for index in range(body_start, len(lines)):
-        if LEVEL_TWO.match(lines[index]):
-            body_end = index
-            break
-    body = '\n'.join(lines[body_start:body_end]).strip()
-    if not body:
-        raise ValueError(f'CHANGELOG.md section for version {version} is empty')
-    return body + '\n'
+    if not isinstance(versions, list) or not all(isinstance(item, dict) for item in versions):
+        raise ValueError('Unexpected CurseForge game versions response')
+    if not isinstance(types, list) or not all(isinstance(item, dict) for item in types):
+        raise ValueError('Unexpected CurseForge version types response')
+    groups = {}
+    for _, prefix in GAME_VERSION_GROUPS:
+        if prefix not in groups:
+            groups[prefix] = type_ids(types, prefix)
+            if not groups[prefix]:
+                raise ValueError(f'CurseForge reported no {prefix} version type; refusing guessed IDs')
+    ids = []
+    for name, prefix in GAME_VERSION_GROUPS:
+        matching = [game_version_id(item) for item in versions
+                    if item.get('name') == name and item.get('gameVersionTypeID') in groups[prefix]
+                    and game_version_id(item) is not None]
+        if len(matching) != 1:
+            raise ValueError(f'CurseForge version name {name} absent/ambiguous in its version type; refusing guessed IDs')
+        ids.extend(matching)
+    if len(set(ids)) != len(GAME_VERSION_GROUPS):
+        raise ValueError('CurseForge version IDs must be distinct')
+    return ids
 
 
-# Names sent in `gameVersionNames` with every upload: the Minecraft version, the loader and the
-# environment tags. The environment tags are not decoration — every 1.21.1 NeoForge file that the
-# CurseForge web UI produced for this game carries `Client` (and `Server` when the mod is installed
-# on both sides), and the official upload documentation mixes the environment tags into its
-# `gameVersionNames` example too. The v0.23.1 upload sent only the version and the loader and the
-# server answered HTTP 400, so the tags are part of the accepted metadata.
-REQUIRED_VERSION_NAMES = ('1.21.1', 'NeoForge', 'Client', 'Server')
-
-
-def cf_metadata(env, changelog, release_type='beta', opener=safe_opener, report=None):
+def cf_metadata(env, changelog, release_type='beta', opener=safe_opener):
     project, token, relations = cf_config(env)
     if release_type not in ('alpha', 'beta', 'release'):
         raise ValueError('Invalid release type')
-    # Safety pre-check against the catalog: each required name must exist with at least one usable
-    # id. No id is selected from it — uploads send the officially supported `gameVersionNames`
-    # field instead, so a duplicated catalog row (a real CurseForge situation for `1.21.1`) is not
-    # an error and cannot make this code pick the wrong numeric id.
-    versions = request_json(urllib.request.Request(f'{API}/game/versions',
-                            headers={'X-Api-Token': token, 'Accept': 'application/json'}), opener)
-    if not isinstance(versions, list) or not all(isinstance(item, dict) for item in versions):
-        raise ValueError('Unexpected CurseForge game versions response')
-    def usable_ids(name):
-        return [item['id'] for item in versions
-                if item.get('name') == name and type(item.get('id')) is int and item['id'] > 0]
-
-    missing = [name for name in REQUIRED_VERSION_NAMES if not usable_ids(name)]
-    if missing:
-        raise ValueError('CurseForge version names absent from the catalog: ' + ', '.join(missing) +
-                         '; refusing to upload')
-    if report is not None:
-        report.append('upload_game_version_names=' + ','.join(REQUIRED_VERSION_NAMES))
+    headers = {'X-Api-Token': token, 'Accept': 'application/json'}
+    versions = request_json(urllib.request.Request(f'{API}/game/versions', headers=headers), opener, (token,))
+    types = request_json(urllib.request.Request(f'{API}/game/version-types', headers=headers), opener, (token,))
+    ids = resolve_game_versions(versions, types)
     return project, token, {'changelog': changelog, 'changelogType': 'markdown',
-                            'gameVersionNames': list(REQUIRED_VERSION_NAMES), 'releaseType': release_type,
+                            'gameVersions': ids, 'releaseType': release_type,
                             'relations': {'projects': relations}}
 
 
@@ -278,7 +353,7 @@ def cf_upload(bundle, tag, changelog, release_type='beta', root=ROOT, env=None, 
     boundary, body = multipart(metadata, jar)
     response = request_json(urllib.request.Request(f'{API}/projects/{project}/upload-file', data=body,
                             headers={'X-Api-Token': token, 'Content-Type': f'multipart/form-data; boundary={boundary}'},
-                            method='POST'), opener)
+                            method='POST'), opener, (token,))
     if not isinstance(response, dict) or type(response.get('id')) is not int or response['id'] <= 0:
         raise ValueError('CurseForge did not acknowledge a file ID; check dashboard before retrying')
     return response['id']
@@ -286,13 +361,14 @@ def cf_upload(bundle, tag, changelog, release_type='beta', root=ROOT, env=None, 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('validate', 'package', 'verify', 'release-notes',
-                                            'curseforge-preflight', 'curseforge-upload'))
+    parser.add_argument('command', choices=('validate', 'package', 'verify', 'curseforge-preflight',
+                                           'curseforge-upload', 'release-notes'))
     parser.add_argument('--tag')
     parser.add_argument('--java', action='store_true')
     parser.add_argument('--bundle', type=Path, default=ROOT / 'build/release')
     parser.add_argument('--changelog', type=Path, default=ROOT / 'CHANGELOG.md')
-    parser.add_argument('--output', type=Path)
+    parser.add_argument('--version', help='release-notes only: default is the tag version')
+    parser.add_argument('--output', type=Path, help='release-notes only: write here instead of stdout')
     parser.add_argument('--release-type', choices=('alpha', 'beta', 'release'), default='beta')
     args = parser.parse_args()
     if args.command == 'validate':
@@ -308,28 +384,18 @@ def main():
         verify(args.bundle, tag=args.tag)
         print('Release bundle SHA-256, metadata, logo and licenses verified')
     elif args.command == 'release-notes':
-        version, _ = validate(tag=args.tag)
-        notes = release_notes(args.changelog.read_text(encoding='utf-8'), version)
-        if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(notes, encoding='utf-8')
-            print(f'Release notes for {version} written to {args.output}')
-        else:
-            print(notes, end='')
+        version = args.version or (validate(tag=args.tag)[0] if args.tag else properties()['mod_version'])
+        release_notes(args.changelog, version, args.output)
     elif args.command == 'curseforge-preflight':
-        version, _ = validate(tag=args.tag)
-        report = []
-        cf_metadata(os.environ, release_notes(args.changelog.read_text(encoding='utf-8'), version),
-                    args.release_type, report=report)
-        for line in report:
-            print(line)
-        print('CurseForge configuration, current release notes and game version names verified (no upload)')
+        cf_metadata(os.environ, '', args.release_type)
+        print('CurseForge configuration and game versions verified (no upload)')
     elif args.command == 'curseforge-upload':
         if not args.tag:
             raise ValueError('Uploading requires an explicit --tag')
         version, _ = validate(tag=args.tag)
-        notes = release_notes(args.changelog.read_text(encoding='utf-8'), version)
-        file_id = cf_upload(args.bundle, args.tag, notes, args.release_type)
+        file_id = cf_upload(args.bundle, args.tag,
+                            release_changelog(args.changelog.read_text(encoding='utf-8'), version),
+                            args.release_type)
         print(f'CurseForge acknowledged file ID {file_id}; publication remains subject to moderation')
 
 

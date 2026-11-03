@@ -10,7 +10,8 @@ class CursorPickPolicyTest {
     }
 
     @Test void placementAndOrdinaryItemUseRetainOutlineSelection() {
-        for (BattleMode mode : new BattleMode[]{BattleMode.PLACE, BattleMode.USE_ITEM, BattleMode.NONE})
+        for (BattleMode mode : new BattleMode[]{BattleMode.PLACE, BattleMode.BREAK, BattleMode.USE_ITEM,
+                BattleMode.NONE})
             assertFalse(CursorPickPolicy.usesCollider(mode), mode.name());
     }
 }

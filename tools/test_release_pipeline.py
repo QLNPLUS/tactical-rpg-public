@@ -2,6 +2,7 @@
 import io
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -58,7 +59,6 @@ class Fixture(unittest.TestCase):
         self.bundle = self.root / 'bundle'
         self.tag = 'v0.22.2-neoforge-1.21.1'
         self.env = {'CURSEFORGE_PROJECT_ID': '123', 'CURSEFORGE_API_TOKEN': 'mock-not-a-real-token',
-                    'CURSEFORGE_APRICITYUI_SLUG': 'fixture-ui', 'CURSEFORGE_APRICITYUI_PROJECT_ID': '456',
                     'CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG': 'fixture-camera',
                     'CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID': '789'}
 
@@ -78,10 +78,20 @@ class Fixture(unittest.TestCase):
 
     def opener(self, request, timeout):
         self.requests.append(request)
-        data = [{'id': 1, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'},
-                {'id': 3, 'name': 'Client'}, {'id': 4, 'name': 'Server'}]
-        if request.get_method() == 'POST':
+        if request.full_url.endswith('/game/version-types'):
+            # CurseForge splits version names across types: the game version lives
+            # under a "Minecraft <series>" type and the same name repeats elsewhere.
+            data = [{'id': 77784, 'name': 'Minecraft 1.21'}, {'id': 615, 'name': 'Addons'},
+                    {'id': 68441, 'name': 'Modloader'}, {'id': 75208, 'name': 'Environment'}]
+        elif request.get_method() == 'POST':
             data = {'id': 999}
+        else:
+            data = [{'id': 11779, 'name': '1.21.1', 'gameVersionTypeID': 77784},
+                    {'id': 16115, 'name': '1.21.1', 'gameVersionTypeID': 615},
+                    {'id': 12735, 'name': '1.21.1', 'gameVersionTypeID': 1},
+                    {'id': 10150, 'name': 'NeoForge', 'gameVersionTypeID': 68441},
+                    {'id': 9638, 'name': 'Client', 'gameVersionTypeID': 75208},
+                    {'id': 9639, 'name': 'Server', 'gameVersionTypeID': 75208}]
         return io.BytesIO(json.dumps(data).encode())
 
 
@@ -330,9 +340,8 @@ class CurseForgeTests(Fixture):
 
     def test_reject_invalid_project_or_slug(self):
         for key, value in [('CURSEFORGE_PROJECT_ID', '../123'), ('CURSEFORGE_PROJECT_ID', '0'),
-                           ('CURSEFORGE_APRICITYUI_SLUG', 'https://fake'),
-                           ('CURSEFORGE_APRICITYUI_PROJECT_ID', '123'),
-                           ('CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID', '456')]:
+                           ('CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG', 'https://fake'),
+                           ('CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID', '123')]:
             env = dict(self.env, **{key: value})
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 release.cf_config(env)
@@ -344,80 +353,50 @@ class CurseForgeTests(Fixture):
         self.assertNotIn('mock-private', str(caught.exception))
         self.assertEqual(self.requests, [])
 
-    def test_preflight_is_get_only_and_uses_official_names(self):
+    def test_preflight_is_get_only_and_relations_are_explicit(self):
         project, token, metadata = release.cf_metadata(self.env, 'notes', opener=self.opener)
         self.assertEqual(project, '123')
-        # Official field, no numeric ids chosen from the (possibly duplicated) catalog.
-        self.assertEqual(metadata['gameVersionNames'],
-                         ['1.21.1', 'NeoForge', 'Client', 'Server'])
-        self.assertNotIn('gameVersions', metadata)
-        self.assertEqual([p['type'] for p in metadata['relations']['projects']],
-                         ['requiredDependency', 'optionalDependency'])
-        self.assertEqual(len(self.requests), 1)
-        self.assertEqual(self.requests[0].get_method(), 'GET')
-        self.assertNotIn(token, self.requests[0].full_url)
+        self.assertEqual(metadata['gameVersions'], [11779, 10150, 9638, 9639])
+        # The client UI framework is no longer a relation; the optional camera mod is the only one.
+        self.assertEqual([p['type'] for p in metadata['relations']['projects']], ['optionalDependency'])
+        # CurseForge validates this field as an integer even though its docs show a string.
+        self.assertEqual([p['projectID'] for p in metadata['relations']['projects']], [789])
+        self.assertTrue(all(type(p['projectID']) is int for p in metadata['relations']['projects']))
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual([r.get_method() for r in self.requests], ['GET', 'GET'])
+        for request in self.requests:
+            self.assertNotIn(token, request.full_url)
 
-    def test_duplicate_catalog_rows_are_accepted(self):
-        # Real CurseForge catalog: three entries named 1.21.1, one named NeoForge.
-        catalog = [{'id': 11779, 'name': '1.21.1'}, {'id': 12735, 'name': '1.21.1'},
-                   {'id': 16115, 'name': '1.21.1'}, {'id': 10150, 'name': 'NeoForge'},
-                   {'id': 999, 'name': 'Client'}, {'id': 998, 'name': 'Server'}]
-        opener = lambda *args, **kwargs: io.BytesIO(json.dumps(catalog).encode())  # noqa: E731
-        _, _, metadata = release.cf_metadata(self.env, 'notes', opener=opener)
-        self.assertEqual(metadata['gameVersionNames'],
-                         ['1.21.1', 'NeoForge', 'Client', 'Server'])
-        self.assertNotIn('gameVersions', metadata)
-        # Duplicates for NeoForge too: still accepted, still no id chosen.
-        catalog = [{'id': 1, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'}, {'id': 3, 'name': 'NeoForge'},
-                   {'id': 4, 'name': 'Client'}, {'id': 5, 'name': 'Server'}]
-        _, _, metadata = release.cf_metadata(
-            self.env, 'notes', opener=lambda *a, **kw: io.BytesIO(json.dumps(catalog).encode()))
-        self.assertNotIn('gameVersions', metadata)
+    TYPES = [{'id': 77784, 'name': 'Minecraft 1.21'}, {'id': 615, 'name': 'Addons'},
+             {'id': 68441, 'name': 'Modloader'}, {'id': 75208, 'name': 'Environment'}]
+    ENTRIES = [{'id': 11779, 'name': '1.21.1', 'gameVersionTypeID': 77784},
+               {'id': 10150, 'name': 'NeoForge', 'gameVersionTypeID': 68441},
+               {'id': 9638, 'name': 'Client', 'gameVersionTypeID': 75208},
+               {'id': 9639, 'name': 'Server', 'gameVersionTypeID': 75208}]
 
-    def test_version_names_are_matched_exactly(self):
-        for catalog in ([{'id': 1, 'name': '1.21.1'}, {'id': 2, 'name': 'neoforge'}],
-                        [{'id': 1, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge '}],
-                        [{'id': 1, 'name': '1.21.1 '}, {'id': 2, 'name': 'NeoForge'}],
-                        [{'id': 1, 'name': '1.21'}, {'id': 2, 'name': 'NeoForge'}]):
-            with self.subTest(catalog=catalog), self.assertRaises(ValueError):
-                release.cf_metadata(self.env, '', opener=lambda *a, **kw: io.BytesIO(json.dumps(catalog).encode()))
+    def test_same_name_under_another_version_type_is_ignored(self):
+        # 1.21.1 repeats under "Addons"; only the Minecraft 1.21 id may be selected.
+        versions = [{'id': 16115, 'name': '1.21.1', 'gameVersionTypeID': 615}] + self.ENTRIES
+        self.assertEqual(release.resolve_game_versions(versions, self.TYPES), [11779, 10150, 9638, 9639])
 
-    def test_entries_without_usable_positive_id_fail(self):
-        for catalog in ([], [{'id': 1, 'name': '1.21.1'}],
-                        [{'id': '1', 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'}],
-                        [{'id': True, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'}],
-                        [{'id': 0, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'}],
-                        [{'id': -5, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'}],
-                        [{'id': 1, 'name': '1.21.1'}, {'id': 2}],
-                        [{'id': 1, 'name': '1.21.1'}, 'not-an-object', {'id': 2, 'name': 'NeoForge'}],
-                        {'id': 1, 'name': '1.21.1'}):
-            with self.subTest(catalog=catalog), self.assertRaises(ValueError):
-                release.cf_metadata(self.env, '', opener=lambda *a, **kw: io.BytesIO(json.dumps(catalog).encode()))
+    def test_game_loader_and_environment_groups_are_required(self):
+        for missing, marker in [({77784}, 'no Minecraft version type'),
+                                ({68441}, 'no Modloader version type'),
+                                ({75208}, 'no Environment version type')]:
+            types = [t for t in self.TYPES if t['id'] not in missing]
+            with self.subTest(marker=marker), self.assertRaisesRegex(ValueError, marker):
+                release.resolve_game_versions(self.ENTRIES, types)
 
-    def test_missing_environment_tag_fails_closed(self):
-        # The upload metadata carries the environment tags itself (v0.23.1 sent only the version
-        # and the loader and CurseForge answered HTTP 400), so a catalog without them must stop
-        # the release instead of silently publishing a file with an incomplete version list.
-        for absent in ('Client', 'Server'):
-            catalog = [{'id': 1, 'name': '1.21.1'}, {'id': 2, 'name': 'NeoForge'},
-                       {'id': 3, 'name': 'Client'}, {'id': 4, 'name': 'Server'}]
-            catalog = [item for item in catalog if item['name'] != absent]
-            with self.subTest(absent=absent), self.assertRaisesRegex(ValueError, absent):
-                release.cf_metadata(self.env, '', opener=lambda *a, **kw: io.BytesIO(json.dumps(catalog).encode()))
-
-    def test_upload_payload_uses_names_and_keeps_relations(self):
-        self.package()
-        self.requests.clear()
-        file_id = release.cf_upload(self.bundle, self.tag, 'notes', root=self.root,
-                                    env=self.env, opener=self.opener)
-        self.assertEqual(file_id, 999)
-        posts = [request for request in self.requests if request.get_method() == 'POST']
-        self.assertEqual(len(posts), 1)
-        payload = posts[0].data
-        self.assertIn(b'"gameVersionNames": ["1.21.1", "NeoForge", "Client", "Server"]', payload)
-        self.assertNotIn(b'gameVersions', payload)
-        self.assertIn(b'"relations"', payload)
-        self.assertIn(b'requiredDependency', payload)
+    def test_missing_or_ambiguous_versions_fail(self):
+        cases = [[], self.ENTRIES[:3], self.ENTRIES[:2] + [self.ENTRIES[3]],
+                 [self.ENTRIES[0], self.ENTRIES[1], self.ENTRIES[2], self.ENTRIES[2], self.ENTRIES[3]],
+                 [{'id': 11779, 'name': '1.21.1', 'gameVersionTypeID': 77784},
+                  {'id': 11780, 'name': '1.21.1', 'gameVersionTypeID': 77784}] + self.ENTRIES[1:]]
+        for versions in cases:
+            with self.subTest(versions=versions), self.assertRaises(ValueError):
+                release.resolve_game_versions(versions, self.TYPES)
+        with self.assertRaises(ValueError):
+            release.cf_metadata(self.env, '', opener=lambda *a, **kw: io.BytesIO(json.dumps([]).encode()))
 
     def test_invalid_release_type_fails_before_get(self):
         with self.assertRaisesRegex(ValueError, 'release type'):
@@ -429,8 +408,8 @@ class CurseForgeTests(Fixture):
         file_id = release.cf_upload(self.bundle, self.tag, 'notes', root=self.root,
                                     env=self.env, opener=self.opener)
         self.assertEqual(file_id, 999)
-        self.assertEqual([r.get_method() for r in self.requests], ['GET', 'POST'])
-        post = self.requests[1]
+        self.assertEqual([r.get_method() for r in self.requests], ['GET', 'GET', 'POST'])
+        post = self.requests[2]
         self.assertEqual(post.full_url, release.API + '/projects/123/upload-file')
         self.assertIn(b'name="metadata"', post.data)
         self.assertIn(b'name="file"', post.data)
@@ -444,17 +423,33 @@ class CurseForgeTests(Fixture):
             release.cf_upload(self.bundle, self.tag, '', root=self.root, env=self.env, opener=self.opener)
         self.assertEqual(self.requests, [])
 
-    def test_http_error_redacts_body_and_does_not_retry(self):
-        calls = []
+    def test_http_error_admits_only_the_api_message(self):
+        token = self.env['CURSEFORGE_API_TOKEN']
+        body = json.dumps({'errorCode': 1002,
+                           'errorMessage': 'Error in field `metadata`: Invalid type.',
+                           'headerToken': token}).encode()
         def failure(request, **kwargs):
-            calls.append(request)
-            raise urllib.error.HTTPError(request.full_url, 401, self.env['CURSEFORGE_API_TOKEN'], {},
-                                         io.BytesIO(b'private response'))
-        with self.assertRaisesRegex(ValueError, 'HTTP 401') as caught:
+            raise urllib.error.HTTPError(request.full_url, 400, 'Bad Request', {}, io.BytesIO(body))
+        with self.assertRaisesRegex(ValueError, 'HTTP 400') as caught:
             release.cf_metadata(self.env, '', opener=failure)
-        self.assertNotIn(self.env['CURSEFORGE_API_TOKEN'], str(caught.exception))
-        self.assertNotIn('private response', str(caught.exception))
-        self.assertEqual(len(calls), 1)
+        message = str(caught.exception)
+        self.assertIn('Invalid type', message)
+        self.assertNotIn(token, message)
+        self.assertNotIn('headerToken', message)
+
+    def test_error_detail_message_is_redacted_and_bounded(self):
+        token = 'secret-token-value'
+        body = json.dumps({'errorMessage': 'bad ' + token + ' ' + 'y' * 900}).encode()
+        error = urllib.error.HTTPError('https://curseforge.invalid', 400, 'Bad', {}, io.BytesIO(body))
+        detail = release.error_detail(error, (token,))
+        self.assertIn('[redacted]', detail)
+        self.assertNotIn(token, detail)
+        self.assertLessEqual(len(detail), 516)
+
+    def test_error_detail_ignores_non_json_or_oversized_bodies(self):
+        for body in (b'plain html rejection', b'{"errorMessage": 42}', b'x' * 20000, b'[]'):
+            error = urllib.error.HTTPError('https://curseforge.invalid', 400, 'Bad', {}, io.BytesIO(body))
+            self.assertEqual(release.error_detail(error), '')
 
     def test_transport_failure_redacted(self):
         def failure(*args, **kwargs):
@@ -476,73 +471,56 @@ class CurseForgeTests(Fixture):
         self.assertIsNone(release.NoRedirect().redirect_request(None, None, 302, '', {}, 'https://other.test'))
 
 
+class ChangelogTests(unittest.TestCase):
+    def test_only_the_current_version_section_is_sent(self):
+        text = '# log\n\n## 0.23.1 — now\n\nline a\n\n## 0.23.0 — old\n\nline b\n'
+        self.assertEqual(release.release_changelog(text, '0.23.1'), '## 0.23.1 — now\n\nline a')
+
+    def test_oversized_or_missing_section_is_clipped(self):
+        text = 'x' * 9000
+        clipped = release.release_changelog(text, '9.9.9')
+        self.assertTrue(clipped.startswith('x' * 8000))
+        self.assertIn('truncated for upload', clipped)
+        self.assertLess(len(clipped), 8100)
+
+
 class ReleaseNotesTests(unittest.TestCase):
-    TEXT = ('# Updates\n\n## 0.23.1 — fix metadata\nprerequisite warning line\n\n'
-            '### Sub\nkept\n\n## 0.23.0 — older\nold body\n')
-
-    def test_plain_heading_section_only(self):
-        notes = release.release_notes(self.TEXT, '0.23.1')
-        self.assertIn('prerequisite warning line', notes)
-        self.assertIn('### Sub', notes)
-        self.assertNotIn('old body', notes)
-        self.assertNotIn('0.23.0', notes)
-
-    def test_bracketed_heading_with_date(self):
-        text = '## [0.23.1] - 2026-10-28\nbracketed\n## [0.23.0] - 2026-10-27\nold\n'
-        self.assertEqual(release.release_notes(text, '0.23.1'), 'bracketed\n')
-
-    def test_missing_empty_duplicate_and_prefix_collision_fail(self):
-        cases = ['## 0.23.10 — later\nbody\n',            # prefix collision must not match
-                 '## 0.23.1 — only\n## 0.23.0 — older\n',  # empty section
-                 '## 0.23.0 — older\nbody\n',             # missing
-                 '## 0.23.1 — a\nx\n## 0.23.1 — b\ny\n']  # duplicated
-        for text in cases:
-            with self.subTest(text=text[:20]), self.assertRaises(ValueError):
-                release.release_notes(text, '0.23.1')
-
-    def test_hash_three_and_top_level_headings_are_not_sections(self):
-        text = '# 0.23.1 top\nignore\n### 0.23.1\nignore\n## 0.23.1 — real\nbody\n'
-        self.assertEqual(release.release_notes(text, '0.23.1'), 'body\n')
+    def test_writes_only_the_current_section_and_refuses_a_missing_version(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            changelog = root / 'CHANGELOG.md'
+            changelog.write_text('# log\n\n## 0.24.0 — now\n\nline a\n\n## 0.23.1 — old\n\nline b\n',
+                                 encoding='utf-8')
+            output = root / 'notes.md'
+            release.release_notes(changelog, '0.24.0', output)
+            self.assertEqual(output.read_text(encoding='utf-8'), '## 0.24.0 — now\n\nline a\n')
+            missing = root / 'missing.md'
+            with self.assertRaisesRegex(ValueError, 'no section'):
+                release.release_notes(changelog, '9.9.9', missing)
+            self.assertFalse(missing.exists())
+            changelog.write_text('# log\n\n## 0.24.01 — not this release\n\nwrong notes\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'no section'):
+                release.release_notes(changelog, '0.24.0', missing)
+            self.assertFalse(missing.exists())
 
 
-class NotesUploadTests(Fixture):
-    def setUp(self):
-        super().setUp()
-        self.requests = []
+class RepositoryChangelogTests(unittest.TestCase):
+    """The real release notes both services receive must be this version only and English."""
 
-    def test_metadata_carries_only_current_section_and_environment_probe(self):
-        changelog = ('## 0.23.1 — current\nWARNING manual ApricityUI 1.2.8\n## 0.23.0 — old\nhistory\n')
-        report = []
-        _, _, metadata = release.cf_metadata(
-            self.env, release.release_notes(changelog, '0.23.1'), opener=self.opener, report=report)
-        self.assertIn('manual ApricityUI 1.2.8', metadata['changelog'])
-        self.assertNotIn('history', metadata['changelog'])
-        self.assertEqual(metadata['gameVersionNames'],
-                         ['1.21.1', 'NeoForge', 'Client', 'Server'])
-        self.assertIn('upload_game_version_names=1.21.1,NeoForge,Client,Server', report)
-
-
-class BundlePurityTests(Fixture):
-    def test_bundle_stays_exactly_three_files_when_side_files_live_elsewhere(self):
-        self.package()
-        expected = sorted([release.jar_name('0.22.2'), 'SHA256SUMS', 'release-manifest.json'])
-        self.assertEqual(sorted(item.name for item in self.bundle.iterdir()), expected)
-        # The workflow writes the upload intent and the release notes into $RUNNER_TEMP.
-        side = self.root / 'runner-temp'
-        side.mkdir()
-        (side / 'cf-upload-intent.json').write_text('{"tag": "v0.22.2-neoforge-1.21.1"}', encoding='utf-8')
-        (side / 'release-notes.md').write_text('notes\n', encoding='utf-8')
-        release.verify(self.bundle, self.root, self.tag)
-        self.assertEqual(sorted(item.name for item in self.bundle.iterdir()), expected)
-
-    def test_any_extra_file_in_the_bundle_fails_verification(self):
-        self.package()
-        for stray in ('cf-upload-intent.json', 'release-notes.md', 'sources.jar'):
-            with self.subTest(stray=stray):
-                (self.bundle / stray).write_text('{}', encoding='utf-8')
-                with self.assertRaisesRegex(ValueError, 'Unexpected release payload'):
-                    release.verify(self.bundle, self.root, self.tag)
-                (self.bundle / stray).unlink()
+    def test_current_version_section_is_english_and_has_no_history(self):
+        version, _ = release.validate()
+        text = (release.ROOT / 'CHANGELOG.md').read_text(encoding='utf-8')
+        notes = release.release_changelog(text, version)
+        self.assertTrue(notes.startswith(f'## {version}'), notes[:80])
+        self.assertGreater(len(notes), 500)
+        self.assertIsNone(re.search(r'[\u3000-\u303f\u3400-\u9fff\uff00-\uffef]', notes),
+                          'the current release notes must not contain CJK text')
+        self.assertNotIn('## 0.23.1', notes)
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / 'notes.md'
+            self.assertEqual(release.release_notes(release.ROOT / 'CHANGELOG.md', version, output),
+                             notes)
+            self.assertEqual(output.read_text(encoding='utf-8'), notes + '\n')
 
 
 class WorkflowTests(unittest.TestCase):
@@ -552,8 +530,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("tags: ['v*-neoforge-1.21.1']", text)
         self.assertIn(':common:test :neoforge-1.21.1:build', text)
         self.assertIn('tools/check_release.py', text)
-        self.assertIn('tools/apply_journal_theme.py --check', text)
-        import re
+        # The retired AUI theme script no longer exists in tools/; a CI step calling it can only fail.
+        self.assertNotIn('apply_journal_theme', text)
+        self.assertIn('tools/release_pipeline.py release-notes', text)
+        self.assertIn('--notes-file "$RUNNER_TEMP/release-notes.md"', text)
+        self.assertNotIn('--notes-file CHANGELOG.md', text)
         actions = re.findall(r'uses: (\S+)', text)
         self.assertTrue(actions)
         self.assertTrue(all(re.fullmatch(r'actions/[a-z-]+@[a-f0-9]{40}', action) for action in actions))
@@ -562,34 +543,6 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('persist-credentials: false', text)
         self.assertIn('case "$INPUT_TARGET" in both|github) ;; *) exit 1 ;; esac', text)
         self.assertIn('case "$INPUT_RELEASE_TYPE" in alpha|beta|release) ;; *) exit 1 ;; esac', text)
-
-    CF_TARGET_CONDITION = "if: github.event_name != 'workflow_dispatch' || inputs.target == 'both'"
-
-    def test_every_curseforge_step_is_limited_to_cf_targets(self):
-        text = (release.ROOT / '.github/workflows/build-release.yml').read_text(encoding='utf-8')
-        publish = text.split('\n  publish:', 1)[1]
-        steps = ['      - ' + block for block in publish.split('\n      - ')[1:]]
-        curseforge = [step for step in steps
-                      if 'CURSEFORGE_API_TOKEN' in step or 'cf-upload-intent' in step]
-        self.assertEqual(len(curseforge), 5, 'expected preflight, gate, intent record, intent artifact, upload')
-        for step in curseforge:
-            with self.subTest(step=step.splitlines()[0][:60]):
-                self.assertIn(self.CF_TARGET_CONDITION, step)
-        # Both manual targets: `both` publishes to CurseForge, `github` must skip every CF step
-        # (including the duplicate gate), so the condition has to be on all of them.
-        for event, target, expected in (('push', None, True), ('workflow_dispatch', 'both', True),
-                                        ('workflow_dispatch', 'github', False)):
-            with self.subTest(event=event, target=target):
-                runs = not (event == 'workflow_dispatch' and target != 'both')
-                self.assertEqual(runs, expected)
-
-    def test_side_files_stay_out_of_the_verified_bundle(self):
-        text = (release.ROOT / '.github/workflows/build-release.yml').read_text(encoding='utf-8')
-        self.assertNotIn('build/release/cf-upload-intent.json', text)
-        self.assertNotIn('build/release/release-notes.md', text)
-        self.assertIn('${{ runner.temp }}/cf-upload-intent.json', text)
-        self.assertIn('$RUNNER_TEMP/release-notes.md', text)
-        self.assertIn('release-notes --tag "$RELEASE_TAG" --output "$RUNNER_TEMP/release-notes.md"', text)
 
 
 if __name__ == '__main__':

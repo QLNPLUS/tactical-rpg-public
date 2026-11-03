@@ -17,7 +17,7 @@ public final class BattlePlayerLifecycle {
     public static void onLogout(PlayerEvent.PlayerLoggedOutEvent event) {
         // Only this player leaves; everybody else keeps the encounter.
         if (event.getEntity() instanceof ServerPlayer player) {
-            BattleManager.leave(player, "player disconnected");
+            BattleManager.leave(player, BattleText.exitReason(BattleText.Exit.DISCONNECTED));
             // The connection is gone, so its published membership ends here; the generation counter is
             // kept, which is what lets the next connection's transitions stay above it.
             com.tactical.neoforge.battle.multi.MembershipGenerations.forget(player.getUUID());
@@ -32,7 +32,8 @@ public final class BattlePlayerLifecycle {
         // Respawn replaces the ServerPlayer instance. Match UUID only at this explicit boundary;
         // ordinary actions/logout retain exact identity checks to reject stale player objects.
         // Only the stale member record is released; a reconnect never restores membership.
-        BattleManager.releaseReplacedMember(battle, replacement, "player respawned");
+        BattleManager.releaseReplacedMember(battle, replacement,
+                BattleText.exitReason(BattleText.Exit.RESPAWNED));
         syncInactiveUnlessMember(replacement);
     }
 

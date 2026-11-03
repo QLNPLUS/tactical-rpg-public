@@ -37,6 +37,8 @@ import java.util.UUID;
 @EventBusSubscriber(modid = Tactical.MOD_ID)
 public final class CreeperSelfTest {
     private static boolean enabled;
+    /** Rows the AI published as structure; a text row would mean the warning lost its translation. */
+    private static final List<net.minecraft.network.chat.Component> warnings = new ArrayList<>();
     private static int ticks;
     private static int stage;
     private static int preparedAt;
@@ -210,8 +212,23 @@ public final class CreeperSelfTest {
             session.add(powered);
             AiContext first = context(normal);
             AiContext second = context(powered);
+            warnings.clear();
             session.resolveInstant(first, session.planTurn(first));
             session.resolveInstant(second, session.planTurn(second));
+            require(warnings.size() == 2, "both prepared creepers published one warning row each: " + warnings.size());
+            for (int index = 0; index < warnings.size(); index++) {
+                var row = warnings.get(index);
+                require(row.getContents() instanceof net.minecraft.network.chat.contents.TranslatableContents,
+                        "the warning is a key, not a finished sentence");
+                var key = (net.minecraft.network.chat.contents.TranslatableContents) row.getContents();
+                require(BattleText.KEY_AI_CREEPER_PREPARE.equals(key.getKey()),
+                        "the warning carries the prepare key");
+                require(key.getArgs().length == 1
+                                && key.getArgs()[0] instanceof net.minecraft.network.chat.Component name
+                                && name.getContents() instanceof net.minecraft.network.chat.contents.TranslatableContents entityKey
+                                && "entity.minecraft.creeper".equals(entityKey.getKey()),
+                        "the mob's own name component travels as the argument, still unresolved");
+            }
             CreeperTelegraphPacket snapshot = session.snapshot();
             require(snapshot.creepers().size() == 2 && snapshot.creepers().stream().allMatch(CreeperTelegraphPacket.CreeperWarning::preparing),
                     "snapshot contains ALL simultaneously prepared creepers");
@@ -260,6 +277,14 @@ public final class CreeperSelfTest {
             public boolean hasLineOfSight(GridPos from, GridPos target) { return actor.hasLineOfSight(player); }
             public void attackPlayer() { throw new AssertionError("creeper must not melee"); }
             public void log(String message) { Tactical.LOGGER.info("[Tactical] CREEPER fixture: {}", message); }
+            @Override public boolean logLocalized(net.minecraft.network.chat.Component text) {
+                // The production context hands this to the encounter's journal; the fixture records the
+                // structure so the test can prove the warning is still a key plus typed arguments.
+                warnings.add(text);
+                Tactical.LOGGER.info("[Tactical] CREEPER fixture: structured row {}", text.getContents() instanceof
+                        net.minecraft.network.chat.contents.TranslatableContents key ? key.getKey() : "<literal>");
+                return true;
+            }
         };
     }
 

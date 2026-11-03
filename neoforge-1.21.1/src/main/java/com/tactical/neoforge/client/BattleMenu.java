@@ -1,31 +1,27 @@
 package com.tactical.neoforge.client;
 
-import com.sighs.apricityui.init.Document;
-import com.sighs.apricityui.init.Element;
-import com.tactical.neoforge.network.DefendPacket;
-import com.tactical.neoforge.network.EndTurnPacket;
+import com.tactical.neoforge.client.ui.command.BattleMenuScreen;
+import com.tactical.neoforge.network.FleePacket;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.Screen;
 import net.neoforged.neoforge.network.PacketDistributor;
 
 /**
- * Mouse-driven command panel shown automatically at the start of each player
- * turn. It lives on the right edge of the screen so the battlefield stays
- * visible behind it.
+ * Mouse-driven command panel shown automatically at the start of each player's turn. It lives on the
+ * right edge of the screen so the battlefield stays visible behind it.
+ *
+ * <p>The panel itself is native ({@link BattleMenuScreen}); this class keeps the lifecycle the old
+ * AUI page had - when to open, when to close, and which screen it may close - and forwards the eight
+ * actions to their existing entry points.</p>
  */
 public final class BattleMenu {
 
-    public static final String PAGE = "tactical/screens/battle_menu.html";
-
-    private static final java.util.Map<Document, Long> WIRED = new java.util.WeakHashMap<>();
     private static boolean dismissed;
     private static boolean pendingReopen;
     private static int lastAction = -1;
     private static int lastTurn = -1;
     private static int lastWindowWidth = -1;
     private static int lastWindowHeight = -1;
-    private static String renderedWeapon="";
-    private static int renderedKind=-1,renderedRange=-1;
-    private static int renderedAp=-1,renderedAttack=-1,renderedItem=-1,renderedPlace=-1,renderedRecovery=-1,renderedPaid=-1;
 
     private BattleMenu() {
     }
@@ -34,14 +30,14 @@ public final class BattleMenu {
     public static void tick() {
         Minecraft minecraft = Minecraft.getInstance();
         if (!BattleClientState.active) {
-            closeOwnMenu(minecraft);
+            closeOwnScreen(minecraft);
             reset();
             return;
         }
         int width = minecraft.getWindow().getWidth();
         int height = minecraft.getWindow().getHeight();
         if (lastWindowWidth != -1 && (width != lastWindowWidth || height != lastWindowHeight)) {
-            closeOwnMenu(minecraft);
+            closeOwnScreen(minecraft);
             BattleClientState.mode = BattleMode.NONE;
             dismissed = false;
         }
@@ -51,28 +47,17 @@ public final class BattleMenu {
             lastTurn = BattleClientState.round;
             dismissed = false;
         }
-        if (!BattleClientState.isPlayerTurn()) {
-            closeOwnMenu(minecraft);
+        if (!commandTurn()) {
+            closeOwnScreen(minecraft);
             dismissed = false;
             pendingReopen = false;
             lastAction = BattleClientState.actionCount;
             return;
         }
-        if (minecraft.screen instanceof TacticalScreen screen && screen.getLinkedDocument() != null
-                && PAGE.equals(screen.getLinkedDocument().getPath())) {
-            Document document = screen.getLinkedDocument();
-            if (WIRED.getOrDefault(document, -1L) != document.getRefreshGeneration()) {
-                fill(document); wire(document, minecraft);
-            } else if(!renderedWeapon.equals(BattleClientState.weapon)||renderedKind!=BattleClientState.weaponKind||renderedRange!=BattleClientState.weaponRange
-                    ||renderedAp!=BattleClientState.ap||renderedAttack!=BattleClientState.attackCost
-                    ||renderedItem!=BattleClientState.itemCost||renderedPlace!=BattleClientState.placeCost
-                    ||renderedRecovery!=BattleClientState.apRecovery||renderedPaid!=BattleClientState.paidActionCount) {
-                fill(document);
-            }
-            updateVitals(document);
-        }
+        // The native panel reads the client state every frame, so no per-tick refill is needed.
+        if (owns(minecraft.screen)) return;
         if (minecraft.screen != null) return;
-        if (BattleClientState.moving) {
+        if (BattleClientState.commandMoving()) {
             pendingReopen = true;
             return;
         }
@@ -90,25 +75,41 @@ public final class BattleMenu {
     }
 
     /**
-     * True only for the screen this class owns.
+     * True while this client has something to command: its own body's turn, or the turn of the companion the
+     * projection says it controls.
      *
-     * <p>Every AUI page is a {@link TacticalScreen}, so "close the tactical screen" also closes the
-     * nearby list, the journal or any other tactical page the player opened for a reason of their own.
-     * The battle menu may only ever close itself.</p>
+     * <p>Only the command surface reads this. Every privileged path (inventory, growth, blocks, fleeing)
+     * keeps its own strict {@link BattleClientState#isPlayerTurn()} gate, so a companion turn can never
+     * become a player turn.</p>
      */
-    public static boolean owns(Document document) {
-        return document != null && ownsPath(document.getPath());
+    public static boolean commandTurn() {
+        return BattleClientState.isPlayerTurn() || BattleClientState.isCommandingCompanion();
     }
 
-    /** The identity comparison behind {@link #owns}, kept pure so it can be tested headlessly. */
-    public static boolean ownsPath(String path) {
-        return PAGE.equals(path);
+    /**
+     * True only for the screen this class owns.
+     *
+     * <p>Every tactical page keeps the battlefield visible, so "close the tactical screen" would also
+     * close the nearby list, the journal or any other page the player opened for a reason of their
+     * own. The battle menu may only ever close itself.</p>
+     */
+    public static boolean owns(Screen screen) {
+        return screen instanceof com.tactical.neoforge.client.ui.screen.NativeTacticalScreen nativeScreen
+                && ownsId(nativeScreen.screenId());
+    }
+
+    /**
+     * The identity comparison behind {@link #owns}, kept pure so the ownership rule can be tested
+     * headlessly. Only the command panel carries this id; every other tactical screen must survive a
+     * battle tick that decides the menu is no longer wanted.
+     */
+    public static boolean ownsId(String id) {
+        return BattleMenuScreen.SCREEN_ID.equals(id);
     }
 
     /** Close the battle menu if - and only if - it is the screen currently open. */
-    private static void closeOwnMenu(Minecraft minecraft) {
-        if (!(minecraft.screen instanceof TacticalScreen screen)) return;
-        if (!owns(screen.getLinkedDocument())) return;
+    private static void closeOwnScreen(Minecraft minecraft) {
+        if (!owns(minecraft.screen)) return;
         minecraft.setScreen(null);
     }
 
@@ -127,174 +128,85 @@ public final class BattleMenu {
         dismissed = true;
         // Opening the panel always drops any pending world action.
         BattleClientState.mode = BattleMode.NONE;
+        BattleClientState.blockEntry = false;
         BattleClientState.selectedSlot = -1;
-        TacticalScreen screen = new TacticalScreen(PAGE, () -> {
+        minecraft.setScreen(new BattleMenuScreen());
+    }
+
+    /** Escape, the close button, or a cleared popover layer: the panel stays dismissed for this turn. */
+    public static void dismiss() {
+        Minecraft minecraft = Minecraft.getInstance();
+        dismissed = true;
+        BattleClientState.mode = BattleMode.NONE;
+        BattleClientState.blockEntry = false;
+        minecraft.setScreen(null);
+    }
+
+    /**
+     * Runs one of the eight panel actions through the same entry points the AUI page used.
+     *
+     * <p>The AUI page was replaced by the aim/skill/facing screens in the same dispatch, which meant
+     * those screens accepted "a tactical screen is already open". The native panel closes itself
+     * first, exactly like the pre-existing defend and end-turn paths, so each target screen still
+     * sees the screen state it expects.</p>
+     */
+    public static void activate(String action) {
+        Minecraft minecraft = Minecraft.getInstance();
+        // The character page is a view and not an action: it spends nothing, the server is not asked to take a
+        // turn, and it therefore may not be swallowed by the busy gate below. Reading the page is allowed in
+        // any phase, including while every other command is waiting for a forced fall to land.
+        if ("character".equals(action)) {
             BattleClientState.mode = BattleMode.NONE;
-            minecraft.setScreen(null);
-        });
-        screen.setPauseGame(false).setShowDefaultBackground(false);
-        minecraft.setScreen(screen);
-        Document document = screen.getLinkedDocument();
-        if (document == null) {
+            com.tactical.neoforge.client.ui.character.CharacterScreen.open();
             return;
         }
-        fill(document);
-        wire(document, minecraft);
-    }
-
-    private static void fill(Document document) {
-        renderedWeapon=BattleClientState.weapon;renderedKind=BattleClientState.weaponKind;renderedRange=BattleClientState.weaponRange;
-        set(document, "round", Integer.toString(BattleClientState.round));
-        set(document, "actor", BattleClientState.actor.isEmpty() ? "等待" : BattleClientState.actor + " 的回合");
-        set(document, "ap", BattleClientState.ap + " / " + BattleClientState.maxAp);
-        set(document, "weapon", BattleClientState.weaponKind == 0
-                ? BattleClientState.weapon + " · 近战"
-                : BattleClientState.weapon + " · 射程 " + BattleClientState.weaponRange);
-        renderedAp=BattleClientState.ap;renderedAttack=BattleClientState.attackCost;renderedItem=BattleClientState.itemCost;
-        renderedPlace=BattleClientState.placeCost;renderedRecovery=BattleClientState.apRecovery;renderedPaid=BattleClientState.paidActionCount;
-        set(document, "stance", BattleClientState.defending ? "防御中" : "下回合 +"+BattleClientState.apRecovery+" AP");
-        set(document, "attack-cost", BattleClientState.attackCost + " AP");
-        set(document, "attack-desc", "选择射程内的敌人");
-        set(document, "tool-cost", BattleClientState.itemCost + " / " + BattleClientState.placeCost + " AP");
-        set(document, "tool-desc", "使用主手道具 · E 背包");
-        set(document, "skill-cost", "按技能计费");
-        set(document, "defend-cost", "25 AP");
-        set(document, "flee-cost", com.tactical.core.combat.BattleRules.FLEE_COST + " AP");
-        set(document, "recovery", "+" + BattleClientState.apRecovery + " AP");
-        updateVitals(document);
-        set(document,"end-desc","保留剩余 AP");
-        set(document, "status", "操作 "+BattleClientState.paidActionCount+" 次 · 连续涨费");
-        renderGauges(document);
-    }
-
-    /** Resource packets may change without a new AP quote or weapon change. */
-    private static void updateVitals(Document document) {
-        var player = Minecraft.getInstance().player;
-        if (player != null) {
-            int[] health = BattleClientState.participantHealth.get(player.getId());
-            set(document, "hp", health != null
-                    ? Math.max(0, health[0]) + "/" + Math.max(1, health[1])
-                    : SkillClientState.number(player.getHealth()) + "/" + SkillClientState.number(player.getMaxHealth()));
-        }
-        set(document, "mp", SkillClientState.number(BattleClientState.mp) + "/"
-                + SkillClientState.number(BattleClientState.maxMp));
-    }
-    private static void renderGauges(Document document) {
-        Element list = document.getElementById("gauges");
-        if (list == null) {
-            return;
-        }
-        list.setInnerHTML("");
-        StringBuilder html = new StringBuilder();
-        for (int i = 0; i < BattleClientState.order.size(); i++) {
-            String name = escape(BattleClientState.order.get(i));
-            int percent = i < BattleClientState.gauges.length ? BattleClientState.gauges[i] : 0;
-            html.append("<div class=\"menu-gauge\">")
-                    .append("<span class=\"gauge-name\">").append(name).append("</span>")
-                    .append("<span class=\"gauge-track\"><span class=\"gauge-fill\" style=\"width:")
-                    .append(percent).append("%\"></span></span>")
-                    .append("<span class=\"gauge-pct\">").append(percent).append("%</span>")
-                    .append("</div>");
-        }
-        list.setInnerHTML(html.toString());
-    }
-
-    private static String escape(String value) {
-        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
-    }
-
-    private static void wire(Document document, Minecraft minecraft) {
-        WIRED.put(document, document.getRefreshGeneration());
-        setSettingsOpen(document, false);
-        Element settings = document.getElementById("menu-settings");
-        if (settings != null) settings.addEventListener("click", event -> {
-            event.preventDefault();
-            event.stopPropagation();
-            minecraft.tell(() -> setSettingsOpen(document,
-                    !"true".equals(settings.getAttribute("aria-expanded"))));
-        });
-        Element close = document.getElementById("menu-close");
-        if (close != null) close.addEventListener("click", ignored -> minecraft.tell(() -> {
-            dismissed = true;
-            BattleClientState.mode = BattleMode.NONE;
-            minecraft.setScreen(null);
-        }));
-        Element move = document.getElementById("opt-move");
-        if (move != null) {
-            move.addEventListener("click", ignored -> {
+        // A forced fall is a hard barrier for commands, not only for clicks: the server runs nothing until
+        // every falling unit has landed, so opening an aim page here would only produce a rejection line
+        // after the player had already spent the click.
+        if (BattleClientState.terrainFalling) return;
+        switch (action) {
+            case "move" -> {
+                minecraft.setScreen(null);
                 BattleClientState.mode = BattleMode.MOVE;
                 BattleAim.open();
-            });
-        }
-
-        Element skill = document.getElementById("opt-skill");
-        if (skill != null) skill.addEventListener("click", ignored -> SkillMenu.open());
-
-        Element attack = document.getElementById("opt-attack");
-        if (attack != null) {
-            attack.addEventListener("click", ignored -> {
+            }
+            case "skill" -> {
+                minecraft.setScreen(null);
+                SkillMenu.open();
+            }
+            case "attack" -> {
+                minecraft.setScreen(null);
                 BattleClientState.mode = BattleMode.ATTACK;
                 BattleAim.open();
-            });
-        }
-
-        Element defend = document.getElementById("opt-defend");
-        if (defend != null) {
-            defend.addEventListener("click", ignored -> {
-                BattleClientState.mode = BattleMode.NONE;
+            }
+            case "tool" -> {
                 minecraft.setScreen(null);
+                BattleTool.open();
+            }
+            case "block" -> {
+                minecraft.setScreen(null);
+                BattleTool.openBlock();
+            }
+            case "defend" -> {
+                minecraft.setScreen(null);
+                BattleClientState.mode = BattleMode.NONE;
                 BattleFacing.openDefend();
-            });
-        }
-
-        Element item = document.getElementById("opt-tool");
-        if (item != null) {
-            item.addEventListener("click", ignored -> BattleTool.open());
-        }
-
-        Element flee=document.getElementById("opt-flee");
-        if(flee!=null)flee.addEventListener("click",event->{
-            var stamp=BattleClientState.stamp();
-            if(stamp==null)return;
-            PacketDistributor.sendToServer(new com.tactical.neoforge.network.FleePacket(stamp));
-            BattleClientState.mode=BattleMode.NONE;minecraft.setScreen(null);
-        });
-
-        Element endTurn = document.getElementById("opt-end");
-        if (endTurn != null) {
-            endTurn.addEventListener("click", ignored -> {
+            }
+            case "end" -> {
                 minecraft.setScreen(null);
                 BattleFacing.open();
-            });
+            }
+            case "flee" -> flee(minecraft);
+            default -> {
+            }
         }
     }
 
-    /** Escape dismisses settings first without leaving the current battle menu. */
-    static boolean closeSettings(Document document) {
-        if (document == null || !PAGE.equals(document.getPath())) return false;
-        Element button = document.getElementById("menu-settings");
-        if (button == null || !"true".equals(button.getAttribute("aria-expanded"))) return false;
-        setSettingsOpen(document, false);
-        return true;
-    }
-
-    private static void setSettingsOpen(Document document, boolean open) {
-        Element button = document.getElementById("menu-settings");
-        Element controls = document.getElementById("journal-settings");
-        if (button == null || controls == null || document.isDisposed()) return;
-        button.setAttribute("aria-expanded", Boolean.toString(open));
-        controls.setAttribute("aria-hidden", Boolean.toString(!open));
-        button.setClassName("journal-settings-toggle" + (open ? " is-open" : ""));
-        controls.setClassName("journal-controls" + (open ? " is-open" : ""));
-        button.invalidateStyle();
-        controls.invalidateStyle();
-        document.markDirty(controls, com.sighs.apricityui.render.Drawer.RELAYOUT);
-    }
-
-    private static void set(Document document, String id, String value) {
-        Element element = document.getElementById(id);
-        if (element != null && !value.equals(element.getTextContent())) {
-            element.setTextContent(value);
-        }
+    private static void flee(Minecraft minecraft) {
+        var stamp = BattleClientState.stamp();
+        if (stamp == null) return;
+        PacketDistributor.sendToServer(new FleePacket(stamp));
+        BattleClientState.mode = BattleMode.NONE;
+        minecraft.setScreen(null);
     }
 }

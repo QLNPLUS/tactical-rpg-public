@@ -1,8 +1,15 @@
 # 发布配置与边界
 
+## 仓库与发布目标（公开线）
+
+- 规范仓库：`QLNPLUS/tactical-rpg-public`，默认分支 `main`。后续提交、普通 push、版本标签与显式发布都在这个仓库完成；原私有仓库只作历史备份，不再推送。
+- 普通 push 与 pull_request 只构建、测试与检查发布包，不提供发布凭据、不创建 Release、不上传 CurseForge。只有与 `gradle.properties` 的 `mod_version` 精确对应的 `v<版本>-neoforge-1.21.1` 标签，或显式 `workflow_dispatch`，才进入发布作业。
+- **开源不等于已发布**：这个仓库里的源码树不等于对应版本的二进制已经上传到 CurseForge 或 GitHub Release。是否上传、文件 ID 与审核状态一律以两家服务的回执为准，不以仓库文档的声明代替。
+- 工作流不使用 ApricityUI 相关的任何变量；界面自 0.24.0 起由本模组原生绘制，没有 UI 前置可声明。
+
 ## 入口和产物
 
-**工作流已包含在本仓库中：** `.github/workflows/build-release.yml`（原获批版本，逐字节恢复，未改动）。脚本仅依赖 Python 3.11+ 标准库（CI 使用 3.12）；GitHub 写操作由工作流中的 `gh` 执行，CF 使用官方 Upload API。**0.23.0 的 tag 预检失败、那一次没有上传任何文件**（其 tag `v0.23.0-neoforge-1.21.1` 不改写）；0.23.1 的上传状态以该 tag 的文件页与运行结果为准。截至本记录（2026-10-28），该工作流尚未在公开仓实际运行过。已存在的配置项只是名称层面的记录，**不能据此确认 token 有效、项目上传权限或上传就绪**。
+工作流：[build-release.yml](../.github/workflows/build-release.yml)。脚本仅依赖 Python 3.11+ 标准库（CI 使用 3.12）；GitHub 写操作由工作流中的 `gh` 执行，CF 使用官方 Upload API。
 
 | 事件 | 构建 / 检查 | GitHub Release / CurseForge |
 | --- | --- | --- |
@@ -17,11 +24,12 @@
 
 ```bash
 python -m unittest discover -s tools -p test_release_pipeline.py -v
-python tools/apply_journal_theme.py --check
 bash ./gradlew :common:test :neoforge-1.21.1:build --no-daemon
 python tools/check_release.py
 python tools/release_pipeline.py package
 ```
+
+原有的 `python tools/apply_journal_theme.py --check` 已从 CI 与本清单删除：该脚本随 AUI 页面一起退役、仓库内已不存在，继续执行必然阻断推送 CI。页面主题不再由脚本检查，而由 `NativeUiOnlyTest` 与 `tools/check_release.py` 的原生门覆盖（JAR 内不得有 AUI 页面/类/旧 mixin/字体，且必须包含原生界面类）。
 
 只调用仓库 wrapper，不调用全局 Gradle。`package` 使用标准库核对三份 PNG 的 IHDR 尺寸（1024 / 400 / 256），并核对 JAR 中 logo 与源码一致、JAR 版本、许可元数据（当前为 **LGPL-3.0-only**）、根 LICENSE、NOTICE、两份第三方许可原文和 YiRan 嵌套包条目；字体门由 `tools/check_release.py` 的“包内不得出现 `.ttf`”断言负责，`release_pipeline.py` 的 `check_jar` 不检查字体，CI 中两者都会运行；不依赖 Pillow，也不冒充图像解码/视觉验收。生成：
 
@@ -37,73 +45,39 @@ python tools/release_pipeline.py package
 
 在仓库 Settings → Secrets and variables → Actions 中配置；发布作业使用名为 **release** 的 GitHub Environment，建议为它设置审批人和允许发布的标签规则。可把 token 放进该 Environment 的 secrets；其他值可使用仓库 variables 或该 Environment 的 variables。
 
-| 类型 | 名称 | 要求 | 记录状态（名称层面） |
-| --- | --- | --- | --- |
-| Variable | `CURSEFORGE_PROJECT_ID` | 本项目的 Minecraft CF 数字 ID | 记录为 **`1766445`**（0.23.0 预检失败且未上传；0.23.1 状态以文件页与运行结果为准） |
-| Secret | `CURSEFORGE_TOKEN` | 有该项目上传权限的 Upload API token；workflow 把它映射为作业内环境变量 `CURSEFORGE_API_TOKEN`（Python 侧变量名不变）。不得提交到源码、URL 或日志 | **名称已配置**（值不入库、不写入文档、未被读取；**不能据此确认有效性与项目权限**） |
-| Variable | `CURSEFORGE_APRICITYUI_SLUG` | 从真实 ApricityUI CF 项目确认的 slug | 已核对并配置（值存于仓库 variables） |
-| Variable | `CURSEFORGE_APRICITYUI_PROJECT_ID` | 同一 ApricityUI 项目的数字 ID | 已核对并配置（值存于仓库 variables） |
-| Variable | `CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG` | 从真实 Dungeons Perspective CF 项目确认的 slug | 已核对并配置（值存于仓库 variables） |
-| Variable | `CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID` | 同一 Dungeons Perspective 项目的数字 ID | 已核对并配置（值存于仓库 variables） |
-| 自动提供 | `GITHUB_TOKEN`（传给 gh 的 `GH_TOKEN`） | publish job 明确申请 `contents: write`；仓库/组织策略必须允许 | 由 GitHub 提供 |
-| 环境 / 策略 | `release` | Environment 可访问，审批和分支/标签规则允许发布 | **工作流指定**；当前**未核实**该 Environment 是否已创建、是否有保护规则（此前一次 `gh api .../environments` 列表为空） |
+| 类型 | 名称 | 要求 |
+| --- | --- | --- |
+| Variable | `CURSEFORGE_PROJECT_ID` | **自己的** Minecraft CF 项目数字 ID；需先实际创建并确认项目，不猜测 |
+| Secret | `CURSEFORGE_TOKEN` | 有该项目上传权限的 Upload API token；workflow 把它映射为作业内环境变量 `CURSEFORGE_API_TOKEN`（Python 侧变量名不变）。不得提交到源码、URL 或日志 |
+| Variable | `CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG` | 从真实 Dungeons Perspective CF 项目确认的 slug |
+| Variable | `CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID` | 同一 Dungeons Perspective 项目的数字 ID |
+| 自动提供 | `GITHUB_TOKEN`（传给 gh 的 `GH_TOKEN`） | publish job 明确申请 `contents: write`；仓库/组织策略必须允许 |
+| 环境 / 策略 | `release` | Environment 可访问，审批和分支/标签规则允许本次发布 |
 
-依赖关系在 CF 上传 metadata 中分别为 `requiredDependency` 和 `optionalDependency`，而不是 `embeddedLibrary`。ApricityUI **1.2.8** 为必需客户端前置；Dungeons Perspective **3.6.3** 为可选客户端镜头验证目标。CF 关系本身只标项目，**不锁定版本或客户端 side**；英文描述明确版本和客户端要求，以 JAR NeoForge 元数据控制实际加载要求。
+上传 metadata 只声明**一个**依赖关系：Dungeons Perspective **3.6.3** 为 `optionalDependency`（可选客户端镜头验证目标），不是 `embeddedLibrary`。界面重制后本模组不再有 UI 前置，因此**不再声明 `requiredDependency`**；已发布的 0.23.1 上传时曾声明 ApricityUI 1.2.8 为必需前置，那是已发布版本的历史事实。CF 关系本身只标项目，不锁定版本或客户端 side；英文描述明确版本和客户端要求，以 JAR NeoForge 元数据控制实际加载要求。
 
-> ### ⚠ 依赖版本缺口（必须告知玩家）
->
-> 截至 **2026-10-28** 查看，CurseForge 上 ApricityUI 的 **1.21.1 NeoForge 文件列表最新的是 1.2.7**，**不满足** Tactical RPG 的 `>= 1.2.8` 要求。CF 的 `requiredDependency` 只是“必须是这个项目”，**不保证自动装到 1.2.8**，所以玩家可能被装上 1.2.7 而在版本检查处失败。处理方式：
->
-> - 玩家从官方 Maven 手动下载 1.2.8 **原始 JAR**：<https://maven.sighs.cc/repository/maven-releases/com/sighs/ApricityUI-neoforge-1.21.1/1.2.8/ApricityUI-neoforge-1.21.1-1.2.8.jar>（SHA-256 `7636ae43311b5401b13776799fb79cf4122b23db7fe4ae6ca03a94b14acbc0f6`）；
-> - **不下调**本模组的版本范围，**不把** ApricityUI 的 JAR 复制进本仓库或本模组分发包（保持 `requiredDependency` 关系，不改为 `embeddedLibrary`）；
-> - 该观察仅为 **2026-10-28 的可见列表**，不是“ApricityUI 没有 alpha/更新通道”的断言；上游发布状态以其项目页为准。
+这个可选依赖的真实 CF 标识在 0.23.1 轮已按可核查来源填入（见下）。发布负责人仍应在 CF 项目页面核对 slug、数字 ID、作者和 1.21.1 NeoForge 文件是否对应；脚本校验格式和项目 ID 互异，但不能替代这种身份核对。若依赖没有可确认的 CF 项目，保持缺配置阻断，或明确选择 `github`，不要伪造关系或默默删掉前置。
 
-发布负责人仍必须在 CF 项目页面核对两个依赖的 slug、数字 ID、作者与 1.21.1 NeoForge 文件是否对应；脚本只校验格式与项目 ID 互异，不能替代这种身份核对。缺配置时发布作业会失败关闭。
+**已废弃的变量（不要再配置）**：`CURSEFORGE_APRICITYUI_SLUG` 与 `CURSEFORGE_APRICITYUI_PROJECT_ID` 已从工作流和 `tools/release_pipeline.py` 移除；界面重制后没有任何 UI 前置可声明。保留它们不会改变上传内容，只会让人误以为仍有必需前置。
 
-**当前是否可上传：不能据配置名称断言就绪。** 工作流已包含在本仓库，仓库 variable `CURSEFORGE_PROJECT_ID=1766445` 与上述四个依赖 variable 已在名称层面配置，secret **名称** `CURSEFORGE_TOKEN` 已配置（值未被读取、未写入任何文件）。但这些都只是**名称层面**的事实：**不能据此确认 token 是否有效、是否具备该项目上传权限、以及上传是否就绪**。**0.23.0 的预检失败、该次没有上传任何文件**，也没有调用上传/编辑项目接口；0.23.1 的上传状态以文件页与运行结果为准；**截至本记录（2026-10-28）**，该工作流尚未在公开仓实际运行过。本文件也**不判断**该项目页面上已有或没有其它文件，也不对历史发布下结论。发布类型默认 `beta`，需要发布时用精确 tag 或手动运行触发。（历史：更早一轮用 `gh variable list --json name` / `gh secret list --json name` 看到相关项为空、`release` 环境返回 404，那是**当时**的观测，之后配置有过变化。）
-
-
-## CF 文件说明的来源（只取当前版本章节）
-
-CurseForge 上传 metadata 的 `changelog` 由 `tools/release_pipeline.py release-notes`（内部 `release_notes()`）从**仓库根 `CHANGELOG.md`** 中**只提取当前版本的二级章节**：支持 `## 0.23.1` 与 `## [0.23.1] - 2026-10-28` 两种写法，遇到下一个 `## ` 即停止；`### ` 子标题保留在章节内。**章节缺失、重复或为空一律失败**（不会退回整份历史，也不会发空说明）。GitHub Release 用同一次提取的结果（`--notes-file build/release/release-notes.md`）。`docs/curseforge.md` 只用于 **CF 项目描述栏**的人工粘贴，不参与上传 metadata，工作流也不会改写项目描述。
-
-因此前置版本警告（ApricityUI 需 **≥ 1.2.8**、CF 可见最新为 **1.2.7**、官方 Maven 原始 JAR 与 SHA-256）**写在 0.23.1 章节正文里**，确保只上传该章节时玩家仍能看到。
-
-## CF 上传元数据与防重复
-
-- **版本字段**：metadata 使用官方支持的 `gameVersionNames`，取值固定为 `["1.21.1", "NeoForge", "Client", "Server"]`，**不发送 `gameVersions` 数字 ID**。原因有两条：一是 CurseForge 目录里 `1.21.1` 存在多条同名行（2026-10-28 只读诊断读到 `(11779,77784)`、`(12735,1)`、`(16115,615)`，`NeoForge` 为 `(10150,68441)`），旧的“恰好一个 ID”判断会把合法的重复目录行当成错误（0.23.0 的 tag 预检就是这样失败的）；二是 `v0.23.1-neoforge-1.21.1` 那次 tag 运行只发 `["1.21.1", "NeoForge"]`，服务器回答 **HTTP 400**，且报文体没有记录，所以成因**仍未证实**。当前做法（四个名称）是**假设性修复**，不是已证实的要求：依据只是官方文档把 `gameVersionNames` 视为可选、其示例写成“环境标签 + 版本名”的混合（`["Client", "Server", "26.1.2"]`），以及 CurseForge 网页 UI 产出的同类 1.21.1 + NeoForge 文件**都带 `Client`**（两侧都装的模组还带 `Server`，例如 ApricityUI 的 `Client,1.21.1,NeoForge,Server`）；本模组战斗逻辑跑在服务端且要求双端同版本，故四个名称一起发。官方文档**从未**声明环境标签是必需项，因此如果这次仍然 400，下一步应改用数字 `gameVersions`，并用 `gameVersionTypeID` 区分三条同名 `1.21.1` 目录行（广泛使用的上传实现正是这种做法：只用目录 id、从不发送 `gameVersionNames`）。
-- **已核对的接口边界**：官方 Upload API 只公开 `GET /api/game/dependencies`、`GET /api/game/versions`、`POST .../upload-file`、`POST .../update-file`、Maven 与本地化导入/导出，**没有**“列出本人项目文件/审核中文件”的 GET。因此“CF 上是否已有同名文件”在自动化侧只能记为 **unknown**（公开列表受 Cloudflare 与审核态影响，镜像也会滞后），不允许当作 absent 上报。
-- **保留的只读预检**：上传前仍 `GET /api/game/versions`，只要求这四个名称**各至少一条正整数 id**，不选 ID、不因重复判错；任一名称缺失、id 无效、响应异常一律 fail closed（缺 `Client` / `Server` 也拒绝上传，避免再发出不完整的版本数组）。预检打印 `upload_game_version_names=1.21.1,NeoForge,Client,Server`。
-- **跨运行防重复**：POST 之前先把上传意图（tag、commit、project id、JAR SHA-256，**不含 token**）写成 artifact `cf-upload-intent-<tag>`（保留 90 天）；同一 tag 的后续自动运行若查到未过期的旧意图即 **fail closed**，不自动重试。这次门只覆盖 artifact 保留期，之外仍需人工判断。
-- **结果未知的处置**：POST 之后若超时或连接中断，CurseForge 侧状态属于**未知**——文件可能已被接收、也可能仍在审核。此时**必须先到 CF 项目页人工确认**，再决定是否手工处理；脚本与工作流都**不做自动重试**，也不覆盖远端已有文件。成功路径只以 CF 返回的正整数 file ID 为准。
-
-## 恢复发布（仅 0.23.1 一次；`recovery-publish.yml`）
-
-`v0.23.1-neoforge-1.21.1` 的正常 tag 发布在 CurseForge 上传步骤失败（HTTP 400，报文体未记录，成因未知），
-GitHub Release 也因此没有创建。用户随后在 CurseForge 作者后台（含 pending/processing）确认**不存在** 0.23.1 文件，
-于是允许一次人工恢复发布。
-
-- **触发**：仅 `workflow_dispatch`，**没有任何输入**；tag、来源 run（`40661691067`）、commit（`c6ecbe3…`）、
-  JAR SHA-256（`df18bfae…`）与 recovery intent 名称都是常量，dispatch 无法指向别的产品或别的 tag。
-- **产品来源**：只下载那次运行已核验的 `verified-release` 产物，**不重建**；`tools/cf_recovery.py verify-product`
-  校验三件套、manifest 的 tag/commit、以及 JAR SHA-256 与常量完全一致。
-- **顺序**：tag 身份 → 下载产物 → 产物 pin → 无同名 recovery intent → 无同名 GitHub Release →
-  目录/配置预检（GET）→ 记录 recovery intent 并先上传为 artifact → **只发一次** POST → 建 GitHub Release。
-- **不重试**：任何 HTTP 错误、超时、传输错误、无法解析的响应或没有正整数 file id，都只报一个白名单分类
-  （`http_400` / `http_5xx` / `network_error` / `no_file_id` …）并声明 `curseforge_outcome=unknown` 与
-  `retry_policy=forbidden_second_upload`；脚本不重试、不打印 token、请求体或响应正文。
-- **不动历史**：不改动既有 tag、不删除原 `cf-upload-intent-…` 证据、不做任何 Git 写操作。
-- **人工前置**：本流程仍要求打 dispatch 的人在 CurseForge 后台确认“当前没有任何 0.23.1 文件（含审核中）”，
-  因为 400 之后 CF 侧状态客观上属于未知；用户本次已确认过一次，该确认**不覆盖**之后的任何新 POST。
+**0.23.1 发布轮的配置状态（历史）**：仓库 variable `CURSEFORGE_PROJECT_ID=1766445` 与 secret 名称 `CURSEFORGE_TOKEN` 沿用既有设置；本轮补齐了此前缺失的四个依赖 variable：`CURSEFORGE_APRICITYUI_SLUG=apricityui` / `CURSEFORGE_APRICITYUI_PROJECT_ID=1470115`、`CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG=dungeons-perspective` / `CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID=1258200`。这四个数字/文案取自 CurseForge 数据的只读镜像 `api.cfwidget.com`（返回的 `id`、`title`、`urls.curseforge` 与 slug 三者自洽），并用文件名前缀交叉核对：该镜像下 ApricityUI 的文件为 `ApricityUI-neoforge-1.21.1-*.jar`、Dungeons Perspective 的文件为 `dungeons_iso-neoforge-*+1.21.1.jar`，与本项目测试安装实际加载的 `ApricityUI-neoforge-1.21.1-1.2.8.jar`、`dungeons_iso-neoforge-3.6.3+1.21.1.jar` 命名规则一致。**这仍不是 CF 项目页面的人工核对**：页面渲染需要 Cloudflare 交互，本轮未取得；发布负责人应自行打开两个项目页面确认作者与 1.21.1 NeoForge 文件无误。脚本只校验格式、互异性与"依赖项目不同于发布项目"，不校验身份。改动任一 variable 前先看该轮发布说明是否已声明依赖关系。
 
 ## CF API 契约与失败行为
+
+**0.23.1 实测补充（直接调用官方 Upload API 的项目必读）**：以下三点都在真实发布中被 HTTP 400 挡住过，已由 `tools/release_pipeline.py` 处理并有对应的离线测试。
+
+1. **版本名不唯一**：`GET /api/game/versions` 里 `1.21.1` 同名出现三次——`(11779, 类型 77784 "Minecraft 1.21")`、`(12735, 类型 1)`、`(16115, 类型 615 "Addons")`。只按名字要求“唯一”会永远失败；必须先取 `GET /api/game/version-types`，再在对应类型组内解析。
+2. **必须带环境组**：`gameVersions` 除游戏版本与加载器外，还要至少一个环境条目，否则回执 `You must select at least one version from the environment group of versions`。实测 `Environment=75208`（`Client=9638` / `Server=9639`）、`Modloader=68441`（`NeoForge=10150`）、`1.21.1=11779`。
+3. **`projectID` 必须是整数**：官方文章示例写 `projectID: "74924"`，实际校验为 `Invalid type. Expected Integer but got String. Path 'relations.projects[0].projectID'`。URL 与比较仍用字符串，payload 里转 `int`。
+
+错误诊断口径也已调整：命中 HTTP 错误时读取至多 16385 字节、按 JSON 解析后**只采纳 `errorMessage`（回退 `message`）**，替换 token 为 `[redacted]` 并截断到 512 字符；绝不原样输出正文、headers 或 URL。整段抑制会让 400 完全无法定位（本轮就先卡在这里）。
 
 官方参考：<https://support.curseforge.com/en/support/solutions/articles/9000197321-curseforge-upload-api>（本次已在线读取正文核对）。
 
 - 认证：`X-Api-Token` 请求头，不放 query string。
 - 先 GET `https://minecraft.curseforge.com/api/game/versions`，从响应中精确查找名称 `1.21.1` 和 `NeoForge` 的唯一数字 ID；不存在或歧义即失败，不硬编码猜测 ID。
 - POST `https://minecraft.curseforge.com/api/projects/{projectId}/upload-file`，multipart 仅含 `metadata` JSON 与 `file` 二进制。
-- metadata 包括 Markdown CHANGELOG、`releaseType`、两项 gameVersions 和上述依赖关系。标签入口默认 `beta`；手动输入可选 `alpha` / `beta` / `release`。GitHub 对 alpha/beta 同样标记为 prerelease。
+- metadata 包括 Markdown CHANGELOG（**仅当前版本章节**，见下节）、`releaseType`、两项 gameVersions 和上述依赖关系。标签入口默认 `beta`；手动输入可选 `alpha` / `beta` / `release`。GitHub 对 alpha/beta 同样标记为 prerelease。
 - 只有取得正整数文件 ID 才报告 CF 接收成功；接收不等于审核通过或已公开可下载。
 - 不跟随 HTTP 重定向，避免把 token 带到另一站点；错误只打印安全状态/配置键名，不打印 token、响应正文或 headers；不对 POST 自动重试。
 - 在任何外部写入前完成 CF 配置和版本查询预检；缺配置使整个两处发布失败，GitHub 不会先被误标成功。
@@ -112,9 +86,11 @@ GitHub Release 也因此没有创建。用户随后在 CurseForge 作者后台�
 
 若明确只发布 GitHub，手动选择 `target=github`。工作流摘要会写明 **CurseForge NOT enabled**；这种成功不能被描述为“两处发布成功”。对当前可见配置，这是唯一不依赖 CF token 的外部发布方式，但本次没有执行。
 
-## 描述、美术与许可
+## 发布说明、描述、美术与许可
 
-- 英文 CF 正文：[curseforge.md](curseforge.md)，上传到 CF 项目描述栏；工作流只上传文件，不改写 CF 项目描述或项目头像。
+- **两家服务的发布说明都只取当前版本章节**（`tools/release_pipeline.py` 的同一个 `release_changelog`）：CurseForge 上传把该段放进 metadata 的 changelog；GitHub Release 由 `release-notes` 子命令先写到 `$RUNNER_TEMP/release-notes.md`，`gh release create` 只读这个临时文件，不再用整本 `CHANGELOG.md` 当 notes。本地可用 `python tools/release_pipeline.py release-notes --version <版本> --output <路径>` 预览同一段文本。当前 `mod_version` 是 **0.27.0 已有限验收、未公开发布**（掠夺者弩、流浪者/沼骸原生药箭、女巫自身回合饮药与真实投瓶、卫道士原生斧击与有限木门破门均已实装；864 项 Java 测试、51 项发布脚本测试和受影响服务端夹具通过，单客户端真实输入、权威状态与关键原图已由主控复核，包含治疗自饮过程补证；未因此重跑全部历史界面或多人矩阵）。本轮批准的是实现、验收及通过后的提交推送/测试机检查，**尚未授权本版本 CF/GitHub 公开发布**；0.25.2 的发布指令不自动延伸到本版本。实际提交、部署、上传文件 ID 和审核状态分别以相应回执为准，不以文档声明代替成功。只提取当前版本章节，不额外上传历史章节。该章节必须全文英文且不超过 8000 字符上限（超限会被裁成 `(truncated for upload)`）；`CHANGELOG.md` 里 0.24.2 及更早章节保持历史原文，不随本版本发到两个服务。缺该版本章节时 `release-notes` 直接失败，不会退回整本文件。
+- 临时 notes 文件只放在 runner 临时目录，**不进** `build/release` 这个只含二进制的制品包。
+- 英文 CF 正文：[curseforge.md](curseforge.md)，上传到 CF 项目描述栏；工作流只上传文件，不改写 CF 项目描述或项目头像。GitHub Release 也不会用该文件作 notes。
 - 模组 logo 位于 `neoforge-1.21.1/src/main/resources/logo.png`，`neoforge.mods.toml` 的 `logoFile` 指向 `logo.png`；发布包检查要求该 PNG 实际存在。
 - 高分辨率源图约定 `branding/tactical-rpg-1024.png`；CF 图约定 `branding/curseforge-icon.png`。图像由项目主控制作并审核，本工作流不会生成或自动上传项目头像。
 - 自有部分以根 [LICENSE](../LICENSE) 为准；根 Gradle 为 Java 模块 JAR 加入 `META-INF/LICENSE`。NeoForge 模块继续打包原有 [NOTICE.md](../NOTICE.md)、第三方 LGPL / GPL 文本和嵌套库，不修改第三方声明或库二进制。

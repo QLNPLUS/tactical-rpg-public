@@ -1,12 +1,16 @@
 package com.tactical.neoforge.battle.ai;
 
 import com.tactical.core.grid.GridPos;
+import com.tactical.neoforge.Tactical;
+import com.tactical.neoforge.battle.BattleText;
 import com.tactical.neoforge.network.CreeperTelegraphPacket;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.monster.Creeper;
+import net.minecraft.world.entity.monster.Witch;
 import net.minecraft.world.level.gameevent.GameEvent;
 import net.neoforged.neoforge.network.PacketDistributor;
 
@@ -62,6 +66,7 @@ public final class BattleAiSession {
         if (participants.containsKey(actor.getUUID())) return;
         TacticalMobAi adapter = TacticalAiRegistry.create(actor);
         if (actor instanceof Creeper) access(actor).tactical$setControlled(true);
+        if (actor instanceof Witch witch) witchAccess(witch).tactical$setControlled(true);
         participants.put(actor.getUUID(), new Participant(actor, adapter));
         sendSnapshot();
     }
@@ -72,6 +77,7 @@ public final class BattleAiSession {
         if (participant == null) return;
         participant.adapter.close();
         if (actor instanceof Creeper) access(actor).tactical$setControlled(false);
+        if (actor instanceof Witch witch) witchAccess(witch).tactical$setControlled(false);
         sendSnapshot();
     }
 
@@ -82,6 +88,7 @@ public final class BattleAiSession {
         for (Participant participant : List.copyOf(participants.values())) {
             participant.adapter.close();
             if (participant.actor instanceof Creeper) access(participant.actor).tactical$setControlled(false);
+            if (participant.actor instanceof Witch witch) witchAccess(witch).tactical$setControlled(false);
         }
         participants.clear();
         sendSnapshot();
@@ -112,6 +119,29 @@ public final class BattleAiSession {
             case MOVE, DIVE -> throw new IllegalArgumentException("Battle owner must animate MOVE/DIVE; never resolve DIVE as an instant attack");
             case MELEE -> context.attackPlayer();
             case RANGED -> context.rangedAttackPlayer();
+            case DRINK_POTION -> {
+                // One commit point: the server re-checks the shared cooldown, the frozen price and whether
+                // the brew really took effect, so a refused drink charges nothing and starts no cooldown.
+                if (context.drinkPotion(action.brew())) {
+                    participant.adapter.onActionResolved(action.kind());
+                }
+                return AiResolution.END_TURN;
+            }
+            case THROW_POTION -> {
+                if (context.throwPotion(action.brew())) {
+                    participant.adapter.onActionResolved(action.kind());
+                }
+                return AiResolution.END_TURN;
+            }
+            case BREAK_DOOR -> {
+                // One commit point: the server re-checks the same pair, the real protection chain, the frozen
+                // price and the actor's standing, and only a real removal charges anything. A refused break
+                // still ends the turn, exactly like a refused melee.
+                if (context.breakDoor(action.door())) {
+                    participant.adapter.onActionResolved(action.kind());
+                }
+                return AiResolution.END_TURN;
+            }
             case SKILL -> {
                 // Runtime owns validation and all costs. Never reserve or pay again here.
                 if (context.castSkill(action.skill(), action.skillTarget())) {
@@ -124,14 +154,14 @@ public final class BattleAiSession {
                 access(participant.actor).tactical$setPreparing(true);
                 participant.actor.playSound(SoundEvents.CREEPER_PRIMED, 1.0F, 0.5F);
                 participant.actor.gameEvent(GameEvent.PRIME_FUSE);
-                context.log(participant.actor.getDisplayName().getString() + " 正在准备爆炸，将在它的下个回合引爆");
+                publishWarning(context, BattleText.KEY_AI_CREEPER_PREPARE, participant.actor);
                 sendSnapshot();
                 return AiResolution.END_TURN;
             }
             case DETONATE -> {
                 participant.adapter.onActionResolved(action.kind());
                 access(participant.actor).tactical$setPreparing(false);
-                context.log(participant.actor.getDisplayName().getString() + " 引爆了");
+                publishWarning(context, BattleText.KEY_AI_CREEPER_DETONATE, participant.actor);
                 // This invokes vanilla explosion, mobGriefing, charged/NBT radius, lingering cloud,
                 // kill/loot attribution and NeoForge hooks. Never remove the battle roster here.
                 access(participant.actor).tactical$explodeCreeper();
@@ -174,6 +204,20 @@ public final class BattleAiSession {
                 : new CreeperTelegraphPacket(true, battleId, level.dimension().location(), warnings);
     }
 
+    /**
+     * Publish one built-in warning as structure, or leave it in the server log.
+     *
+     * <p>The mob's own name component travels as an argument; no {@code getString()} happens here, so the
+     * row is readable in every language and independent of whether the client still has the entity in
+     * tracking range. A context without a player-visible journal gets a server-side line instead of a
+     * one-language sentence published to players.</p>
+     */
+    private static void publishWarning(AiContext context, String key, Mob actor) {
+        Component row = BattleText.translatable(key, BattleText.entityName(actor));
+        if (context.logLocalized(row)) return;
+        Tactical.LOGGER.info("[Tactical] {} ({}): the context has no player-visible journal", key, actor.getUUID());
+    }
+
     private Participant current(AiContext context) {
         if (closed || context.actor().level() != level || !context.actor().isAlive() || context.actor().isRemoved()) return null;
         Participant participant = participants.get(context.actor().getUUID());
@@ -190,7 +234,8 @@ public final class BattleAiSession {
             for (GridPos next : action.path()) {
                 if (next.equals(context.targetCell()) || context.occupied(next) || !seen.add(next)
                         || !(context.flying() ? context.airNeighbors(previous) : context.standableNeighbors(previous)).contains(next)) {
-                    context.log("AI movement rejected: occupied, outside zone or unstandable cell");
+                    Tactical.LOGGER.debug("[Tactical] AI movement rejected for {}: occupied, outside zone or unstandable cell",
+                            context.actor().getUUID());
                     return AiAction.endTurn();
                 }
                 previous = next;
@@ -198,7 +243,8 @@ public final class BattleAiSession {
         }
         if (action.kind() == AiAction.Kind.DIVE) {
             if (!(adapter(context.actor()) instanceof PhantomTacticalAi) || !validDive(context, action)) {
-                context.log("AI dive rejected: incomplete return, collision, invalid attack or insufficient AP");
+                Tactical.LOGGER.debug("[Tactical] AI dive rejected for {}: incomplete return, collision, invalid attack or insufficient AP",
+                        context.actor().getUUID());
                 return AiAction.endTurn();
             }
         }
@@ -210,6 +256,26 @@ public final class BattleAiSession {
                 && (context.rangedCost() <= 0 || context.ap() < context.rangedCost()
                 || !context.canRangedAttack(context.actorCell()))) {
             return AiAction.endTurn();
+        }
+        if (action.kind() == AiAction.Kind.DRINK_POTION
+                && (context.witch().drinkCost() <= 0 || context.ap() < context.witch().drinkCost()
+                || !context.witch().ready())) {
+            return AiAction.endTurn();
+        }
+        if (action.kind() == AiAction.Kind.THROW_POTION
+                && (context.witch().throwCost() <= 0 || context.ap() < context.witch().throwCost()
+                || context.target() == null || !context.canThrowFrom(context.actorCell()))) {
+            return AiAction.endTurn();
+        }
+        if (action.kind() == AiAction.Kind.BREAK_DOOR) {
+            // The plan and the execution have to name the same door, and it has to be the door this actor
+            // really stands in front of on the route the server found; the price is the quoted one.
+            VindicatorRoute route = context.vindicator();
+            if (!(adapter(context.actor()) instanceof VindicatorTacticalAi)
+                    || !route.breakAllowed() || route.breakCost() <= 0 || context.ap() < route.breakCost()
+                    || !action.door().equals(route.doorAhead(context.actorCell()))) {
+                return AiAction.endTurn();
+            }
         }
         if (action.kind() == AiAction.Kind.PREPARE_EXPLOSION || action.kind() == AiAction.Kind.DETONATE) {
             TacticalMobAi adapter = adapter(context.actor());
@@ -245,5 +311,10 @@ public final class BattleAiSession {
     private static TacticalCreeperAccess access(Mob actor) {
         if (actor instanceof TacticalCreeperAccess access) return access;
         throw new IllegalStateException("Creeper tactical mixin missing: register tactical.creeper.mixins.json");
+    }
+
+    private static TacticalWitchAccess witchAccess(Mob actor) {
+        if (actor instanceof TacticalWitchAccess access) return access;
+        throw new IllegalStateException("Witch tactical mixin missing: register tactical.witch.mixins.json");
     }
 }

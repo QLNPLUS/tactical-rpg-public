@@ -5,6 +5,7 @@ import com.tactical.core.grid.GridMovementRules;
 import com.tactical.core.grid.GridPos;
 import com.tactical.neoforge.Tactical;
 import com.tactical.neoforge.battle.LevelGridWorld;
+import com.tactical.neoforge.client.ui.platform.ClientText;
 import com.tactical.neoforge.network.*;
 import com.tactical.neoforge.skill.SkillDefinition;
 import com.tactical.neoforge.skill.SkillTarget;
@@ -44,7 +45,7 @@ public final class SkillOverlay {
     private static boolean aiming(Minecraft mc) {
         return BattleClientState.mode==BattleMode.SKILL&&BattleClientState.isPlayerTurn()&&!BattleClientState.moving
                 &&mc.level!=null&&mc.player!=null&&mc.player.isAlive()&&SkillClientState.selected()!=null
-                &&(mc.screen==null||mc.screen instanceof BattleAim.BattleAimScreen);
+                &&(mc.screen==null||BattleAim.isOpen());
     }
     public static SkillTarget target(HitResult hit) {
         Minecraft mc=Minecraft.getInstance();SkillView view=SkillClientState.selected();
@@ -66,7 +67,7 @@ public final class SkillOverlay {
         Minecraft mc=Minecraft.getInstance();
         if(!aiming(mc)){clearPreview();return;}
         SkillView view=SkillClientState.selected();SkillTarget target=target(BattleAim.pickAtCursor());
-        if(target==null||!view.ready()){clearPreview();updateLabel();return;}
+        if(target==null||!view.ready()){clearPreview();return;}
         long now=mc.level.getGameTime();
         boolean changed=!Objects.equals(target,pendingTarget)||!view.id().equals(pendingSkill)
                 ||!Objects.equals(SkillClientState.session(),pendingSession)||pendingRevision!=SkillClientState.revision()
@@ -80,7 +81,6 @@ public final class SkillOverlay {
             pendingWeapon=mc.player.getMainHandItem().copy();pendingId=++sequence;sent=now;
             PacketDistributor.sendToServer(new SkillPreviewRequestPacket(pendingSession,BattleClientState.turnEpoch,mc.level.dimension().location(),pendingId,pendingSkill,target));
         }
-        updateLabel();
     }
     public static void accept(SkillPreviewResponsePacket packet) {
         Minecraft mc=Minecraft.getInstance();
@@ -97,7 +97,7 @@ public final class SkillOverlay {
             var shape=mc.level.getBlockState(support).getCollisionShape(mc.level,support);
             if(!shape.isEmpty())placed.add(new Surface(cell.x(),support.getY()+shape.max(Direction.Axis.Y),cell.z()));
         }
-        surfaces=List.copyOf(placed);updateLabel();
+        surfaces=List.copyOf(placed);
     }
     private static boolean fresh() {
         Minecraft mc=Minecraft.getInstance();
@@ -111,23 +111,61 @@ public final class SkillOverlay {
     public static void execute(HitResult hit) {
         Minecraft mc=Minecraft.getInstance();SkillView view=SkillClientState.selected();SkillTarget target=target(hit);
         if(!aiming(mc)||view==null||!view.ready()||target==null||!fresh()||!preview.valid()||!preview.target().equals(target))return;
-        if(mc.getConnection()==null||!mc.getConnection().hasChannel(SkillCastPacket.TYPE))return;
+        cast(target);
+    }
+
+    /**
+     * The one skill cast every caller shares: the aiming page's world click and the HUD's entity row both
+     * end here. The target is already resolved by the caller, so a HUD click does not have to fake a world
+     * ray; authority, range, line of sight, cost and the turn generation are all rechecked server side.
+     *
+     * @return true when the intent was sent, false when there is nothing legal to send.
+     */
+    public static boolean cast(SkillTarget target) {
+        Minecraft mc=Minecraft.getInstance();SkillView view=SkillClientState.selected();
+        if(view==null||!view.ready()||target==null)return false;
+        if(SkillClientState.session()==null||BattleClientState.mode!=BattleMode.SKILL
+                ||mc.level==null||mc.getConnection()==null||!mc.getConnection().hasChannel(SkillCastPacket.TYPE))return false;
         BattleScreenInput.syncSelectedSlot();
         PacketDistributor.sendToServer(new SkillCastPacket(SkillClientState.session(),BattleClientState.turnEpoch,mc.level.dimension().location(),view.id(),target));
         SkillClientState.cancelSelection();mc.setScreen(null);
+        return true;
     }
-    public static void updateLabel() {
-        Minecraft mc=Minecraft.getInstance();
-        if(BattleClientState.mode!=BattleMode.SKILL||!(mc.screen instanceof BattleAim.BattleAimScreen screen)||screen.getLinkedDocument()==null)return;
+    /** The slot wording of the current preview: what the aiming page shows and nothing more. */
+    public record Label(String text, boolean valid) { }
+
+    /**
+     * The aiming page's one line of feedback.
+     *
+     * <p>This is a display point, so this is where the server's structure becomes this client's language;
+     * the stored preview and the published state keep components unresolved.</p>
+     */
+    public static Label label() {
         SkillView view=SkillClientState.selected();
-        String text=view==null?"技能已不可用":!view.ready()?view.reason():!fresh()?"等待有效目标预览…"
-                :!preview.valid()?preview.reason():"本次 "+preview.apCost()+" AP · "+SkillClientState.number(preview.mpCost())+" MP · 影响 "+preview.affected().length+" 个单位";
-        var label=screen.getLinkedDocument().getElementById("aim-target");
-        if(label!=null&&!text.equals(label.getTextContent()))label.setTextContent(text);
+        if(view==null)return new Label(ClientText.get(ClientText.Keys.SKILL_UNAVAILABLE),false);
+        if(!view.ready())return new Label(view.reason().getString(),false);
+        SkillPreviewResponsePacket fresh=preview();
+        if(fresh==null)return new Label(ClientText.get(ClientText.Keys.SKILL_WAITING_PREVIEW),false);
+        if(!fresh.valid())return new Label(fresh.reason().getString(),false);
+        return new Label(ClientText.get(ClientText.Keys.SKILL_EFFECT,Integer.toString(fresh.apCost()),
+                SkillClientState.number(fresh.mpCost()),Integer.toString(fresh.affected().length)),true);
     }
+
+    /** The AP the preview would spend; zero while no valid preview exists. */
+    public static int apCost() {
+        SkillPreviewResponsePacket fresh=preview();
+        return fresh==null||!fresh.valid()?0:fresh.apCost();
+    }
+
+    /** The MP the preview would spend; zero while no valid preview exists. */
+    public static int mpCost() {
+        SkillPreviewResponsePacket fresh=preview();
+        return fresh==null||!fresh.valid()?0:(int)Math.round(fresh.mpCost());
+    }
+
     @SubscribeEvent public static void render(RenderLevelStageEvent event) {
         if(event.getStage()!=RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS||!aiming(Minecraft.getInstance()))return;
-        updateLabel();Minecraft mc=Minecraft.getInstance();var pose=event.getPoseStack();var camera=event.getCamera().getPosition();
+        Minecraft mc=Minecraft.getInstance();var pose=event.getPoseStack();var camera=event.getCamera().getPosition();
         pose.pushPose();pose.translate(-camera.x,-camera.y,-camera.z);
         var buffers=mc.renderBuffers().bufferSource();boolean ready=fresh()&&preview.valid();
         if(ready) {

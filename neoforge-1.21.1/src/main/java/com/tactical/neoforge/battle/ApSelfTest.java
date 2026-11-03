@@ -23,6 +23,7 @@ import net.minecraft.server.network.ServerGamePacketListenerImpl;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.monster.Skeleton;
@@ -205,7 +206,7 @@ public final class ApSelfTest {
         battle.adjustAp(20-battle.currentAp());
         server.getCommands().getDispatcher().execute("attribute @s tactical:ap_recovery base set 30",owner.createCommandSourceStack().withPermission(2));
         int revision=battle.stateRevision();battle.tick();
-        check(battle.stateRevision()>revision && wire.state.apRecovery()==30 && battle.currentAp()==20,
+        check(battle.stateRevision()>revision && state().apRecovery()==30 && battle.currentAp()==20,
                 "recovery-only native command updates S2C immediately without refilling AP");
         begin(owner);check(battle.currentAp()==50,"native absolute recovery30 applied to actual remainder20");
         owner.getAttribute(TacticalAttributes.AP_RECOVERY).setBaseValue(0);
@@ -297,6 +298,8 @@ public final class ApSelfTest {
         }
         GameProfile profile=new GameProfile(UUID.nameUUIDFromBytes("tactical-ap-fixture".getBytes(java.nio.charset.StandardCharsets.UTF_8)),"ApOwner");
         owner=new ServerPlayer(server,level,profile,ClientInformation.createDefault());wire=new Wire();wire.channel=new EmbeddedChannel(wire);
+        // Fixture-only publication capture: a snapshot is recorded before it is cut for transport.
+        com.tactical.neoforge.network.ServerPackets.startCapture();
         for(String id:List.of("battle_state","battle_log","player_step","creeper_telegraph","move_choice_offer"))
             ChannelAttributes.getOrCreateAdHocChannels(wire).add(ResourceLocation.fromNamespaceAndPath(Tactical.MOD_ID,id));
         new ServerGamePacketListenerImpl(server,wire,owner,CommonListenerCookie.createInitial(profile,false));
@@ -305,18 +308,31 @@ public final class ApSelfTest {
         owner.getAttribute(Attributes.MAX_HEALTH).setBaseValue(1000);owner.setHealth(1000);
         level.addNewPlayer(owner);
         melee=mob(EntityType.ZOMBIE,1,0);ranged=mob(EntityType.SKELETON,4,8);
+        // A real skeleton spawns with its bow; without it the actor has no ranged action to quote at all.
+        ranged.setItemSlot(EquipmentSlot.MAINHAND,new ItemStack(Items.BOW));
     }
     private static <T extends Mob>T mob(EntityType<T> type,int dx,int dz) {
         T mob=type.create(level);check(mob!=null,"native actor created");mob.setPos(origin.getX()+dx+.5,origin.getY(),origin.getZ()+dz+.5);
         mob.setNoAi(true);mob.setPersistenceRequired();mob.getAttribute(Attributes.MAX_HEALTH).setBaseValue(1000);mob.setHealth(1000);
         level.addFreshEntity(mob);mobs.add(mob);return mob;
     }
+    /** The last battle snapshot the server attempted to publish to the fixture owner. */
+    private static BattleStatePacket state() {
+        if (owner == null) return null;
+        BattleStatePacket last = null;
+        for (var payload : com.tactical.neoforge.network.ServerPackets.capturedFor(owner.getUUID())) {
+            if (payload instanceof BattleStatePacket snapshot) last = snapshot;
+        }
+        return last;
+    }
+
     private static void check(boolean condition,String label) { if(!condition)throw new AssertionError(label); }
     private static void finish(MinecraftServer server) {
         enabled=false;cancelAttack=cancelUse=cancelShot=false;BattleManager.reset();
         for(Mob mob:mobs)mob.discard();mobs.clear();
         if(owner!=null && !owner.isRemoved())level.removePlayerImmediately(owner,Entity.RemovalReason.DISCARDED);
         if(wire!=null && wire.channel!=null)wire.channel.finishAndReleaseAll();
+        com.tactical.neoforge.network.ServerPackets.stopCapture();
         if(level!=null)for(BlockPos chunk:forced)level.setChunkForced(chunk.getX(),chunk.getZ(),false);
         forced.clear();BattleEffects.clear();server.halt(false);
     }

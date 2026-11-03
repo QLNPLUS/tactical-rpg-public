@@ -131,6 +131,10 @@ public final class TeamSelfTest {
     }
 
     private static void participationAndMelee() throws Exception {
+        // The snapshot is published as bounded parts since 0.24.0, so a connection-level observer sees parts,
+        // not the logical payload. The fixture therefore reads the server's own publication capture: exactly
+        // what was attempted for this recipient, before the transport sliced it.
+        com.tactical.neoforge.network.ServerPackets.startCapture();
         check(BattleManager.start(owner,true),"real encounter starts"); battle = BattleManager.current();
         check(battle.sideOf(owner)==BattleSide.PLAYER && battle.sideOf(first)==BattleSide.HOSTILE,"native side assignment");
         Zombie ally = mob(EntityType.ZOMBIE,5,0,0,false);
@@ -178,7 +182,7 @@ public final class TeamSelfTest {
         TacticalConfig.INSTANCE.friendlyFire.set(false); owner.setHealth(ownerHp); owner.setInvulnerable(true);
         begin(owner);
         int ap=battle.currentAp(); battle.tryAttack(ally.getUUID());
-        check(battle.currentAp()==ap && !battle.previewWeaponAttack(owner,ally).isEmpty(),"owner native intent and preview reject friend without cost");
+        check(battle.currentAp()==ap && !battle.weaponAttackAllowed(owner,ally),"owner native intent and preview reject friend without cost");
         int[] ids=wire.last().turnEntityIds();
         check(Arrays.stream(ids).filter(id->id==ally.getId()).count()==1,"friendly appears in actual native turn snapshot exactly once");
         archer = mob(EntityType.SKELETON,-4,0,3,true);
@@ -268,6 +272,7 @@ public final class TeamSelfTest {
     private static void check(boolean condition,String message) { if(!condition)throw new AssertionError(message); }
     private static void finish(MinecraftServer server) {
         enabled=false; BattleManager.reset(); BattleManager.setAutoTrigger(true);
+        com.tactical.neoforge.network.ServerPackets.stopCapture();
         if(configured) {
             TacticalConfig.INSTANCE.participantCap.set(oldCap);
             TacticalConfig.INSTANCE.friendlyFire.set(oldFriendlyFire);
@@ -286,7 +291,27 @@ public final class TeamSelfTest {
         @Override public void send(Packet<?> packet,PacketSendListener listener,boolean flush) {
             if(packet instanceof ClientboundCustomPayloadPacket custom && custom.payload() instanceof BattleStatePacket state)states.add(state);
         }
-        private BattleStatePacket last() { check(!states.isEmpty(),"native state recorded");return states.getLast(); }
-        private int inactiveCount() { return (int)states.stream().filter(s->!s.active()).count(); }
+        private BattleStatePacket last() {
+            BattleStatePacket captured = capturedLast();
+            if (captured != null) return captured;
+            check(!states.isEmpty(),"native state recorded");
+            return states.getLast();
+        }
+        private int inactiveCount() {
+            var packets = com.tactical.neoforge.network.ServerPackets.capturedFor(owner.getUUID());
+            int captured = 0;
+            for (var packet : packets) {
+                if (packet instanceof BattleStatePacket state && !state.active()) captured++;
+            }
+            return Math.max(captured, (int) states.stream().filter(s -> !s.active()).count());
+        }
+        /** The last logical snapshot the server attempted to publish to this recipient. */
+        private BattleStatePacket capturedLast() {
+            var packets = com.tactical.neoforge.network.ServerPackets.capturedFor(owner.getUUID());
+            for (int index = packets.size() - 1; index >= 0; index--) {
+                if (packets.get(index) instanceof BattleStatePacket state) return state;
+            }
+            return null;
+        }
     }
 }

@@ -33,9 +33,13 @@ public final class BattleInput {
         if (event.getButton() != 0 && event.getButton() != 1) return;
         double guiX=mc.mouseHandler.xpos()*mc.getWindow().getGuiScaledWidth()/Math.max(1,mc.getWindow().getScreenWidth());
         double guiY=mc.mouseHandler.ypos()*mc.getWindow().getGuiScaledHeight()/Math.max(1,mc.getWindow().getScreenHeight());
-        if(BattleLog.interceptsAt(new com.sighs.apricityui.layout.Position((float)guiX,(float)guiY))) return;
+        // A release over the HUD finishes a HUD gesture, never a battlefield one: the journal, the
+        // roster and the rail are interface, and a press there was already swallowed.
+        if(com.tactical.neoforge.client.ui.hud.NativeHud.overUi(guiX,guiY)) return;
         event.setCanceled(true);
-        if (!BattleClientState.isPlayerTurn()) return;
+        // A companion turn is a command turn too: its move/attack aiming is driven by the very same world
+        // clicks, while every privileged path keeps its own strict player-turn gate.
+        if (!BattleMenu.commandTurn()) return;
         if (event.getButton() == 1 || BattleClientState.mode == BattleMode.NONE) {
             BattleMenu.open();
         } else {

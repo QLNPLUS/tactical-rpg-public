@@ -1,5 +1,6 @@
 package com.tactical.neoforge.client;
 
+import com.tactical.neoforge.client.ui.hud.JournalViewport;
 import com.tactical.neoforge.network.BattleLogPacket;
 
 import java.util.LinkedHashMap;
@@ -9,7 +10,6 @@ import java.util.UUID;
 
 /** Main-client-thread state, independent of rendering and Minecraft singletons. */
 public final class BattleLogState {
-    public static final int VISIBLE_LINES = 7;
     /**
      * Encounter id to the membership generation whose traffic is refused.
      *
@@ -24,8 +24,15 @@ public final class BattleLogState {
     private boolean finished;
     private boolean collapsed;
     private boolean dirty;
-    private int historyOffset;
-    private int visibleLines = VISIBLE_LINES;
+    /**
+     * Where the body is scrolled to: an entry's own sequence plus the pixels scrolled into it, or
+     * {@link JournalViewport.Anchor#NEWEST} while the newest entry hugs the body's bottom edge.
+     *
+     * <p>A pixel distance would have to be corrected by hand every time an entry is appended, evicted
+     * or re-wrapped; an anchor survives all three because it names content, not a distance. The
+     * viewport resolves it against the heights the layout measured this frame.</p>
+     */
+    private JournalViewport.Anchor journalAnchor = JournalViewport.Anchor.NEWEST;
 
     /**
      * Refuse one encounter's older traffic after the server ended that membership.
@@ -65,18 +72,15 @@ public final class BattleLogState {
             sequence = -1;
             finished = false;
             collapsed = false;
-            historyOffset = 0;
+            journalAnchor = JournalViewport.Anchor.NEWEST;
         }
         if (packet.sequence() <= sequence || finished) return false;
-        // Anchor the last displayed entry rather than an index: bounded snapshots evict old rows.
-        long anchor = historyOffset > 0 && !history.isEmpty()
-                ? history.get(history.size() - historyOffset - 1).sequence() : -1;
+        // Nothing is re-anchored here on purpose. The anchor names an entry and the pixels scrolled
+        // into it, so a snapshot that appends newer entries - or evicts the oldest ones at the head of
+        // the bounded history - leaves a browsing reader exactly where they were, while an unchanged
+        // NEWEST anchor keeps following the end of the log.
         sequence = packet.sequence();
         history = packet.history();
-        if (anchor >= 0) {
-            historyOffset = (int) history.stream().filter(entry -> entry.sequence() > anchor).count();
-            historyOffset = Math.min(historyOffset, maxOffset());
-        }
         // Keep the terminal sequence to reject queued updates, but never retain its UI.
         finished = packet.lifecycle() == BattleLogPacket.FINISH;
         dirty = true;
@@ -98,8 +102,7 @@ public final class BattleLogState {
         history = List.of();
         finished = false;
         collapsed = false;
-        historyOffset = 0;
-        visibleLines = VISIBLE_LINES;
+        journalAnchor = JournalViewport.Anchor.NEWEST;
         dirty = true;
     }
 
@@ -119,34 +122,69 @@ public final class BattleLogState {
     public boolean finished() { return finished; }
     public boolean collapsed() { return collapsed; }
     public List<BattleLogPacket.Entry> history() { return history; }
-    /** Positive native wheel deltas browse older entries; negative deltas return to latest. */
-    public boolean scroll(double delta) {
-        if (!visible() || collapsed || !Double.isFinite(delta) || delta == 0) return false;
-        int steps = (int) Math.min(BattleLogPacket.MAX_HISTORY, Math.max(1, Math.ceil(Math.abs(delta))));
-        int next = Math.max(0, Math.min(maxOffset(), historyOffset + (delta > 0 ? steps : -steps)));
-        if (next != historyOffset) {
-            historyOffset = next;
+
+    /**
+     * One wheel notch browses text lines: positive deltas move into older history, negative ones
+     * towards the newest entry. The HUD hands over the raw wheel notch, so a notch down (the negative
+     * native delta) returns towards the end of the log, which is the ordinary console direction the
+     * user asked for.
+     *
+     * <p>The movement is in the viewport's own unit - GUI pixels - so a single entry taller than the
+     * body can be read line by line instead of being skipped whole. The caller passes the heights the
+     * layout measured this frame, which is the same content it paints and reports.</p>
+     */
+    public boolean scroll(double delta, JournalViewport.Content content) {
+        return scroll(delta, !collapsed, content);
+    }
+
+    /**
+     * The caller decides whether the body is really drawn: the tight/narrow form's explicit expand
+     * shows the body without changing the ordinary collapse preference.
+     */
+    public boolean scroll(double delta, boolean bodyShown, JournalViewport.Content content) {
+        if (!visible() || !bodyShown || !Double.isFinite(delta) || delta == 0) return false;
+        int notches = (int) Math.min(BattleLogPacket.MAX_HISTORY, Math.max(1, Math.ceil(Math.abs(delta))));
+        int step = content == null || content.count() <= 0 ? 1 : Math.max(1, content.lineHeight());
+        JournalViewport.Anchor next = JournalViewport.shift(content, journalAnchor,
+                delta > 0 ? notches * step : -notches * step);
+        if (!next.equals(journalAnchor)) {
+            journalAnchor = next;
             dirty = true;
         }
         // Consume even at either boundary so the camera never receives journal wheel input.
         return true;
     }
 
-    public void setVisibleLines(int lines) {
-        visibleLines = Math.max(1, Math.min(VISIBLE_LINES, lines));
-        int next = Math.min(historyOffset, maxOffset());
-        if (next != historyOffset) {
-            historyOffset = next;
-            dirty = true;
-        }
+    /**
+     * The layout reports the position it really resolved this frame. Adopting it keeps one browsed
+     * position for every body size, so a shrink cannot leave the reader past the oldest entry and a
+     * view that reached the newest end starts following new entries again.
+     */
+    public void setJournalAnchor(JournalViewport.Anchor anchor) {
+        JournalViewport.Anchor next = anchor == null ? JournalViewport.Anchor.NEWEST : anchor;
+        if (next.equals(journalAnchor)) return;
+        journalAnchor = next;
+        dirty = true;
     }
 
-    private int maxOffset() { return Math.max(0, history.size() - visibleLines); }
-    public int historyOffset() { return historyOffset; }
-    public List<BattleLogPacket.Entry> visibleHistory() {
-        int end = history.size() - historyOffset;
-        return history.subList(Math.max(0, end - visibleLines), end);
+    /** Where the body is scrolled to: the entry under its top edge, or the newest end. */
+    public JournalViewport.Anchor journalAnchor() {
+        return journalAnchor;
     }
+
+    /** True while the reader is browsing older history instead of following the newest entry. */
+    public boolean browsing() {
+        return !journalAnchor.newest();
+    }
+
+    /**
+     * The retained history, oldest first. Every entry the client still keeps is browsable, so this is
+     * also what the journal's scroll bar reports as its total - the window is chosen by the layout.
+     */
+    public List<BattleLogPacket.Entry> retainedHistory() {
+        return history;
+    }
+
     public boolean dirty() { return dirty; }
     public void markClean() { dirty = false; }
 }

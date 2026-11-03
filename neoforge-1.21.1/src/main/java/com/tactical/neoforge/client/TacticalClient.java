@@ -1,38 +1,29 @@
 package com.tactical.neoforge.client;
 
-import com.mojang.brigadier.Command;
-import com.sighs.apricityui.ApricityUI;
-import com.sighs.apricityui.init.Document;
-import com.sighs.apricityui.init.Element;
-import com.sighs.apricityui.parser.HTML;
-import com.tactical.core.combat.ApCalculator;
 import com.tactical.neoforge.Tactical;
-import net.minecraft.commands.Commands;
+import com.tactical.neoforge.client.ui.debug.DevProbe;
+import com.tactical.neoforge.client.ui.screen.NativeTacticalScreen;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
-import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.network.PacketDistributor;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
-
 /**
  * Client bootstrap. Kept separate from {@link Tactical} so the dedicated server
- * never class-loads ApricityUI types.
+ * never class-loads client-only types.
+ *
+ * <p>Every tactical screen, panel and HUD is drawn by this mod's own native toolkit; no page is
+ * registered with a UI dependency, so this class only wires the native listeners, the key mapping
+ * and the development probe.</p>
  */
 @EventBusSubscriber(modid = Tactical.MOD_ID, bus = EventBusSubscriber.Bus.MOD, value = Dist.CLIENT)
 public final class TacticalClient {
 
-    private static final String PAGE_TEST_UI = "tactical/screens/tactical_test.html";
-    private static final String PAGE_HUD = "tactical/overlays/battle_hud.html";
-    private static final String PAGE_MENU = "tactical/screens/battle_menu.html";
-
     private static net.minecraft.client.KeyMapping menuKey;
+    private static net.minecraft.client.KeyMapping characterKey;
 
     private TacticalClient() {
     }
@@ -41,27 +32,22 @@ public final class TacticalClient {
     public static void onRegisterKeyMappings(net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent event) {
         menuKey = new net.minecraft.client.KeyMapping(
                 "key.tactical.menu", org.lwjgl.glfw.GLFW.GLFW_KEY_B, "key.categories.tactical");
+        // The character page is bound to K and stays rebindable like every other key of this mod.
+        characterKey = new net.minecraft.client.KeyMapping(
+                "key.tactical.character", org.lwjgl.glfw.GLFW.GLFW_KEY_K, "key.categories.tactical");
         event.register(menuKey);
+        event.register(characterKey);
     }
 
     @SubscribeEvent
     public static void onClientSetup(FMLClientSetupEvent event) {
-        registerTemplate(PAGE_TEST_UI);
-        registerTemplate(PAGE_HUD);
-        registerTemplate(TurnChargeHud.PAGE);
-        registerTemplate(PAGE_MENU);
-        registerTemplate("tactical/screens/battle_inventory.html");
-        registerTemplate(BattleFacing.PAGE);
-        registerTemplate(BattleAim.PAGE);
-        registerTemplate(MoveChoiceScreen.PAGE);
-        registerTemplate(SkillMenu.PAGE);
-        registerTemplate(NearbyBattlesScreen.PAGE);
-        registerTemplate(NearbyHint.PAGE);
-
-        NeoForge.EVENT_BUS.addListener(TacticalClient::onRegisterClientCommands);
         NeoForge.EVENT_BUS.addListener(TacticalClient::onClientTick);
+        // A tactical page swallows world key input (passEvents is false), so the character key also needs a real
+        // screen-key route: it opens only from one of this mod's own tactical pages, never from a container or
+        // the chat, and it stays a rebindable mapping rather than a hard-coded key code.
+        NeoForge.EVENT_BUS.addListener(net.neoforged.bus.api.EventPriority.HIGHEST,
+                TacticalClient::onTacticalScreenKey);
         NeoForge.EVENT_BUS.addListener(net.neoforged.bus.api.EventPriority.HIGHEST, WheelGuard::onScroll);
-        NeoForge.EVENT_BUS.addListener(net.neoforged.bus.api.EventPriority.HIGHEST, InventoryUi::onClick);
         NeoForge.EVENT_BUS.addListener(BattleInput::onMouseButton);
         NeoForge.EVENT_BUS.addListener(BattleInput::onMovementInput);
         NeoForge.EVENT_BUS.addListener(BattleFacing::onRenderPlayer);
@@ -70,46 +56,95 @@ public final class TacticalClient {
         NeoForge.EVENT_BUS.addListener(HealthBarRenderer::onRenderLevel);
         NeoForge.EVENT_BUS.addListener(TargetHighlightRenderer::onRenderLevel);
         NeoForge.EVENT_BUS.addListener(VanillaHudGuard::onRenderGuiLayer);
-
-        if (Boolean.getBoolean("tactical.selftest")) {
-            event.enqueueWork(TacticalClient::runSelfTest);
-        }
+        // Development-only, read-only layout probe; inert unless the run sets -Dtactical.devprobe.port.
+        DevProbe.startIfConfigured();
     }
 
-    private static void runSelfTest() {
-        Document document = openTestUi();
-        Tactical.LOGGER.info("[Tactical] selftest document={}", document != null ? document.getUuid() : "null");
+    /** Keeps the probe honest: no native tactical screen on screen means the report is "null". */
+    private static void publishProbeScreen() {
+        if (!DevProbe.enabled()) return;
+        boolean nativeScreen = net.minecraft.client.Minecraft.getInstance().screen
+                instanceof NativeTacticalScreen;
+        if (!nativeScreen) {
+            DevProbe.publishClosed();
+        }
+        // The game's own screens answer from their own widgets, so a driver can click them for real.
+        DevProbe.publishActiveScreen(!nativeScreen
+                && net.minecraft.client.Minecraft.getInstance().screen != null);
     }
 
     private static void onClientTick(ClientTickEvent.Post event) {
+        publishProbeScreen();
         BattleTool.refresh();
         BattleHud.tick();
         BattleMenu.tick();
         BattleFacing.tick();
+        BattleAim.tickBinding();
         MoveChoiceScreen.tickOpenScreen();
         CameraDirector.tick();
         BattleInput.onClientTick();
-        WheelGuard.tick();
-        InventoryUi.tick();
-        UiZoom.tick();
         animateMover();
         BattleDiscoveryClientState.tick();
         NearbyBattlesScreen.tickOpenScreen();
-        NearbyHint.tick();
-        if (menuKey != null && menuKey.consumeClick()) {
+        if (menuKey != null && menuKey.consumeClick()
+                && !com.tactical.neoforge.client.ui.character.CharacterScreen.isOpen()) {
             // In a battle B keeps the original command menu; outside one it opens the nearby list.
             if (BattleDiscoveryClientState.bOpensBattleMenu()) BattleMenu.open();
             else NearbyBattlesScreen.open();
         }
+        tickCharacterPage();
         if (Boolean.getBoolean("tactical.selftest.battle")) {
             runBattleSelfTest();
         }
-        if (Boolean.getBoolean("tactical.selftest.ui")) {
-            if (uiSelfTest == null) {
-                uiSelfTest = UiSelfTest.start();
-            }
-            uiSelfTest.tick();
+    }
+
+    /**
+     * The character page's two entry points and its only bridge to the answers.
+     *
+     * <p>The bound key opens the page when no other screen owns input - the world, or one of this mod's own
+     * tactical pages - and never while a container or the chat is open. The server's own open intent (the
+     * command answers with {@code openScreen}) arrives through the client state cache, so the page is opened
+     * by exactly one of those two paths and never twice. While the page is open every new cached answer is
+     * handed to it once, which is how a snapshot, a preview or a refusal becomes visible without the network
+     * handler knowing about a screen.</p>
+     */
+    private static void tickCharacterPage() {
+        var minecraft = net.minecraft.client.Minecraft.getInstance();
+        if (minecraft.player == null) return;
+        // With no screen open the mapping's click is the only route; inside one of this mod's tactical pages the
+        // real screen-key listener above handles it, so the two paths can never open the page twice.
+        if (minecraft.screen == null && characterKey != null && characterKey.consumeClick()
+                && !com.tactical.neoforge.client.ui.character.CharacterScreen.isOpen()) {
+            com.tactical.neoforge.client.ui.character.CharacterScreen.open();
+            return;
         }
+        if (!com.tactical.neoforge.client.ui.character.CharacterScreen.isOpen()
+                && com.tactical.neoforge.client.progression.CharacterClientState.takeOpenRequest()
+                && canOpenCharacterPage(minecraft)) {
+            com.tactical.neoforge.client.ui.character.CharacterScreen.open();
+            return;
+        }
+        com.tactical.neoforge.client.ui.character.CharacterScreen.pump();
+    }
+
+    private static void onTacticalScreenKey(net.neoforged.neoforge.client.event.ScreenEvent.KeyPressed.Pre event) {
+        if (characterKey == null || characterKey.isUnbound()) return;
+        var screen = event.getScreen();
+        if (!(screen instanceof com.tactical.neoforge.client.ui.screen.TacticalSurface)) return;
+        if (com.tactical.neoforge.client.ui.character.CharacterScreen.isOpen()) return;
+        if (!characterKey.matches(event.getKeyCode(), event.getScanCode())) return;
+        // The mapping's click queue is drained so the tick path cannot open the page a second time.
+        while (characterKey.consumeClick()) { }
+        com.tactical.neoforge.client.ui.character.CharacterScreen.open();
+        event.setCanceled(true);
+    }
+
+    /** The world or one of this mod's own tactical pages, never a container or the chat. */
+    private static boolean canOpenCharacterPage(net.minecraft.client.Minecraft minecraft) {
+        if (minecraft.screen == null) return true;
+        return minecraft.screen instanceof net.minecraft.client.gui.screens.inventory.AbstractContainerScreen<?>
+                ? false
+                : minecraft.screen instanceof com.tactical.neoforge.client.ui.screen.TacticalSurface;
     }
 
     /** Teleported grid steps do not produce vanilla walking, so drive the limb swing here. */
@@ -129,7 +164,6 @@ public final class TacticalClient {
     }
 
     private static boolean battleTestStarted;
-    private static UiSelfTest uiSelfTest;
     private static boolean battleTestForced;
     private static boolean battleTestLogged;
     private static boolean battleTestMoveSent;
@@ -187,50 +221,5 @@ public final class TacticalClient {
             battleTestEnded = true;
             Tactical.LOGGER.info("[Tactical] selftest battle ended");
         }
-    }
-
-    private static void registerTemplate(String path) {
-        String resource = "/assets/apricityui/apricity/" + path;
-        try (InputStream stream = TacticalClient.class.getResourceAsStream(resource)) {
-            if (stream == null) {
-                Tactical.LOGGER.warn("[Tactical] missing bundled page {}", resource);
-                return;
-            }
-            String html = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
-            HTML.putTemple(path, html);
-            Tactical.LOGGER.info("[Tactical] registered AUI page {}", path);
-        } catch (IOException e) {
-            Tactical.LOGGER.error("[Tactical] failed to read bundled page {}", resource, e);
-        }
-    }
-
-    private static void onRegisterClientCommands(RegisterClientCommandsEvent event) {
-        event.getDispatcher().register(Commands.literal("tacticalui")
-                .executes(context -> {
-                    openTestUi();
-                    return Command.SINGLE_SUCCESS;
-                }));
-    }
-
-    private static Document openTestUi() {
-        ApricityUI.removeDocument(PAGE_TEST_UI);
-        Document document = ApricityUI.createDocument(PAGE_TEST_UI);
-        if (document == null) {
-            Tactical.LOGGER.warn("[Tactical] page {} was not registered", PAGE_TEST_UI);
-            return null;
-        }
-        Element status = document.getElementById("status");
-        if (status != null) {
-            status.setTextContent("Java 绑定成功 · AP " + ApCalculator.defaultMaxAp());
-        }
-        Element ping = document.getElementById("ping");
-        if (ping != null) {
-            ping.addEventListener("click", ignored -> {
-                if (status != null) {
-                    status.setTextContent("按钮回调可用");
-                }
-            });
-        }
-        return document;
     }
 }

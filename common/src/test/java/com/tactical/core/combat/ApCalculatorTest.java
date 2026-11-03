@@ -39,6 +39,16 @@ class ApCalculatorTest {
         assertEquals(0,ApCalculator.beginOwnTurnAp(-1,150,0,false));
         assertEquals(Integer.MAX_VALUE,ApCalculator.beginOwnTurnAp(Integer.MAX_VALUE,Integer.MAX_VALUE,Integer.MAX_VALUE,false));
     }
+    @Test void breakingHasItsOwnBasePrice() {
+        // Breaking is a command of its own, so its base price does not borrow the placement or item
+        // price, and it takes part in the same escalation counter every paid action shares.
+        assertEquals(10, ApCalculator.BREAK_COST);
+        assertEquals(10, ApCalculator.paidActionCost(ApCalculator.BREAK_COST, 0));
+        assertEquals(13, ApCalculator.paidActionCost(ApCalculator.BREAK_COST, 1));
+        assertEquals(23, ApCalculator.paidActionCost(ApCalculator.BREAK_COST, 5));
+        assertTrue(ApCalculator.BREAK_COST != ApCalculator.ITEM_COST,
+                "an item use and a block break are not the same price");
+    }
     @Test void initiativeStillFavorsFastAttackers() {
         assertTrue(ApCalculator.initiative(1.6,.1,0)>ApCalculator.initiative(1,.23,0));
     }

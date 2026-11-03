@@ -72,8 +72,8 @@ public final class FlightSelfTest {
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public static void onDamage(LivingDamageEvent.Post event) {
         if (!enabled || event.getEntity() != owner || event.getSource().getEntity() != phantom || event.getNewDamage() <= 0) return;
-        require(battle != null && !battle.isPlayerTurnNow() && wire.state != null
-                && wire.state.actorEntityId() == phantom.getId(), "actual vanilla phantom damage occurs only in its own turn");
+        require(battle != null && !battle.isPlayerTurnNow() && state() != null
+                && state().actorEntityId() == phantom.getId(), "actual vanilla phantom damage occurs only in its own turn");
         hits++;
     }
 
@@ -133,7 +133,7 @@ public final class FlightSelfTest {
                     phantom == null ? null : phantom.position(), home, owner == null ? null : owner.position(),
                     phantom == null ? null : phantom.getBoundingBox(), phantom == null ? null : phantom.getDeltaMovement(),
                     hits, battle == null ? -1 : enemyInt("ap"), beforeAp, expectedCost,
-                    wire == null ? null : wire.state, wire == null ? null : wire.log);
+                    state(), log());
             finish(event.getServer());
             // Explicit non-zero exit: a green Gradle task must never look like a passing fixture.
             Runtime.getRuntime().halt(1);
@@ -267,6 +267,8 @@ public final class FlightSelfTest {
         owner = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
         wire = new RecordingConnection();
         wire.channel = new EmbeddedChannel(wire);
+        // Fixture-only publication capture: a snapshot is recorded before it is cut for transport.
+        com.tactical.neoforge.network.ServerPackets.startCapture();
         for (String id : List.of("battle_state", "battle_log", "player_step", "creeper_telegraph", "move_choice_offer")) {
             ChannelAttributes.getOrCreateAdHocChannels(wire).add(ResourceLocation.fromNamespaceAndPath(Tactical.MOD_ID, id));
         }
@@ -296,6 +298,27 @@ public final class FlightSelfTest {
         forced.clear();
         BattleEffects.clear();
         server.halt(false);
+    }
+
+
+    /** The last battle snapshot the server attempted to publish to the fixture owner. */
+    private static BattleStatePacket state() {
+        if (owner == null) return null;
+        BattleStatePacket last = null;
+        for (var payload : com.tactical.neoforge.network.ServerPackets.capturedFor(owner.getUUID())) {
+            if (payload instanceof BattleStatePacket snapshot) last = snapshot;
+        }
+        return last;
+    }
+
+    /** The last journal snapshot the server attempted to publish to the fixture owner. */
+    private static BattleLogPacket log() {
+        if (owner == null) return null;
+        BattleLogPacket last = null;
+        for (var payload : com.tactical.neoforge.network.ServerPackets.capturedFor(owner.getUUID())) {
+            if (payload instanceof BattleLogPacket packet) last = packet;
+        }
+        return last;
     }
 
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }

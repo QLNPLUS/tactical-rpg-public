@@ -13,6 +13,7 @@ import net.neoforged.neoforge.event.entity.living.LivingIncomingDamageEvent;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 /** Public recruitment/read API. Calls must run on the owning server thread. */
 @EventBusSubscriber(modid = Tactical.MOD_ID)
@@ -28,6 +29,40 @@ public final class BattleParticipation {
     public static boolean tryAddFriendly(Mob mob) {
         ServerBattle battle = BattleManager.candidateFor(mob);
         return battle != null && battle.tryAddFriendly(mob);
+    }
+
+    /**
+     * Recruit one hand-commanded companion into the battle its own controller is already fighting.
+     *
+     * <p>The candidate is resolved from the adapter and from the controller's route, never from "a battle
+     * happens to be nearby": if the resolved controller is not in an encounter, or the mob is already owned
+     * by another one, nothing happens. Being a companion is an explicit opt-in through
+     * {@link com.tactical.neoforge.registry.companion.CompanionRegistry}, so a mod that never registered an
+     * adapter keeps the old automatic behaviour of {@link #tryAddFriendly(Mob)}.</p>
+     *
+     * @return true when the companion was admitted by its controller's own encounter
+     */
+    public static boolean tryAddCompanion(Mob mob) {
+        if (mob == null) return false;
+        com.tactical.neoforge.api.companion.CompanionAdapter adapter =
+                com.tactical.neoforge.registry.companion.CompanionRegistry.find(mob);
+        if (adapter == null) return false;
+        UUID controllerId = adapter.controllerId(mob);
+        if (controllerId == null) return false;
+        ServerBattle battle = BattleManager.findFor(controllerId);
+        return battle != null && battle.tryAddCompanion(mob, adapter);
+    }
+
+    /** The battle currently owning this companion, or null. Identity-bearing, never positional. */
+    public static ServerBattle battleOfCompanion(LivingEntity companion) {
+        ServerBattle battle = BattleManager.containing(companion);
+        return battle != null && battle.isCompanion(companion) ? battle : null;
+    }
+
+    /** The controller of a hand-commanded companion, or null when this actor is not one. */
+    public static UUID companionController(LivingEntity companion) {
+        ServerBattle battle = BattleManager.containing(companion);
+        return battle == null ? null : battle.companionOwner(companion);
     }
 
     /** Null means this exact entity is outside the active encounter. */

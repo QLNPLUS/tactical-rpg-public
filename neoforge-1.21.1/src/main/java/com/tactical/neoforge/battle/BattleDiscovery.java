@@ -79,7 +79,7 @@ public final class BattleDiscovery {
             }
             entries.add(new NearbyBattlesPacket.Entry(battle.sessionId(), battle.managerName(),
                     (int) Math.round(Math.sqrt(distanceSq)), battle.memberCount(), battle.playerCapacity(),
-                    denial == BattleEligibility.Denial.NONE, describeForList(denial)));
+                    denial == BattleEligibility.Denial.NONE, BattleText.listDenial(denial)));
         }
         entries.sort(Comparator.comparingInt(NearbyBattlesPacket.Entry::distance)
                 .thenComparing(entry -> entry.sessionId().toString()));
@@ -126,16 +126,12 @@ public final class BattleDiscovery {
 
     /**
      * The invitation wording does not fit a self-service join, so the one shared status that mentions
-     * an invitation is rephrased here; every other reason is the single authoritative text.
+     * an invitation is rephrased for the list by {@link BattleText#listDenial}; every other reason is the
+     * single authoritative text.
      */
-    private static String describeForList(BattleEligibility.Denial denial) {
-        if (denial == BattleEligibility.Denial.NOT_A_SAFE_BOUNDARY) return "战斗正在结算动作，请稍后再试";
-        return BattleEligibility.describe(denial);
-    }
-
     private static JoinBattleResultPacket refusal(UUID sessionId, BattleEligibility.Denial denial) {
         UUID target = sessionId == null ? new UUID(0L, 0L) : sessionId;
-        return new JoinBattleResultPacket(target, denial, BattleEligibility.describe(denial));
+        return new JoinBattleResultPacket(target, denial, BattleText.denial(denial));
     }
 
     private static double distanceSquared(ServerBattle battle, ServerPlayer player) {

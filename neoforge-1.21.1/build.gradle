@@ -31,10 +31,6 @@ repositories {
         }
         filter { includeModule('com.github.yiran1457', 'YiRanExpressionLib') }
     }
-    maven {
-        name = 'sighs'
-        url = uri('https://maven.sighs.cc/repository/maven-releases/')
-    }
 }
 
 // Single source of truth for the MP05 isolated harness: run names, game directories,
@@ -42,10 +38,16 @@ repositories {
 // and the configuration check all read this map so the values cannot drift apart.
 def multiplayerServerHost = '127.0.0.1'
 def multiplayerHarness = [
+        // Bridge ports stay distinct from the plain client listener (25589) and from the read-only
+        // layout probe ports (25592 plain client, 25594/25595 for these two clients). Client B moved
+        // from 25591 to 25593 because another local project's long-running development server answers
+        // on 25591; nothing here is a release value.
         clientA: [run: 'clientMultiA', target: 'clientA', gameDir: 'run-multiplayer-a',
-                  username: 'TacticalA', uuid: 'bf8308eb-ed73-3ea9-b5fa-a235825ad642', bridgePort: 25590],
+                  username: 'TacticalA', uuid: 'bf8308eb-ed73-3ea9-b5fa-a235825ad642', bridgePort: 25590,
+                  probePort: 25594],
         clientB: [run: 'clientMultiB', target: 'clientB', gameDir: 'run-multiplayer-b',
-                  username: 'TacticalB', uuid: '72b726e2-87b6-3e68-a317-5b1b52afbe7a', bridgePort: 25591],
+                  username: 'TacticalB', uuid: '72b726e2-87b6-3e68-a317-5b1b52afbe7a', bridgePort: 25593,
+                  probePort: 25595],
         server : [run: 'serverMultiplayer', target: 'server', gameDir: 'run-multiplayer-server',
                   port: 25569],
 ]
@@ -56,6 +58,19 @@ neoForge {
     runs {
         client {
             client()
+            // Development-only, read-only UI layout probe (binds 127.0.0.1 only). It exists so the
+            // acceptance driver can locate native controls without hard-coded coordinates; it is
+            // absent from every release configuration.
+            systemProperty 'tactical.devprobe.port', '25592'
+            // Development-only server-side trace (admissions and isolation moves). Off unless the run
+            // asks for it, so a normal development client stays quiet and a release never sees it.
+            systemProperty 'tactical.dev.trace', (findProperty('tacticalDevTrace') ?: 'false')
+            // Development-only fault injection for the native entity-interaction receipt: `success` or
+            // `consume` makes an ordinary-priority listener cancel the scoped interaction with that
+            // cancellation result, so a real run can prove a cancelled interaction spends nothing. Empty
+            // (the default) means no injection at all.
+            systemProperty 'tactical.dev.cancelEntityInteract',
+                    (findProperty('tacticalCancelEntityInteract') ?: '')
             // Opt-in isolation for the literal `runClient` task: only when -PacceptanceGameDir=<dir> is passed
             // does the run use a separate game directory and auto-join the isolated server. The default
             // behaviour (shared run/ and its existing world) is untouched.
@@ -68,11 +83,6 @@ neoForge {
             client()
             systemProperty 'tactical.selftest', 'true'
             systemProperty 'tactical.selftest.battle', 'true'
-            programArguments.addAll '--quickPlayMultiplayer', '127.0.0.1:25565'
-        }
-        clientUiTest {
-            client()
-            systemProperty 'tactical.selftest.ui', 'true'
             programArguments.addAll '--quickPlayMultiplayer', '127.0.0.1:25565'
         }
         // Test-only acceptance run: independent game directory (git-ignored by run-*/) so the shared dev
@@ -111,6 +121,27 @@ neoForge {
             gameDirectory = file('run-server-ranged-test')
             systemProperty 'tactical.selftest', 'ranged'
         }
+        // Crossbow/tiped-arrow AI fixture: own isolated world, no shared dev world is touched.
+        serverRangedMobTest {
+            server()
+            gameDirectory = file('run-server-ranged-mob-test')
+            systemProperty 'tactical.selftest', 'ranged_mobs'
+        }
+        // Witch potion fixture: own isolated world and its own port, so it can never share a battle.
+        serverWitchTest {
+            server()
+            gameDirectory = file('run-server-witch-test')
+            systemProperty 'tactical.selftest', 'witch'
+        }
+        // Vindicator axe/door fixture: own isolated world and its own port, so it can never share a battle.
+        // Real oak doors, real axe damage and the real cancellable entity-break event are only decidable on a
+        // booted dedicated server; no client and no shared dev world is involved.
+        serverVindicatorTest {
+            server()
+            gameDirectory = file('run-server-vindicator-test')
+            systemProperty 'tactical.selftest', 'vindicator'
+            programArguments.addAll '--nogui'
+        }
         serverRegenerationTest {
             server()
             gameDirectory = file('run-server-regeneration-test')
@@ -141,6 +172,11 @@ neoForge {
             gameDirectory = file('run-server-reinforcement-test')
             systemProperty 'tactical.selftest', 'reinforcements'
         }
+        serverIsolationTest {
+            server()
+            gameDirectory = file('run-server-isolation-test')
+            systemProperty 'tactical.selftest', 'isolation'
+        }
         serverTeamsTest {
             server()
             gameDirectory = file('run-server-teams-test')
@@ -161,6 +197,49 @@ neoForge {
             gameDirectory = file('run-server-ap-test')
             systemProperty 'tactical.selftest', 'ap'
         }
+        // Server-side fixture for the item-on-entity branch (targets, permission, reach, menus, MP).
+        serverEntityItemTest {
+            server()
+            gameDirectory = file('run-server-entity-item-test')
+            systemProperty 'tactical.selftest', 'entity_item'
+        }
+        // Batch 4a: the only fixture that drives the native component codec, which needs a real
+        // FML/bootstrap context. Headless server, own directory and port; touches no battle state.
+        serverComponentIoTest {
+            server()
+            gameDirectory = file('run-server-component-io-test')
+            systemProperty 'tactical.selftest', 'component_io'
+        }
+        // Batch 4b1: the journal snapshot is a list of native components, so its wire can only be
+        // driven inside a booted game. Headless server, own directory and port; touches no battle state.
+        serverBattleLogTest {
+            server()
+            gameDirectory = file('run-server-battle-log-test')
+            systemProperty 'tactical.selftest', 'battle_log'
+        }
+        // Batch 4b2: the wording the server itself produces (journal rows, chat, command feedback, the
+        // damage breakdown, item refusals) can only be resolved against the shipped language tables and
+        // driven by real producers inside a booted server. Headless, own directory and port.
+        serverTextTest {
+            server()
+            gameDirectory = file('run-server-text-test')
+            systemProperty 'tactical.selftest', 'server_text'
+        }
+        // Batch 4b3a: the paged skill state carries three component frames per skill, which only exist
+        // inside a booted game. Headless server, own directory and port; touches no battle state.
+        serverSkillWireTest {
+            server()
+            gameDirectory = file('run-server-skill-wire-test')
+            systemProperty 'tactical.selftest', 'skill_wire'
+        }
+        // Batch 4b3b: the battle snapshot carries native component names and is published in bounded
+        // slices, and the discovery reasons are components too. Both only exist inside a booted game.
+        // Headless server, own directory and port; touches no battle state and starts no client.
+        serverBattleStateWireTest {
+            server()
+            gameDirectory = file('run-server-battle-state-wire-test')
+            systemProperty 'tactical.selftest', 'battle_state_wire'
+        }
         serverPositionTest {
             server()
             gameDirectory = file('run-server-position-test')
@@ -171,11 +250,28 @@ neoForge {
             gameDirectory = file('run-server-test')
             systemProperty 'tactical.selftest', 'regression'
         }
+        // 0.25: the two block commands and the forced fall. Real world, real native placement/break
+        // chains, own throwaway directory and port; it starts no client and touches no user world.
+        serverBlockTerrainTest {
+            server()
+            gameDirectory = file('run-server-block-terrain-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'block_terrain'
+        }
+        // 0.25: the character profile domain (levels, points, allocation) is its own fixture; the run
+        // entry lives here so both 0.25 fixtures are started the same way, one after the other.
+        serverProgressionTest {
+            server()
+            gameDirectory = file('run-server-progression-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'progression'
+        }
 
         // MP05 isolated two-client harness. Nothing here changes the plain `client`
         // or any existing run: these are additional runs with their own directories.
         //
-        // Ports: dedicated server 25569, AgentHelper bridge A 25590, bridge B 25591.
+        // Ports: dedicated server 25569, AgentHelper bridge A 25590, bridge B 25593, and the
+        // read-only layout probe A 25594 / B 25595 (the plain `client` run keeps 25592).
         // The two clients get explicit distinct `--username`/`--uuid`; MDG does not add
         // its own `--username` for these runs, so the option is never duplicated.
         // The offline UUIDs equal UUID.nameUUIDFromBytes("OfflinePlayer:<name>"), i.e.
@@ -183,9 +279,9 @@ neoForge {
         clientMultiA {
             client()
             gameDirectory = file(multiplayerHarness.clientA.gameDir)
-            // ApricityUI's external debug service binds a fixed ws://127.0.0.1:25321 and
-            // cannot serve two clients on one machine; the harness clients disable it.
-            systemProperty 'apricityui.debug.enabled', 'false'
+            // Read-only layout/text probe so a driver can locate a control and read the strings a
+            // frame really drew in this client's own language. Inert without the property.
+            systemProperty 'tactical.devprobe.port', multiplayerHarness.clientA.probePort.toString()
             programArguments.addAll '--username', multiplayerHarness.clientA.username,
                     '--uuid', multiplayerHarness.clientA.uuid,
                     '--quickPlayMultiplayer', "${multiplayerServerHost}:${multiplayerHarness.server.port}"
@@ -193,7 +289,7 @@ neoForge {
         clientMultiB {
             client()
             gameDirectory = file(multiplayerHarness.clientB.gameDir)
-            systemProperty 'apricityui.debug.enabled', 'false'
+            systemProperty 'tactical.devprobe.port', multiplayerHarness.clientB.probePort.toString()
             programArguments.addAll '--username', multiplayerHarness.clientB.username,
                     '--uuid', multiplayerHarness.clientB.uuid,
                     '--quickPlayMultiplayer', "${multiplayerServerHost}:${multiplayerHarness.server.port}"
@@ -202,6 +298,14 @@ neoForge {
             server()
             gameDirectory = file(multiplayerHarness.server.gameDir)
             // No Swing window: the harness clients own OS focus for real input checks.
+            programArguments.addAll '--nogui'
+        }
+        // Server-side companion self test (com.tactical.neoforge.battle.CompanionSelfTest): real recruitment,
+        // stamped orders, the shared guard and every release path on a real dedicated server.
+        serverCompanionTest {
+            server()
+            gameDirectory = file('run-server-companion-test')
+            systemProperty 'tactical.selftest', 'companion'
             programArguments.addAll '--nogui'
         }
         // Server-side multiplayer self test (com.tactical.neoforge.battle.MultiBattleSelfTest).
@@ -229,7 +333,6 @@ dependencies {
             prefer '1.0.1'
         }
     }
-    implementation "com.sighs:ApricityUI-neoforge-1.21.1:${apricity_version}"
 
     testImplementation platform("org.junit:junit-bom:5.10.2")
     testImplementation "org.junit.jupiter:junit-jupiter"
@@ -248,14 +351,6 @@ tasks.named("test", Test) {
 }
 
 tasks.withType(ProcessResources).configureEach {
-    from('../ui') {
-        into 'assets/apricityui/apricity/tactical'
-        // The journal UI uses the vanilla Minecraft font (every page sets aui-font-mode=mc) and no
-        // page or class references this file, so the leftover LXGW Marker Gothic file stays in the
-        // repository as history but is not shipped in the JAR. Its OFL text lives in licenses/.
-        exclude 'lxgw3500.ttf'
-    }
-
     var replaceProperties = [
             minecraft_version      : minecraft_version,
             minecraft_version_range: '[1.21.1,1.22)',
@@ -335,9 +430,6 @@ tasks.register('multiplayerRunConfigCheck') {
         }
         if (ports.contains(25589)) {
             problems << 'bridge port 25589 would collide with the default AgentHelper listener'
-        }
-        if (ports.contains(25321)) {
-            problems << 'port 25321 is bound by the ApricityUI debug service'
         }
         clients.each { cfg ->
             if (!(cfg.uuid ==~ /[0-9a-f]{8}-[0-9a-f]{4}-3[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/)) {

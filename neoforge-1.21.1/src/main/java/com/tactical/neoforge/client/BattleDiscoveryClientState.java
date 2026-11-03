@@ -7,6 +7,8 @@ import com.tactical.neoforge.network.NearbyBattlesRequestPacket;
 import net.minecraft.client.Minecraft;
 import net.neoforged.neoforge.network.PacketDistributor;
 
+import net.minecraft.network.chat.Component;
+
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -41,7 +43,13 @@ public final class BattleDiscoveryClientState {
     private static long requestCounter;
     private static long lastRequestTick = Long.MIN_VALUE;
     private static boolean awaiting;
-    private static String lastMessage = "";
+    /**
+     * The server's answer to this client's own join attempt, still as structure.
+     *
+     * <p>It is resolved only where it is drawn, so the answering client reads it in its current language
+     * and a language switch does not need another reply.</p>
+     */
+    private static Component lastMessage = Component.empty();
     private static long revision;
     private static UUID joining;
     /** Only the newest request may update the list; an older answer is stale. */
@@ -106,7 +114,7 @@ public final class BattleDiscoveryClientState {
     }
 
     public static long revision() { return revision; }
-    public static String lastMessage() { return lastMessage; }
+    public static Component lastMessage() { return lastMessage; }
     public static boolean awaiting() { return awaiting; }
     public static UUID joining() { return joining; }
 
@@ -323,7 +331,7 @@ public final class BattleDiscoveryClientState {
     public static void clear() {
         entries = List.of();
         DISMISSED.clear();
-        lastMessage = "";
+        lastMessage = Component.empty();
         awaiting = false;
         joining = null;
         refreshPending = false;

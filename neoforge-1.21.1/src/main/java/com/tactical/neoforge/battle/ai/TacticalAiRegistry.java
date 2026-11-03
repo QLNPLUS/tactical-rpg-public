@@ -20,6 +20,19 @@ public final class TacticalAiRegistry {
                 ignored -> new CreeperTacticalAi());
         register(ResourceLocation.withDefaultNamespace("skeleton"), EntityType.SKELETON,
                 SkeletonTacticalAi::new);
+        // Strays and bogged keep vanilla's own tipped arrow: the same bow adapter only chooses the cell.
+        register(ResourceLocation.withDefaultNamespace("stray"), EntityType.STRAY,
+                SkeletonTacticalAi::new);
+        register(ResourceLocation.withDefaultNamespace("bogged"), EntityType.BOGGED,
+                SkeletonTacticalAi::new);
+        register(ResourceLocation.withDefaultNamespace("pillager"), EntityType.PILLAGER,
+                PillagerTacticalAi::new);
+        // A witch drinks for herself and throws a real bottle; she never borrows a bow to imitate a potion.
+        register(ResourceLocation.withDefaultNamespace("witch"), EntityType.WITCH,
+                ignored -> new WitchTacticalAi());
+        // The vindicator keeps the vanilla axe and the vanilla swing; only its route may use a wooden door.
+        register(ResourceLocation.withDefaultNamespace("vindicator"), EntityType.VINDICATOR,
+                ignored -> new VindicatorTacticalAi());
         register(ResourceLocation.withDefaultNamespace("phantom"), EntityType.PHANTOM,
                 ignored -> new PhantomTacticalAi());
     }

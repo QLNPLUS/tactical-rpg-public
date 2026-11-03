@@ -102,6 +102,7 @@ public final class BattleProjectiles {
             Projectile projectile = entry.getKey();
             Flight flight = entry.getValue();
             if (projectile.isRemoved()) {
+                BattlePotionSplash.forget(projectile);
                 OWNERS.remove(projectile);
                 iterator.remove();
                 dirty = true;
@@ -135,6 +136,7 @@ public final class BattleProjectiles {
     public void clear() {
         for (var entry : flights.entrySet()) {
             if (!entry.getValue().settled) entry.getKey().discard();
+            BattlePotionSplash.forget(entry.getKey());
             OWNERS.remove(entry.getKey());
         }
         flights.clear();

@@ -3,6 +3,7 @@ package com.tactical.neoforge.battle;
 import com.mojang.authlib.GameProfile;
 import com.tactical.neoforge.Tactical;
 import com.tactical.neoforge.network.BattleStatePacket;
+import com.tactical.neoforge.network.ServerPackets;
 import io.netty.channel.embedded.EmbeddedChannel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.Connection;
@@ -115,6 +116,10 @@ public final class DeathSelfTest {
     }
 
     private static void setup(MinecraftServer server) {
+        // The logical battle snapshot is published as bounded parts since 0.24.0, so a connection-level
+        // observer no longer sees it. Read what the server itself really published instead; every assertion
+        // below is unchanged in meaning.
+        ServerPackets.startCapture();
         level = server.overworld();
         BlockPos spawn = level.getSharedSpawnPos();
         int floor = Math.min(level.getMaxBuildHeight() - 8, spawn.getY() + 16);
@@ -173,9 +178,9 @@ public final class DeathSelfTest {
         ServerBattle first = start(owner);
         RecordingConnection ownerWire = wire(owner);
         RecordingConnection outsiderWire = wire(outsider);
-        check(ownerWire.count(true) > 0, "positive control: active state crosses actual packet listener");
-        int ownerInactive = ownerWire.count(false);
-        int outsiderStates = outsiderWire.states.size();
+        check(stateCount(owner, true) > 0, "positive control: active state crosses actual packet listener");
+        int ownerInactive = stateCount(owner, false);
+        int outsiderStates = states(outsider).size();
         check(owner.getAttributeValue(Attributes.BLOCK_INTERACTION_RANGE) > blockReach, "battle extends owner reach");
         enemy.addEffect(new MobEffectInstance(MobEffects.MOVEMENT_SPEED, 600));
         BattleEffects.onTurnStart(enemy);
@@ -190,7 +195,7 @@ public final class DeathSelfTest {
         check(actualDeaths == 1 && !outsider.isAlive(), "outsider follows real cancellable vanilla death path");
         BattleManager.onServerTick(event);
         assertRunning(first, "outsider death cannot end owner's encounter or release enemy");
-        check(ownerWire.count(false) == ownerInactive && outsiderWire.states.size() == outsiderStates,
+        check(stateCount(owner, false) == ownerInactive && states(outsider).size() == outsiderStates,
                 "outsider death sends no tactical state to either client");
         speed.tick(enemy, () -> {});
         check(speed.getDuration() == 600, "outsider death does not unfreeze participant effects");
@@ -201,27 +206,33 @@ public final class DeathSelfTest {
         check(canceledDeaths == 1 && owner.isAlive(), "real LivingDeathEvent can be canceled and revive owner");
         BattleManager.onServerTick(event);
         assertRunning(first, "canceled owner death must retain encounter");
-        check(ownerWire.count(false) == ownerInactive, "canceled owner death does not emit exit");
+        check(stateCount(owner, false) == ownerInactive, "canceled owner death does not emit exit");
 
         kill(owner);
         check(!owner.isAlive() && actualDeaths == 2, "owner actually dies, without FakePlayer immunity");
         check(ownerWire.killPackets > 0, "vanilla death packet crosses actual listener");
+        // Everything below happens while the owner is really dead, so a snapshot published from here on was
+        // sent to a dead owner - which is exactly what the old per-send flag asserted.
+        int statesBeforeDeathTick = states(owner).size();
         BattleManager.onServerTick(event);
         check(BattleManager.current() == null && first.finished(), "owner death ends and removes encounter within one server tick");
         check(!enemy.isNoAi() && enemy.getTarget() == null && !BattleManager.isParticipant(enemy), "owner death releases mob AI, aggro and participation");
         check(owner.getAttributeValue(Attributes.BLOCK_INTERACTION_RANGE) == blockReach
                 && owner.getAttributeValue(Attributes.ENTITY_INTERACTION_RANGE) == entityReach, "dead owner's transient reach restored");
-        check(ownerWire.count(false) == ownerInactive + 1, "exactly one inactive S2C sent to dead owner connection");
-        check(ownerWire.states.get(ownerWire.states.size() - 1).deadAtSend, "inactive S2C was sent while owner was dead");
-        assertInactive(ownerWire.last());
-        check(outsiderWire.states.size() == outsiderStates, "owner death does not target outsider connection");
+        check(stateCount(owner, false) == ownerInactive + 1,
+                "exactly one inactive S2C sent to dead owner connection");
+        check(states(owner).size() == statesBeforeDeathTick + 1,
+                "the exit snapshot was published during the death tick, while the owner was dead");
+        check(!states(owner).get(statesBeforeDeathTick).active(), "and it is the inactive one");
+        assertInactive(lastState(owner));
+        check(states(outsider).size() == outsiderStates, "owner death does not target outsider connection");
         speed.tick(enemy, () -> {});
         check(speed.getDuration() == 599, "vanilla effect clock resumes after owner death");
         BattleEffects.onTurnStart(enemy);
         check(speed.getDuration() == 599, "owner death forgets old turn-clock baseline");
         BattleManager.onServerTick(event);
         first.tick();
-        check(ownerWire.count(false) == ownerInactive + 1, "finished encounter cannot resend late exit");
+        check(stateCount(owner, false) == ownerInactive + 1, "finished encounter cannot resend late exit");
         check(!BattleManager.start(owner, true), "dead owner cannot immediately restart encounter");
 
         ServerPlayer deadOwner = owner;
@@ -231,7 +242,7 @@ public final class DeathSelfTest {
         check(owner != deadOwner && owner.getUUID().equals(deadOwner.getUUID()), "respawn is distinct entity with same UUID");
         NeoForge.EVENT_BUS.post(new PlayerEvent.PlayerRespawnEvent(owner, false));
         check(BattleManager.current() == null && !BattleManager.isParticipant(owner), "replacement cannot inherit finished encounter");
-        assertInactive(wire(owner).last());
+        assertInactive(lastState(owner));
         check(owner.getAttributeValue(Attributes.BLOCK_INTERACTION_RANGE) == blockReach, "replacement has no stale reach modifier");
         enemy.removeAllEffects();
         ServerBattle second = start(owner);
@@ -245,13 +256,13 @@ public final class DeathSelfTest {
 
         remove(outsider);
         outsider = player(event.getServer(), outsider.getUUID(), "DeathOutsider", -3);
-        int secondInactive = wire(owner).count(false);
+        int secondInactive = stateCount(owner, false);
         NeoForge.EVENT_BUS.post(new PlayerEvent.PlayerRespawnEvent(outsider, false));
         NeoForge.EVENT_BUS.post(new PlayerEvent.PlayerLoggedInEvent(outsider));
         NeoForge.EVENT_BUS.post(new PlayerEvent.PlayerLoggedOutEvent(outsider));
         assertRunning(second, "outsider respawn/login/logout cannot terminate owner's encounter");
-        check(wire(owner).count(false) == secondInactive, "outsider lifecycle cannot reset owner client");
-        assertInactive(wire(outsider).last());
+        check(stateCount(owner, false) == secondInactive, "outsider lifecycle cannot reset owner client");
+        assertInactive(lastState(outsider));
 
         // Race regression: replacement arrives before the next battle tick sees death.
         ServerPlayer oldReplacement = owner;
@@ -262,13 +273,13 @@ public final class DeathSelfTest {
         NeoForge.EVENT_BUS.post(new PlayerEvent.PlayerRespawnEvent(owner, false));
         check(BattleManager.current() == null && second.finished() && !enemy.isNoAi(), "same-UUID respawn before tick releases stale encounter");
         check(!BattleManager.isParticipant(owner), "early replacement not retained as participant");
-        assertInactive(wire(owner).last());
+        assertInactive(lastState(owner));
         ServerBattle third = start(owner);
         staleIntents(oldReplacement);
         check(BattleManager.current() == third && !third.finished(), "older same-UUID entity cannot stop newly started encounter");
         NeoForge.EVENT_BUS.post(new PlayerEvent.PlayerLoggedOutEvent(owner));
         check(BattleManager.current() == null && third.finished() && !enemy.isNoAi(), "owner logout releases only owner's encounter");
-        assertInactive(wire(owner).last());
+        assertInactive(lastState(owner));
     }
 
     private static ServerBattle start(ServerPlayer actor) {
@@ -315,6 +326,28 @@ public final class DeathSelfTest {
         return connections.stream().filter(connection -> connection.player == player).findFirst().orElseThrow();
     }
 
+    /** Every battle snapshot the server really published to this player, oldest first. */
+    private static List<BattleStatePacket> states(ServerPlayer player) {
+        List<BattleStatePacket> result = new ArrayList<>();
+        for (var payload : ServerPackets.capturedFor(player.getUUID())) {
+            if (payload instanceof BattleStatePacket state) result.add(state);
+        }
+        return result;
+    }
+
+    /** How many published snapshots carried that activity flag. */
+    private static int stateCount(ServerPlayer player, boolean active) {
+        int count = 0;
+        for (BattleStatePacket state : states(player)) if (state.active() == active) count++;
+        return count;
+    }
+
+    private static BattleStatePacket lastState(ServerPlayer player) {
+        List<BattleStatePacket> published = states(player);
+        check(!published.isEmpty(), "server published a tactical state for this player");
+        return published.get(published.size() - 1);
+    }
+
     private static void remove(ServerPlayer player) {
         if (!player.isRemoved()) level.removePlayerImmediately(player, Entity.RemovalReason.DISCARDED);
     }
@@ -331,6 +364,7 @@ public final class DeathSelfTest {
         if (level != null) for (BlockPos chunk : forcedChunks) level.setChunkForced(chunk.getX(), chunk.getZ(), false);
         players.clear();
         connections.clear();
+        ServerPackets.stopCapture();
         forcedChunks.clear();
         BattleEffects.clear();
         server.halt(false);
@@ -344,10 +378,7 @@ public final class DeathSelfTest {
         if (!condition) throw new AssertionError(message);
     }
 
-    private record SentState(BattleStatePacket packet, boolean deadAtSend) {}
-
     private static final class RecordingConnection extends Connection {
-        private final List<SentState> states = new ArrayList<>();
         private EmbeddedChannel channel;
         private ServerPlayer player;
         private int killPackets;
@@ -356,19 +387,9 @@ public final class DeathSelfTest {
 
         @Override
         public void send(Packet<?> packet, PacketSendListener listener, boolean flush) {
-            if (packet instanceof ClientboundCustomPayloadPacket custom && custom.payload() instanceof BattleStatePacket state) {
-                states.add(new SentState(state, player != null && !player.isAlive()));
-            }
+            // The tactical snapshot travels as bounded parts since 0.24.0 and is observed through the server's
+            // own publication capture; only ordinary vanilla packets are still recorded here.
             if (packet instanceof ClientboundPlayerCombatKillPacket) killPackets++;
-        }
-
-        private int count(boolean active) {
-            return (int) states.stream().filter(state -> state.packet.active() == active).count();
-        }
-
-        private BattleStatePacket last() {
-            check(!states.isEmpty(), "connection recorded a tactical state");
-            return states.get(states.size() - 1).packet;
         }
     }
 }

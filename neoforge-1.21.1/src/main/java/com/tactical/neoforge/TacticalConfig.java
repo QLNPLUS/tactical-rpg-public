@@ -30,6 +30,11 @@ public final class TacticalConfig {
     public final ModConfigSpec.IntValue crossbowApCost;
     public final ModConfigSpec.IntValue itemApCost;
     public final ModConfigSpec.IntValue placeApCost;
+    public final ModConfigSpec.IntValue breakApCost;
+    public final ModConfigSpec.IntValue witchDrinkApCost;
+    public final ModConfigSpec.IntValue witchThrowApCost;
+    public final ModConfigSpec.IntValue witchDrinkCooldownTurns;
+    public final ModConfigSpec.DoubleValue witchHealThreshold;
     public final ModConfigSpec.IntValue initialMp;
     public final ModConfigSpec.IntValue outsideMpRecovery;
     public final ModConfigSpec.IntValue outsideMpInterval;
@@ -41,6 +46,17 @@ public final class TacticalConfig {
     public final ModConfigSpec.DoubleValue damageHeightPerLevel;
     public final ModConfigSpec.DoubleValue damageHeightMin;
     public final ModConfigSpec.DoubleValue damageHeightMax;
+    public final ModConfigSpec.IntValue progressionMaxLevel;
+    public final ModConfigSpec.IntValue progressionStatCap;
+    public final ModConfigSpec.IntValue progressionPointsPerLevel;
+    public final ModConfigSpec.IntValue progressionXpBase;
+    public final ModConfigSpec.IntValue progressionXpPerLevel;
+    public final ModConfigSpec.DoubleValue progressionVigorHp;
+    public final ModConfigSpec.DoubleValue progressionMindMp;
+    public final ModConfigSpec.DoubleValue progressionEnduranceAp;
+    public final ModConfigSpec.DoubleValue progressionStrengthDamage;
+    public final ModConfigSpec.DoubleValue progressionDexterityCharge;
+    public final ModConfigSpec.DoubleValue progressionIntelligenceSkillPower;
 
     private TacticalConfig(ModConfigSpec.Builder builder) {
         builder.push("battle");
@@ -80,6 +96,18 @@ public final class TacticalConfig {
         itemApCost = builder.defineInRange("itemCost", 8, 1, 1_000_000);
         placeApCost = builder.comment("Movement, defend and flee do not advance the shared paid action count. Native tactical:max_ap stays a percentage: saved value 100 now means cap150 for every movement speed. Native tactical:ap_recovery is absolute AP, default50.")
                 .defineInRange("placeCost", 10, 1, 1_000_000);
+        breakApCost = builder.comment("Base AP cost of one block break through the block action. It shares the same successful-action surcharge and battle-zone/tool checks as placement.")
+                .defineInRange("breakCost", 10, 1, 1_000_000);
+        builder.pop();
+        builder.push("witch");
+        witchDrinkApCost = builder.comment("Base AP cost of one witch self-drink; it shares the same successful-action surcharge as other main actions and is not a player item cost.")
+                .defineInRange("drinkCost", 25, 1, 1_000_000);
+        witchThrowApCost = builder.comment("Base AP cost of one thrown splash potion. One bottle is one main action.")
+                .defineInRange("throwCost", 15, 1, 1_000_000);
+        witchDrinkCooldownTurns = builder.comment("Own-turn gap between two witch self-drinks: with 3 she may drink on her 1st own turn, not on the 2nd or 3rd, and again on the 4th. All her self-drinks share this one cooldown; wall-clock time, other units' turns and reopening a menu never reduce it.")
+                .defineInRange("drinkCooldownTurns", 3, 1, 100);
+        witchHealThreshold = builder.comment("Health fraction below which a witch spends her drink on ordinary healing (the emergency heal at 0.25 is fixed by the ruleset). A drink is only started when at least one whole healing dose would land.")
+                .defineInRange("healThreshold", 0.5D, 0.05D, 1.0D);
         builder.pop();
         builder.push("mana");
         initialMp=builder.comment("Used once only when an actor has no saved MP balance. Entering battle never refills MP.")
@@ -109,6 +137,34 @@ public final class TacticalConfig {
         damageHeightMax = builder.comment("Upper height multiplier bound.")
                 .defineInRange("max", 1.15, 0.0, 1_000_000.0);
         builder.pop();
+        builder.pop();
+        // Character growth. Every value here is priced and enforced by the server; a page that was opened
+        // under an earlier rule set is refused instead of being charged at the new price (see
+        // com.tactical.neoforge.progression.ProgressionStore, which advances the profile revision when the
+        // rule fingerprint changes). Changing pointsPerLevel never rewrites points already granted.
+        builder.push("progression");
+        progressionMaxLevel = builder.comment("Character level cap. Reaching it refuses further level-ups without touching owned points.")
+                .defineInRange("max_level", 100, 1, 1_000_000);
+        progressionStatCap = builder.comment("Displayed value cap of one stat; the displayed baseline is 10.")
+                .defineInRange("stat_cap", 99, 10, 1_000_000);
+        progressionPointsPerLevel = builder.comment("Points granted per character level. Raising or lowering it never retracts or grants historical points.")
+                .defineInRange("points_per_level", 1, 0, 1_000_000);
+        progressionXpBase = builder.comment("Vanilla XP price of the first level-up (level 1 -> 2).")
+                .defineInRange("xp_base", 100, 0, 1_000_000_000);
+        progressionXpPerLevel = builder.comment("Additional vanilla XP per character level already reached: price = xp_base + xp_per_level * (level - 1).")
+                .defineInRange("xp_per_level", 50, 0, 1_000_000_000);
+        progressionVigorHp = builder.comment("Max health added per invested vigor point.")
+                .defineInRange("vigor_hp", 2.0, 0.0, 1_000_000.0);
+        progressionMindMp = builder.comment("Max MP added per invested mind point.")
+                .defineInRange("mind_mp", 5.0, 0.0, 1_000_000.0);
+        progressionEnduranceAp = builder.comment("Percent points added to tactical:max_ap per invested endurance point; 100 stays 100 percent.")
+                .defineInRange("endurance_ap", 2.0, 0.0, 1_000_000.0);
+        progressionStrengthDamage = builder.comment("Attack damage added per invested strength point.")
+                .defineInRange("strength_damage", 0.5, 0.0, 1_000_000.0);
+        progressionDexterityCharge = builder.comment("Turn charge multiplier added per invested dexterity point; does not touch attack or movement speed.")
+                .defineInRange("dexterity_charge", 0.01, 0.0, 1_000_000.0);
+        progressionIntelligenceSkillPower = builder.comment("Skill damage multiplier added per invested intelligence point; applied once to core skill damage, never to plain attacks, costs, cooldowns or effect levels.")
+                .defineInRange("intelligence_skill_power", 0.02, 0.0, 1_000_000.0);
         builder.pop();
     }
 }

@@ -37,17 +37,19 @@ class ClientLifecycleRetirementTest {
 
     private static BattleStatePacket state(UUID session, long generation, long epoch) {
         return new BattleStatePacket(true, 2, (int) epoch + 1, 80, 150, 10,
-                0, 64, 0, new int[]{0, 64, 0}, "actor", List.of("actor"), 1,
-                "sword", 0, 0, 0, 64, 0, 24, false, 100, new int[]{100, 20, 20}, new int[]{50},
+                0, 64, 0, new int[]{0, 64, 0}, net.minecraft.network.chat.Component.literal("actor"),
+                List.of(net.minecraft.network.chat.Component.literal("actor")), 1,
+                net.minecraft.network.chat.Component.literal("sword"), 0, 0, 0, 64, 0, 24, false, 100, new int[]{100, 20, 20}, new int[]{50},
                 1, false, new int[]{100},
-                10, 8, 10, 50, 0, session, epoch, SERVER, generation);
+                10, 8, 10, 10, 50, 0, false,session, epoch, SERVER, generation);
     }
 
     private static BattleStatePacket exit(UUID session, long generation) {
         return new BattleStatePacket(false, com.tactical.core.combat.BattlePhase.INACTIVE.ordinal(),
-                1, 0, 0, 0, 0, 0, 0, new int[0], "", List.of(), 0, "", 0, 0,
+                1, 0, 0, 0, 0, 0, 0, new int[0], net.minecraft.network.chat.Component.empty(), List.of(), 0,
+                net.minecraft.network.chat.Component.empty(), 0, 0,
                 0, 0, 0, 0, false, -1, new int[0], new int[0], 0, false, new int[0],
-                0, 0, 0, 0, 0, session, 0L, SERVER, generation);
+                0, 0, 0, 0, 0, 0, false, session, 0L, SERVER, generation);
     }
 
     private static BattleLogPacket journal(UUID session, long generation, long sequence, String text) {
@@ -320,9 +322,10 @@ class ClientLifecycleRetirementTest {
 
         UUID next = UUID.randomUUID();
         BattleClientLifecycle.accept(new BattleStatePacket(true, 2, 2, 80, 150, 10,
-                0, 64, 0, new int[]{0, 64, 0}, "actor", List.of("actor"), 1,
-                "sword", 0, 0, 0, 64, 0, 24, false, 100, new int[]{100, 20, 20}, new int[]{50},
-                1, false, new int[]{100}, 10, 8, 10, 50, 0, next, 1L, 9999L, 1L));
+                0, 64, 0, new int[]{0, 64, 0}, net.minecraft.network.chat.Component.literal("actor"),
+                List.of(net.minecraft.network.chat.Component.literal("actor")), 1,
+                net.minecraft.network.chat.Component.literal("sword"), 0, 0, 0, 64, 0, 24, false, 100, new int[]{100, 20, 20}, new int[]{50},
+                1, false, new int[]{100}, 10, 8, 10, 10, 50, 0, false,next, 1L, 9999L, 1L));
         assertTrue(BattleClientState.active, "a different server instance may start its own counter");
         assertEquals(next, BattleClientState.sessionId);
     }

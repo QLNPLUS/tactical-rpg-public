@@ -172,6 +172,23 @@ public final class BattleManager {
         return false;
     }
 
+    /**
+     * True when a body box would overlap any other live encounter of the same dimension.
+     *
+     * <p>Used to keep an evicted mob out of somebody else's battlefield. The test is on the whole
+     * box, not on the feet cell: a wide mob whose feet cell sits outside can still reach into the
+     * zone with its body.</p>
+     */
+    static boolean insideAnyZone(ServerLevel level, AABB box, ServerBattle except) {
+        if (level == null || box == null) return false;
+        for (ServerBattle other : INDEX.all()) {
+            if (other == except || other.finished()) continue;
+            if (other.level() != level) continue;
+            if (BattleDeployment.overlapsZone(box, other.zone().bounds())) return true;
+        }
+        return false;
+    }
+
     // ------------------------------------------------------------------ tick
 
     private static boolean autoTriggerEnabled() {
@@ -246,7 +263,7 @@ public final class BattleManager {
     /** Aggro suppression granted by a successful flee. */
     public static void grantFleeImmunity(ServerPlayer player) {
         FleeProtection.give(player);
-        message(player, "脱离战斗，10 秒内敌对生物不会重新锁定你");
+        message(player, BattleText.translatable(BattleText.KEY_CHAT_FLEE_IMMUNITY));
     }
 
     public static boolean isImmune(ServerPlayer player) {
@@ -286,7 +303,7 @@ public final class BattleManager {
         // A fighter never founds a second encounter by accident; other players keeping their own
         // battle no longer blocks this one.
         if (findFor(player.getUUID()) != null) {
-            message(player, "你已在战斗中");
+            message(player, BattleText.translatable(BattleText.KEY_CHAT_ALREADY_IN_BATTLE));
             return false;
         }
         ServerBattle created;
@@ -294,7 +311,7 @@ public final class BattleManager {
             created = new ServerBattle((ServerLevel) player.level(), player);
         } catch (RuntimeException failure) {
             Tactical.LOGGER.error("[Tactical] battle construction failed", failure);
-            message(player, "战斗创建失败，请稍后重试");
+            message(player, BattleText.translatable(BattleText.KEY_CHAT_CREATE_FAILED));
             return false;
         }
         boolean started = false;
@@ -302,25 +319,25 @@ public final class BattleManager {
             // Register and claim the founder, and refuse an overlapping battlefield, before start()
             // mutates any entity. A refused start therefore leaves every other encounter untouched.
             if (!registerBattle(created) || !claimActor(created, player.getUUID())) {
-                message(player, "战斗创建冲突，请稍后重试");
+                message(player, BattleText.translatable(BattleText.KEY_CHAT_CREATE_CONFLICT));
                 return false;
             }
             if (zoneConflicts(created, created.zone())) {
-                message(player, "附近已有其它战斗正在进行，请先结束或离开那里");
+                message(player, BattleText.translatable(BattleText.KEY_CHAT_ZONE_CONFLICT));
                 return false;
             }
             if (!created.start(force)) {
-                message(player, force
-                        ? "附近没有可以接管的敌对生物"
-                        : "附近没有对你有仇恨的敌对生物");
+                message(player, BattleText.translatable(force
+                        ? BattleText.KEY_CHAT_NO_HOSTILE_FORCED
+                        : BattleText.KEY_CHAT_NO_HOSTILE));
                 return false;
             }
             started = true;
-            message(player, "进入回合制战斗 · 左键点格子移动 · /tactical turn end 结束回合");
+            message(player, BattleText.translatable(BattleText.KEY_CHAT_BATTLE_STARTED));
             return true;
         } catch (RuntimeException failure) {
             Tactical.LOGGER.error("[Tactical] battle start failed; discarding this encounter", failure);
-            message(player, "战斗开始失败，已放弃本场");
+            message(player, BattleText.translatable(BattleText.KEY_CHAT_START_FAILED));
             return false;
         } finally {
             // Whatever step refused, returned early or threw, the registry entry and the founder's
@@ -332,22 +349,26 @@ public final class BattleManager {
         }
     }
 
-    private static void message(ServerPlayer player, String text) {
-        if (player != null && player.connection != null) {
-            player.sendSystemMessage(Component.literal("[Tactical] " + text));
-        }
+    /** One chat line of this mod; the marker stays literal, the body is whatever structure it is given. */
+    private static void message(ServerPlayer player, Component text) {
+        BattleText.chat(player, text);
     }
 
     /** Explicit stop of one player; other members keep the encounter. */
     public static void stop(ServerPlayer player) {
-        leave(player, "stopped by command");
+        leave(player, BattleText.exitReason(BattleText.Exit.COMMAND));
     }
 
     /**
      * Identity-scoped exit. An unrelated player's death/logout is a no-op, and a member
      * leaving never ends the encounter for the remaining players.
      */
+    /** Legacy form: the reason is already text and stays literal. */
     public static boolean leave(ServerPlayer player, String reason) {
+        return leave(player, BattleText.literal(reason));
+    }
+
+    public static boolean leave(ServerPlayer player, Component reason) {
         ServerBattle battle = findFor(player.getUUID());
         if (battle == null) return false;
         boolean removed = battle.leave(player, reason);
@@ -360,7 +381,7 @@ public final class BattleManager {
     }
 
     /** Respawn boundary: release the stale member instance, never admit the replacement. */
-    static boolean releaseReplacedMember(ServerBattle battle, ServerPlayer replacement, String reason) {
+    static boolean releaseReplacedMember(ServerBattle battle, ServerPlayer replacement, Component reason) {
         if (battle == null || replacement == null) return false;
         boolean released = battle.releaseReplacedMember(replacement.getUUID(), replacement, reason);
         if (released && (battle.finished() || battle.memberCount() == 0)) INDEX.remove(battle.sessionId());
@@ -374,14 +395,15 @@ public final class BattleManager {
         if (requester == null || target == null) return BattleEligibility.Denial.UNRESOLVED;
         ServerBattle battle = findFor(requester.getUUID());
         if (battle == null) {
-            message(requester, "你不在战斗中");
+            message(requester, BattleText.translatable(BattleText.KEY_CHAT_NOT_IN_BATTLE));
             return BattleEligibility.Denial.UNRESOLVED;
         }
         BattleEligibility.Denial denial = battle.invite(requester, target);
         if (denial == BattleEligibility.Denial.NONE) {
             offerInvite(target, requester, battle.sessionId());
         } else {
-            message(requester, BattleEligibility.describe(denial));
+            // The denial is a stable code; the wording is built here instead of reusing describe().
+            message(requester, BattleText.denial(denial));
         }
         return denial;
     }
@@ -395,14 +417,17 @@ public final class BattleManager {
         String declineCommand = sessionId == null
                 ? "/tactical battle decline"
                 : "/tactical battle decline " + sessionId;
-        Component accept = Component.literal("[接受]").withStyle(style -> style
+        // The button labels are keyed, the commands and their styles are unchanged.
+        Component accept = BattleText.translatable(BattleText.KEY_CHAT_ACCEPT).withStyle(style -> style
                 .withColor(ChatFormatting.GREEN)
                 .withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND, acceptCommand)));
-        Component decline = Component.literal("[拒绝]").withStyle(style -> style
+        Component decline = BattleText.translatable(BattleText.KEY_CHAT_DECLINE).withStyle(style -> style
                 .withColor(ChatFormatting.RED)
                 .withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND, declineCommand)));
-        target.sendSystemMessage(Component.literal("[Tactical] " + requester.getGameProfile().getName()
-                + " 邀请你加入回合制战斗  ").append(accept).append(Component.literal("  ")).append(decline));
+        BattleText.chat(target, BattleText.translatable(BattleText.KEY_CHAT_INVITE,
+                        BattleText.name(requester.getGameProfile().getName()))
+                .append(Component.literal("  ")).append(accept)
+                .append(Component.literal("  ")).append(decline));
     }
 
     /**
@@ -415,23 +440,23 @@ public final class BattleManager {
         if (player == null) return BattleEligibility.Denial.UNRESOLVED;
         if (sessionId == null) return accept(player);
         if (findFor(player.getUUID()) != null) {
-            message(player, "你已在战斗中");
+            message(player, BattleText.translatable(BattleText.KEY_CHAT_ALREADY_IN_BATTLE));
             return BattleEligibility.Denial.ALREADY_MEMBER;
         }
         ServerBattle battle = findById(sessionId);
         if (battle == null || battle.finished()) {
-            message(player, BattleEligibility.describe(BattleEligibility.Denial.SESSION_CLOSED));
+            message(player, BattleText.denial(BattleEligibility.Denial.SESSION_CLOSED));
             return BattleEligibility.Denial.SESSION_CLOSED;
         }
         if (battle.session().invitation(player.getUUID(), player.level().getGameTime()) == null) {
-            message(player, BattleEligibility.describe(BattleEligibility.Denial.NO_INVITE));
+            message(player, BattleText.denial(BattleEligibility.Denial.NO_INVITE));
             return BattleEligibility.Denial.NO_INVITE;
         }
         BattleEligibility.Denial denial = battle.join(player);
         if (denial == BattleEligibility.Denial.NONE) {
             announceJoin(player, battle);
         } else {
-            message(player, BattleEligibility.describe(denial));
+            message(player, BattleText.denial(denial));
         }
         return denial;
     }
@@ -444,7 +469,7 @@ public final class BattleManager {
      * client-side authorization depends on it.</p>
      */
     static void announceJoin(ServerPlayer player, ServerBattle battle) {
-        message(player, "已加入战斗 · 等待自己的回合");
+        message(player, BattleText.translatable(BattleText.KEY_CHAT_JOINED));
         com.tactical.neoforge.network.ServerPackets.sendUncheckedType(player,
                 new com.tactical.neoforge.network.JoinBattleResultPacket(battle.sessionId(),
                         BattleEligibility.Denial.NONE, ""));
@@ -456,12 +481,12 @@ public final class BattleManager {
         if (sessionId == null) return decline(player);
         ServerBattle battle = findById(sessionId);
         if (battle == null || battle.finished()) {
-            message(player, BattleEligibility.describe(BattleEligibility.Denial.SESSION_CLOSED));
+            message(player, BattleText.denial(BattleEligibility.Denial.SESSION_CLOSED));
             return BattleEligibility.Denial.SESSION_CLOSED;
         }
         BattleEligibility.Denial denial = battle.decline(player);
-        if (denial == BattleEligibility.Denial.NONE) message(player, "已拒绝邀请");
-        else message(player, BattleEligibility.describe(denial));
+        if (denial == BattleEligibility.Denial.NONE) message(player, BattleText.translatable(BattleText.KEY_CHAT_DECLINED));
+        else message(player, BattleText.denial(denial));
         return denial;
     }
 
@@ -476,17 +501,17 @@ public final class BattleManager {
     public static BattleEligibility.Denial accept(ServerPlayer player) {
         if (player == null) return BattleEligibility.Denial.UNRESOLVED;
         if (findFor(player.getUUID()) != null) {
-            message(player, "你已在战斗中");
+            message(player, BattleText.translatable(BattleText.KEY_CHAT_ALREADY_IN_BATTLE));
             return BattleEligibility.Denial.ALREADY_MEMBER;
         }
         List<ServerBattle> inviting = sessionsInviting(player.getUUID(), player.level().getGameTime());
         if (inviting.isEmpty()) {
-            message(player, BattleEligibility.describe(BattleEligibility.Denial.NO_INVITE));
+            message(player, BattleText.denial(BattleEligibility.Denial.NO_INVITE));
             return BattleEligibility.Denial.NO_INVITE;
         }
         if (inviting.size() > 1) {
             // Never guess: joining the wrong encounter would move resources between battles.
-            message(player, "你有 " + inviting.size() + " 个战斗邀请，请在战斗列表中选择要加入的一场");
+            message(player, BattleText.translatable(BattleText.KEY_CHAT_MULTIPLE_INVITES_JOIN, inviting.size()));
             return BattleEligibility.Denial.UNRESOLVED;
         }
         ServerBattle battle = inviting.get(0);
@@ -494,7 +519,7 @@ public final class BattleManager {
         if (denial == BattleEligibility.Denial.NONE) {
             announceJoin(player, battle);
         } else {
-            message(player, BattleEligibility.describe(denial));
+            message(player, BattleText.denial(denial));
         }
         return denial;
     }
@@ -511,16 +536,16 @@ public final class BattleManager {
         if (player == null) return BattleEligibility.Denial.UNRESOLVED;
         List<ServerBattle> inviting = sessionsInviting(player.getUUID(), player.level().getGameTime());
         if (inviting.isEmpty()) {
-            message(player, BattleEligibility.describe(BattleEligibility.Denial.NO_INVITE));
+            message(player, BattleText.denial(BattleEligibility.Denial.NO_INVITE));
             return BattleEligibility.Denial.NO_INVITE;
         }
         if (inviting.size() > 1) {
-            message(player, "你有 " + inviting.size() + " 个战斗邀请，请在战斗列表中选择要拒绝的一场");
+            message(player, BattleText.translatable(BattleText.KEY_CHAT_MULTIPLE_INVITES_DECLINE, inviting.size()));
             return BattleEligibility.Denial.UNRESOLVED;
         }
         BattleEligibility.Denial denial = inviting.get(0).decline(player);
-        if (denial == BattleEligibility.Denial.NONE) message(player, "已拒绝邀请");
-        else message(player, BattleEligibility.describe(denial));
+        if (denial == BattleEligibility.Denial.NONE) message(player, BattleText.translatable(BattleText.KEY_CHAT_DECLINED));
+        else message(player, BattleText.denial(denial));
         return denial;
     }
 
@@ -605,9 +630,24 @@ public final class BattleManager {
         if (battle != null) battle.placeBlock(player, stamp, slot, pos, face, hit);
     }
 
-    public static void useItem(ServerPlayer player, ActionStamp stamp, int slot) {
+    public static void breakBlock(ServerPlayer player, ActionStamp stamp, int slot,
+                                  net.minecraft.core.BlockPos pos) {
         ServerBattle battle = memberBattle(player);
-        if (battle != null) battle.useItem(player, stamp, slot);
+        if (battle != null) battle.breakBlock(player, stamp, slot, pos);
+    }
+
+    public static void useItem(ServerPlayer player, ActionStamp stamp, int slot) {
+        useItem(player, stamp, slot, null);
+    }
+
+    /**
+     * @param target the entity the item should be used on, or null for the original self use. Only this
+     *               identity travels: the server resolves it in the member's own level and re-runs every
+     *               range, sight and cost rule before the native interaction happens.
+     */
+    public static void useItem(ServerPlayer player, ActionStamp stamp, int slot, java.util.UUID target) {
+        ServerBattle battle = memberBattle(player);
+        if (battle != null) battle.useItem(player, stamp, slot, target);
     }
 
     // ---- fixture-only wrappers -------------------------------------------------

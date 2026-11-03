@@ -7,6 +7,7 @@ public final class CursorPickPolicyPureTest {
         check(CursorPickPolicy.usesCollider(BattleMode.MOVE), "move uses collision ground");
         check(CursorPickPolicy.usesCollider(BattleMode.SKILL), "skill uses collision ground");
         check(!CursorPickPolicy.usesCollider(BattleMode.PLACE), "place preserves outline surfaces");
+        check(!CursorPickPolicy.usesCollider(BattleMode.BREAK), "break preserves outline surfaces");
         check(!CursorPickPolicy.usesCollider(BattleMode.USE_ITEM), "item use preserves outline");
         check(!CursorPickPolicy.usesCollider(BattleMode.NONE), "idle hover preserves outline");
         System.out.println("CursorPickPolicyPureTest: 6 checks passed");
