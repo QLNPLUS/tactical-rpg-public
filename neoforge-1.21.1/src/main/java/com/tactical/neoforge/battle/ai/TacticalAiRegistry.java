@@ -35,6 +35,10 @@ public final class TacticalAiRegistry {
                 ignored -> new VindicatorTacticalAi());
         register(ResourceLocation.withDefaultNamespace("phantom"), EntityType.PHANTOM,
                 ignored -> new PhantomTacticalAi());
+        // Exact type only: a blaze is the one caster that fires its own native small fireballs, and no other
+        // monster may inherit that adapter by sharing a superclass.
+        register(ResourceLocation.withDefaultNamespace("blaze"), EntityType.BLAZE,
+                ignored -> new BlazeTacticalAi());
     }
 
     private TacticalAiRegistry() { }

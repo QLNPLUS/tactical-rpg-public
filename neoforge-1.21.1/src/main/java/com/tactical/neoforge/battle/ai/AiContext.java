@@ -85,6 +85,29 @@ public interface AiContext {
     default void clearPendingDrink() { }
 
     /**
+     * Quoted price of one blaze salvo this own turn, or 0 for an actor with no native fireball at all.
+     *
+     * <p>Read from the same server state that charges the action, so a planner can never validate a salvo the
+     * execution path then prices differently.</p>
+     */
+    default int fireballCost() { return com.tactical.core.combat.BattleRules.BLAZE_VOLLEY_COST; }
+
+    /** Authoritative legality of one native salvo from a hypothetical feet cell; independent of facing. */
+    default boolean canFireballFrom(GridPos from) { return false; }
+
+    /**
+     * Whether the entity's own reach and line of sight allow a native melee from that cell.
+     *
+     * <p>Grid adjacency is a movement fact, not a reach fact: an aerial actor is cube-adjacent to cells its body
+     * cannot touch. An adapter whose movement is not ground adjacency answers with the entity's real distance
+     * gate instead of inheriting a longer reach from the grid.</p>
+     */
+    default boolean inNativeMeleeReach(GridPos from) { return false; }
+
+    /** One native salvo as this own turn's main action; false when it was refused and nothing was charged. */
+    default boolean fireballVolley() { return false; }
+
+    /**
      * Everything the door-breaking melee tactics need, read once from the same authoritative terrain the
      * action will be charged and moved on. A context that cannot break doors answers
      * {@link VindicatorRoute#NONE}, which makes the door tactic decline instead of inventing a free break.

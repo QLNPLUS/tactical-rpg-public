@@ -133,6 +133,14 @@ public final class BattleAiSession {
                 }
                 return AiResolution.END_TURN;
             }
+            case FIREBALL_VOLLEY -> {
+                // One commit point: the server re-checks the locked opponent, the geometry and the frozen price,
+                // starts the vanilla charge and charges nothing until a real fireball has joined the world.
+                if (context.fireballVolley()) {
+                    participant.adapter.onActionResolved(action.kind());
+                }
+                return AiResolution.END_TURN;
+            }
             case BREAK_DOOR -> {
                 // One commit point: the server re-checks the same pair, the real protection chain, the frozen
                 // price and the actor's standing, and only a real removal charges anything. A refused break
@@ -265,6 +273,11 @@ public final class BattleAiSession {
         if (action.kind() == AiAction.Kind.THROW_POTION
                 && (context.witch().throwCost() <= 0 || context.ap() < context.witch().throwCost()
                 || context.target() == null || !context.canThrowFrom(context.actorCell()))) {
+            return AiAction.endTurn();
+        }
+        if (action.kind() == AiAction.Kind.FIREBALL_VOLLEY
+                && (context.fireballCost() <= 0 || context.ap() < context.fireballCost()
+                || !context.canFireballFrom(context.actorCell()))) {
             return AiAction.endTurn();
         }
         if (action.kind() == AiAction.Kind.BREAK_DOOR) {

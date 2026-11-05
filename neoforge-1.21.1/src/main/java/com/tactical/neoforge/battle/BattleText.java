@@ -66,6 +66,8 @@ public final class BattleText {
     public static final String KEY_ATTACK_ENEMY_RANGED = "tactical.journal.attack.enemy_ranged";
     public static final String KEY_ATTACK_ENEMY_DRINK = "tactical.journal.attack.enemy_drink";
     public static final String KEY_ATTACK_ENEMY_THROW = "tactical.journal.attack.enemy_throw";
+    /** One blaze salvo: a single paid main action however many fireballs it really fired. */
+    public static final String KEY_ATTACK_ENEMY_FIREBALL = "tactical.journal.attack.enemy_fireball";
     public static final String KEY_WEAPON_BOW = "tactical.journal.weapon.bow";
     public static final String KEY_WEAPON_CROSSBOW = "tactical.journal.weapon.crossbow";
 
@@ -85,6 +87,12 @@ public final class BattleText {
     public static final String KEY_ENEMY_FLIGHT_BLOCKED = "tactical.journal.enemy.flight_blocked";
     public static final String KEY_ENEMY_DIVE_MISSED = "tactical.journal.enemy.dive_missed";
     public static final String KEY_ENEMY_NO_SHOT = "tactical.journal.enemy.no_shot";
+    /** The blaze's own charge started; the wall-clock number is the vanilla charge length. */
+    public static final String KEY_ENEMY_FIREBALL_CHARGE = "tactical.journal.enemy.fireball_charge";
+    /** The charge finished and the first fireball can leave; nothing is charged until it really does. */
+    public static final String KEY_ENEMY_FIREBALL_READY = "tactical.journal.enemy.fireball_ready";
+    /** A salvo refused before any fireball existed: nothing was paid. */
+    public static final String KEY_ENEMY_NO_FIREBALL = "tactical.journal.enemy.no_fireball";
     public static final String KEY_ENEMY_RETARGET = "tactical.journal.enemy.retarget";
     public static final String KEY_ENEMY_ROCKET_UNSUPPORTED = "tactical.journal.enemy.rocket_unsupported";
     public static final String KEY_ENEMY_NO_THROW = "tactical.journal.enemy.no_throw";

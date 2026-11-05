@@ -9,6 +9,13 @@ public final class BattleRules {
 
     public static final int BOW_COST = 15;
     public static final int CROSSBOW_COST = 20;
+    /**
+     * Base price of one blaze fireball salvo: the mod's own design value, not a vanilla fact.
+     *
+     * <p>A blaze fires up to three native fireballs in one own turn, but they are one main action, so the
+     * price is one salvo price and never a per-projectile price.</p>
+     */
+    public static final int BLAZE_VOLLEY_COST = 20;
     public static final int FLEE_COST = 50;
 
     public static final int FLEE_IMMUNITY_TICKS = 200;

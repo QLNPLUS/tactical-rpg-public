@@ -18,6 +18,9 @@ config = "tactical.creeper.mixins.json"
 config = "tactical.witch.mixins.json"
 
 [[mixins]]
+config = "tactical.blaze.mixins.json"
+
+[[mixins]]
 config = "tactical.server.mixins.json"
 
 [[mods]]

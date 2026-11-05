@@ -5,6 +5,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.util.Mth;
+import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.FlyingMob;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.monster.Phantom;
@@ -35,7 +36,10 @@ public final class AerialMovement {
 
     /** Movement policy is broader than the exact-type tactical attack adapter registry. */
     public static boolean supports(LivingEntity actor) {
-        return actor instanceof Phantom || actor instanceof FlyingMob || actor instanceof Vex;
+        return actor instanceof Phantom || actor instanceof FlyingMob || actor instanceof Vex
+                // Exact vanilla type: a blaze carries itself in this encounter's turn-based terms, and no other
+                // monster may be opted into air movement by sharing a superclass with it.
+                || actor != null && actor.getType() == EntityType.BLAZE;
     }
 
     /** Preserve the actual fractional altitude/position when clear; relocation is strictly bounded. */

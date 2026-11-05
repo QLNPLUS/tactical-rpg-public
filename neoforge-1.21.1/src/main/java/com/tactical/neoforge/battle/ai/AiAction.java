@@ -17,6 +17,14 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
         DRINK_POTION,
         /** Throw one brew at the locked opponent; the real splash potion is created on the server. */
         THROW_POTION,
+        /**
+         * One blaze salvo at the locked opponent: the vanilla charge and up to three native fireballs.
+         *
+         * <p>The intent carries nothing the server would trust - the opponent, the price and the geometry are
+         * re-resolved from the same state that charges the action - so a stale plan cannot fire at a target the
+         * turn never locked.</p>
+         */
+        FIREBALL_VOLLEY,
         /** Break one closed wooden door pair; ends the own turn and keeps the remaining AP. */
         BREAK_DOOR
     }
@@ -88,4 +96,6 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
     }
     public static AiAction of(Kind kind) { return new AiAction(kind, List.of()); }
     public static AiAction endTurn() { return of(Kind.END_TURN); }
+    /** One salvo at the opponent this own turn locked; the server owns charge, count and price. */
+    public static AiAction fireballVolley() { return of(Kind.FIREBALL_VOLLEY); }
 }

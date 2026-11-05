@@ -31,6 +31,8 @@ public final class TacticalConfig {
     public final ModConfigSpec.IntValue itemApCost;
     public final ModConfigSpec.IntValue placeApCost;
     public final ModConfigSpec.IntValue breakApCost;
+    /** Base price of one blaze fireball salvo: the mod's own design value, not a vanilla fact. */
+    public final ModConfigSpec.IntValue blazeVolleyApCost;
     public final ModConfigSpec.IntValue witchDrinkApCost;
     public final ModConfigSpec.IntValue witchThrowApCost;
     public final ModConfigSpec.IntValue witchDrinkCooldownTurns;
@@ -98,6 +100,8 @@ public final class TacticalConfig {
                 .defineInRange("placeCost", 10, 1, 1_000_000);
         breakApCost = builder.comment("Base AP cost of one block break through the block action. It shares the same successful-action surcharge and battle-zone/tool checks as placement.")
                 .defineInRange("breakCost", 10, 1, 1_000_000);
+        blazeVolleyApCost = builder.comment("Base AP cost of one blaze fireball salvo. A salvo is one main action however many fireballs it really fires, and it shares the same successful-action surcharge as every other main action.")
+                .defineInRange("blazeVolleyCost", com.tactical.core.combat.BattleRules.BLAZE_VOLLEY_COST, 1, 1_000_000);
         builder.pop();
         builder.push("witch");
         witchDrinkApCost = builder.comment("Base AP cost of one witch self-drink; it shares the same successful-action surcharge as other main actions and is not a player item cost.")

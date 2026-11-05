@@ -133,6 +133,14 @@ neoForge {
             gameDirectory = file('run-server-witch-test')
             systemProperty 'tactical.selftest', 'witch'
         }
+        // Blaze fireball fixture: its own throwaway world and an ephemeral port. Real charges, real native small
+        // fireballs, the real collision rule and the real hand-back are only decidable on a booted server.
+        serverBlazeTest {
+            server()
+            gameDirectory = file('run-server-blaze-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'blaze'
+        }
         // Vindicator axe/door fixture: own isolated world and its own port, so it can never share a battle.
         // Real oak doors, real axe damage and the real cancellable entity-break event are only decidable on a
         // booted dedicated server; no client and no shared dev world is involved.

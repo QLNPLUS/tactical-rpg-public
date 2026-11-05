@@ -52,11 +52,13 @@ import net.minecraft.world.Difficulty;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.ai.attributes.AttributeModifier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.entity.monster.Blaze;
 import net.minecraft.world.entity.monster.Vindicator;
 import net.minecraft.world.entity.monster.Witch;
 import net.minecraft.world.entity.projectile.ThrownPotion;
@@ -152,6 +154,14 @@ public final class ServerBattle {
     private final Map<UUID, PlayerMember> members = new LinkedHashMap<>();
     private BattleRelationPolicy relations = BattleRelationPolicy.pve();
     private BattleZone zone;
+    /**
+     * The one blaze salvo this encounter is currently driving, or null.
+     *
+     * <p>Only the actor whose own turn is running can own it, so a single field is the whole state: the stage
+     * arithmetic and its hard deadline live in {@link BlazeVolley}, and every exit path (actor gone, target
+     * gone, deadline, encounter end) clears it here.</p>
+     */
+    private BlazeVolley blazeVolley;
 
     private final TurnScheduler queue = new TurnScheduler();
     // Includes both hostile and friendly mobs; side-sensitive rules must use hostileCount().
@@ -448,6 +458,9 @@ public final class ServerBattle {
         boolean projectileChanged = projectiles.tick();
         removeDeadEnemies();
         if (finished) return;
+        // The blaze salvo owns the turn while it runs: charge first, then its three shots, then hand back.
+        tickBlazeVolley();
+        if (finished) return;
         ai.tick();
         // Vanilla gravity still runs with NoAI. Only airborne-policy actors are pinned,
         // and never while their authoritative own-turn trajectory is advancing.
@@ -539,6 +552,12 @@ public final class ServerBattle {
         abortWitchDrink(null);
         projectiles.clear();
         BattlePotionSplash.clear(this);
+        // No salvo and no marked fireball may outlive the encounter: the charge bit and the collision rule both
+        // belong to this encounter's control, not to the entity.
+        BlazeVolley endingVolley = blazeVolley;
+        blazeVolley = null;
+        if (endingVolley != null) setBlazeCharged(enemies.get(endingVolley.actorId()), false);
+        BlazeFireballs.clearBattle(this);
         ai.clear();
         // Effects belong to the actor, so they are released per unit of THIS encounter. A global
         // clear would also drop another running encounter's effect clocks, burning baselines and
@@ -1238,6 +1257,8 @@ public final class ServerBattle {
         Vec3 originalPosition = mob.position();
         LivingEntity originalTarget = mob.getTarget();
         float originalFallDistance = mob.fallDistance;
+        // Declared outside the transaction so a failed admission can still give the blaze its own charge back.
+        boolean originalBlazeCharged = false;
         TacticalWitchAccess.WitchDrink witchDrink = null;
         WitchBrew pendingDrink = null;
         try {
@@ -1249,6 +1270,11 @@ public final class ServerBattle {
                 witchDrink = witchAccess(witch).tactical$takeDrink();
                 if (witchDrink != null) pendingDrink = WitchBrews.brewOf(witchDrink.potion());
             }
+            // A blaze can be admitted while vanilla already has it charged. NoAI only stops the goal that would
+            // clear that bit, so the encounter takes the transient state out of the entity here: the only charge
+            // shown from now on is this session's own 60 ticks.
+            originalBlazeCharged = isBlazeActor(mob) && blazeCharged(mob);
+            if (isBlazeActor(mob)) setBlazeCharged(mob, false);
             mob.setNoAi(true);
             mob.setPersistenceRequired();
             mob.getNavigation().stop();
@@ -1263,7 +1289,8 @@ public final class ServerBattle {
             int initiative = ApCalculator.initiative(attribute(mob, Attributes.ATTACK_SPEED),
                     attribute(mob, Attributes.MOVEMENT_SPEED), level.random.nextInt(10));
             EnemyState state = new EnemyState(mob, cell, initialAp(maxAp), maxAp, moveCost, initiative, side,
-                    originalNoAi, originalPersistenceRequired, originalPosition, originalTarget, originalFallDistance);
+                    originalNoAi, originalPersistenceRequired, originalPosition, originalTarget, originalFallDistance,
+                    originalBlazeCharged);
             state.witchDrink = witchDrink;
             state.pendingDrink = pendingDrink;
             // One cooldown object per unit, so two witches can never advance each other's drink.
@@ -1286,7 +1313,7 @@ public final class ServerBattle {
             else {
                 ai.remove(mob);
                 restoreUnit(mob, originalNoAi, originalPersistenceRequired, originalPosition, originalTarget,
-                        originalFallDistance);
+                        originalFallDistance, originalBlazeCharged);
                 if (witchDrink != null && mob instanceof Witch witch) {
                     witchAccess(witch).tactical$restoreDrink(witchDrink);
                 }
@@ -1346,7 +1373,8 @@ public final class ServerBattle {
         if (state == null || state.mob == null) return;
         ai.remove(state.mob);
         restoreUnit(state.mob, state.originalNoAi, state.originalPersistenceRequired,
-                state.originalPosition, state.originalTarget, state.originalFallDistance);
+                state.originalPosition, state.originalTarget, state.originalFallDistance,
+                state.originalBlazeCharged);
         // A rolled-back admission never charged for the drink it froze, so the unit gets it back untouched.
         if (state.witchDrink != null && state.mob instanceof Witch witch) {
             witchAccess(witch).tactical$restoreDrink(state.witchDrink);
@@ -1358,9 +1386,13 @@ public final class ServerBattle {
 
     /** Put one unit's own state back; touches nothing else in the world. */
     private void restoreUnit(Mob mob, boolean originalNoAi, boolean originalPersistenceRequired,
-                             Vec3 originalPosition, LivingEntity originalTarget, float originalFallDistance) {
+                             Vec3 originalPosition, LivingEntity originalTarget, float originalFallDistance,
+                             boolean originalBlazeCharged) {
         BattleEffects.forget(mob);
         mob.getNavigation().stop();
+        // A failed admission gives the entity back its own transient charge bit, because this encounter never
+        // owned it long enough to keep it.
+        if (isBlazeActor(mob)) setBlazeCharged(mob, originalBlazeCharged);
         mob.setNoAi(originalNoAi);
         // Vanilla has no "set false"; the accessor restores the exact original flag in both
         // directions, so a rolled-back unit is not left permanently persistent.
@@ -3003,7 +3035,7 @@ public final class ServerBattle {
     /** A main action that must hit the locked opponent, so losing that opponent cannot be silently re-aimed. */
     private static boolean targetedAction(AiAction.Kind kind) {
         return kind == AiAction.Kind.MELEE || kind == AiAction.Kind.RANGED || kind == AiAction.Kind.SKILL
-                || kind == AiAction.Kind.THROW_POTION;
+                || kind == AiAction.Kind.THROW_POTION || kind == AiAction.Kind.FIREBALL_VOLLEY;
     }
 
     /**
@@ -3479,6 +3511,282 @@ public final class ServerBattle {
     private void refuseShot(EnemyState enemy, String key) {
         journal.record("enemy", BattleText.translatable(key, BattleText.name(enemy.mob)));
         sendState();
+    }
+
+    // ------------------------------------------------------------------
+    // blaze: one native salvo per own turn
+    // ------------------------------------------------------------------
+
+    /** A blaze is the one actor this ruleset gives a native fireball; never a superclass check. */
+    private static boolean isBlazeActor(Mob mob) {
+        return mob != null && mob.getType() == EntityType.BLAZE;
+    }
+
+    /**
+     * Quoted price of this actor's next salvo, or 0 when it has no native fireball at all.
+     *
+     * <p>20 AP is the ruleset's own design value for one salvo and is configurable; the +25% per prior paid
+     * action of this own turn is applied by the same quote every other main action uses.</p>
+     */
+    private int blazeVolleyCost(EnemyState enemy) {
+        if (enemy == null || !isBlazeActor(enemy.mob)) return 0;
+        return quote(intConfig(TacticalConfig.INSTANCE.blazeVolleyApCost, BlazeVolley.DEFAULT_AP_COST),
+                enemy.paidActions);
+    }
+
+    /**
+     * Authoritative legality of one native salvo from a hypothetical feet cell.
+     *
+     * <p>The ceiling is the ruleset's 16 blocks and is additionally clamped by the entity's real follow range,
+     * so the mod's number never overrides what the body can actually see. A blocked line is a real refusal.</p>
+     */
+    private boolean canFireballFrom(EnemyState state, LivingEntity opponent, GridPos from) {
+        if (state == null || opponent == null || from == null || !isBlazeActor(state.mob)) return false;
+        if (opponent.level() != level || !opponent.isAlive() || opponent.isRemoved()) return false;
+        if (!opposed(state.mob, opponent)) return false;
+        if (participantCell(opponent) == null) return false;
+        // The real geometry, not the grid centre: an airborne blaze keeps a fractional offset from its cell and
+        // the native fireball leaves from half its body height plus half a block, aimed at the target's own mid
+        // point. The distance ceiling is the same decision on the same two points.
+        Vec3 origin = fireballOrigin(state, from);
+        Vec3 aim = new Vec3(opponent.getX(), opponent.getY(0.5D), opponent.getZ());
+        if (origin == null || aim.distanceTo(origin) > fireballRangeLimit(state)) return false;
+        return fireballLineClear(state, origin, aim);
+    }
+
+    /** Where this actor's native fireball would really leave from, for the cell it would stand at. */
+    private Vec3 fireballOrigin(EnemyState state, GridPos from) {
+        if (state == null || from == null || state.mob == null) return null;
+        Vec3 feet = AerialMovement.feet(from, state.airOffset);
+        return new Vec3(feet.x, feet.y + state.mob.getBbHeight() * 0.5D + 0.5D, feet.z);
+    }
+
+    private double fireballRangeLimit(EnemyState state) {
+        return Math.min(BlazeTacticalAi.MAXIMUM_RANGE, state.mob.getAttributeValue(Attributes.FOLLOW_RANGE));
+    }
+
+    /** The native straight line to the target mid point; a blocked line is a real refusal, not a lob. */
+    private boolean fireballLineClear(EnemyState state, Vec3 origin, Vec3 aim) {
+        if (origin == null || aim == null) return false;
+        net.minecraft.world.phys.BlockHitResult hit = level.clip(new net.minecraft.world.level.ClipContext(
+                origin, aim, net.minecraft.world.level.ClipContext.Block.COLLIDER,
+                net.minecraft.world.level.ClipContext.Fluid.NONE, state.mob));
+        return hit.getType() == net.minecraft.world.phys.HitResult.Type.MISS
+                || hit.getLocation().distanceToSqr(origin) >= aim.distanceToSqr(origin) - 0.05D;
+    }
+
+    /**
+     * Whether the body itself could melee from that cell.
+     *
+     * <p>Vanilla's blaze picks melee at {@code distanceToSqr < 4.0} and needs a line of sight; an aerial actor is
+     * cube-adjacent to cells two blocks away, so grid adjacency must not be read as reach here.</p>
+     */
+    private boolean inNativeMeleeReach(EnemyState state, LivingEntity opponent, GridPos from) {
+        if (state == null || opponent == null || from == null) return false;
+        if (opponent.level() != level || !opponent.isAlive() || opponent.isRemoved()) return false;
+        GridPos target = participantCell(opponent);
+        if (target == null) return false;
+        // Real position, including the airborne offset the encounter preserved: a blaze nine tenths of a block
+        // away from its cell centre is not at the cell centre for vanilla's own d0 < 4.0 gate.
+        Vec3 feet = AerialMovement.feet(from, state.airOffset);
+        double dx = feet.x - opponent.getX();
+        double dy = feet.y - opponent.getY();
+        double dz = feet.z - opponent.getZ();
+        return dx * dx + dy * dy + dz * dz < 4.0D && hasLineOfSight(from, target, state.mob);
+    }
+
+    /**
+     * Start one salvo: pre-check everything, freeze the price, own the charge - charge nothing yet.
+     *
+     * <p>Nothing about the entity is borrowed or mutated except vanilla's own charge bit, which is cleared on
+     * every exit path. The paid commit happens in {@link #fireBlazeShot} and only once a fireball really joined
+     * the world, so a refused or cancelled salvo leaves AP, the paid-action count and the bar untouched.</p>
+     *
+     * @return true when this own turn now owns a running salvo
+     */
+    private boolean startBlazeVolley(EnemyState state) {
+        if (state == null || !isBlazeActor(state.mob) || blazeVolley != null) return false;
+        LivingEntity target = actionOpponent(state);
+        if (target == null || !isActorTurn(state.mob) || isBusy()) return false;
+        int cost = blazeVolleyCost(state);
+        if (cost <= 0 || state.ap < cost) return false;
+        if (!canFireballFrom(state, target, state.cell)) {
+            journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_NO_FIREBALL,
+                    BattleText.name(state.mob)));
+            sendState();
+            return false;
+        }
+        blazeVolley = new BlazeVolley(state.mob.getUUID(), target.getUUID(), turnEpoch(), cost, ticks);
+        setBlazeCharged(state, true);
+        journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_FIREBALL_CHARGE,
+                BattleText.name(state.mob), BlazeVolley.CHARGE_TICKS));
+        sendState();
+        return true;
+    }
+
+    /**
+     * Advance the running salvo by one server tick.
+     *
+     * <p>The salvo holds the turn: {@link #rangedBusy()} reports it, so nothing else acts, no other unit is
+     * planned and the queue cannot advance. Every path ends here with a bounded hand-back.</p>
+     */
+    private void tickBlazeVolley() {
+        BlazeVolley volley = blazeVolley;
+        if (volley == null) return;
+        EnemyState state = enemies.get(volley.actorId());
+        boolean sameTurn = !ending && state != null && state.mob.isAlive() && !state.mob.isRemoved()
+                && state.mob.level() == level && volley.actorId().toString().equals(queue.current())
+                && volley.epoch() == turnEpoch();
+        if (!sameTurn) {
+            stopBlazeVolley();
+            return;
+        }
+        if (volley.expired(ticks)) {
+            // The hard ceiling reclaims whatever is still flying for this actor, so the deadline cannot leave a
+            // marked projectile behind the turned page.
+            BlazeFireballs.clearOwner(this, volley.actorId());
+            stopBlazeVolley();
+            if (!finished && !ending) advanceTurn();
+            return;
+        }
+        if (volley.charging() && volley.chargeDue(ticks)) {
+            volley.settleCharge();
+            journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_FIREBALL_READY,
+                    BattleText.name(state.mob)));
+            sendState();
+        }
+        if (volley.shotDue(ticks) && !fireBlazeShot(state, volley)) {
+            // A shot that could not be fired ends the volley: no retry, no re-aim, no refund.
+            volley.stopRemaining();
+        }
+        if (volley.complete(ticks, projectiles.pending())) {
+            stopBlazeVolley();
+            if (!finished && !ending) advanceTurn();
+        }
+    }
+
+    /**
+     * Fire exactly one real fireball, and commit the frozen price only when the world really took it.
+     *
+     * <p>The capture scope is what makes the outcome authoritative: a join that an event cancelled produces no
+     * tracked projectile, so nothing is charged and no mark is left behind. A failure thrown after an earlier
+     * shot already joined leaves that shot in the world and does not refund it.</p>
+     */
+    private boolean fireBlazeShot(EnemyState state, BlazeVolley volley) {
+        LivingEntity target = actionOpponent(state);
+        if (target == null || !target.getUUID().equals(volley.targetId())) return false;
+        if (target.level() != level || !target.isAlive() || target.isRemoved() || !opposed(state.mob, target)) {
+            return false;
+        }
+        if (!canFireballFrom(state, target, state.cell)) return false;
+        GridPos targetCell = participantCell(target);
+        if (targetCell != null) faceDirection(state.mob, targetCell);
+        boolean first = volley.shotsFired() == 0;
+        if (first && state.ap < volley.price()) {
+            // The charge ran for 60 ticks; a legal state change in between must not buy a free fireball or push
+            // the balance negative. The quote itself is never re-read and nothing already fired is taken back.
+            journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_NO_FIREBALL,
+                    BattleText.name(state.mob)));
+            sendState();
+            return false;
+        }
+        RuntimeException[] nativeFailure = new RuntimeException[1];
+        int fired = projectiles.capture(state.mob, null, () -> {
+            try {
+                BlazeFireballs.launch(level, (Blaze) state.mob, target, this, volley.targetId());
+            } catch (RuntimeException failure) {
+                nativeFailure[0] = failure;
+            }
+        });
+        if (nativeFailure[0] != null) {
+            Tactical.LOGGER.error("[Tactical] native blaze fireball failed for {} after {} projectile(s)",
+                    state.mob.getUUID(), Math.max(0, fired), nativeFailure[0]);
+        }
+        if (fired <= 0) {
+            if (first) {
+                // A salvo that never produced a fireball is a refusal, not a paid miss: say so and charge nothing.
+                journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_NO_FIREBALL,
+                        BattleText.name(state.mob)));
+                sendState();
+            }
+            return false;
+        }
+        volley.onShotFired(ticks);
+        if (first) {
+            // One paid main action for the whole salvo, committed at the first projectile that really exists.
+            state.ap -= volley.price();
+            state.paidActions++;
+            journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_ENEMY_FIREBALL,
+                    BattleText.name(state.mob), BattleText.name(target)));
+        }
+        sendState();
+        return true;
+    }
+
+    /** Clear the running salvo and its charge presentation; never touches a projectile already in flight. */
+    private void stopBlazeVolley() {
+        BlazeVolley volley = blazeVolley;
+        blazeVolley = null;
+        if (volley == null) return;
+        setBlazeCharged(enemies.get(volley.actorId()), false);
+    }
+
+    private static boolean blazeCharged(Mob mob) {
+        return mob instanceof com.tactical.neoforge.battle.ai.TacticalBlazeAccess access && access.tactical$isCharged();
+    }
+
+    private static void setBlazeCharged(Mob mob, boolean charged) {
+        if (mob instanceof com.tactical.neoforge.battle.ai.TacticalBlazeAccess access) {
+            access.tactical$setCharged(charged);
+        }
+    }
+
+    private static void setBlazeCharged(EnemyState state, boolean charged) {
+        if (state != null && state.mob instanceof com.tactical.neoforge.battle.ai.TacticalBlazeAccess access) {
+            access.tactical$setCharged(charged);
+        }
+    }
+
+    /**
+     * End this encounter's salvo for that exact actor and give its charge presentation back.
+     *
+     * <p>Used by every exit: death, removal, unload, an abandoned fall and a normal release. The {@code fallback}
+     * state is the one the caller still holds when the roster entry is already gone, so the charge bit is cleared
+     * even then and a released blaze never keeps a burning pose it did not earn.</p>
+     */
+    private void dropBlazeVolleyFor(UUID actorId, EnemyState fallback) {
+        if (actorId == null) return;
+        // Order matters: the actor's real fireballs are discarded while the encounter still owns them, so no
+        // projectile is left in the sky after the unit stops being controlled.
+        BlazeFireballs.clearOwner(this, actorId);
+        BlazeVolley volley = blazeVolley;
+        if (volley != null && actorId.equals(volley.actorId())) blazeVolley = null;
+        EnemyState state = enemies.get(actorId);
+        setBlazeCharged(state != null ? state : fallback, false);
+    }
+
+    /**
+     * Whether one of this encounter's marked fireballs may affect a candidate where it really landed.
+     *
+     * <p>Only this encounter's living, opposed participants count: the shooter itself, a same-side unit, a
+     * bystander, an uninvited pet and another encounter's unit are all refused, and a non-living body is refused
+     * by the caller before this is ever asked. Because the refusal happens at the collision entry, the target is
+     * never ignited, hurt or given post-attack enchantment effects in the first place.</p>
+     */
+    public boolean acceptsFireball(UUID actorId, Entity candidate) {
+        if (finished || ending || actorId == null || candidate == null) return false;
+        EnemyState shooter = enemies.get(actorId);
+        if (shooter == null || shooter.mob == null || shooter.mob.isRemoved() || !shooter.mob.isAlive()) return false;
+        if (candidate == shooter.mob) return false;
+        if (!(candidate instanceof LivingEntity victim)) return false;
+        if (victim.level() != level || !victim.isAlive() || victim.isRemoved()) return false;
+        if (!opposed(shooter.mob, victim)) return false;
+        if (victim instanceof ServerPlayer player) {
+            PlayerMember member = members.get(player.getUUID());
+            return member != null && member.entity == player;
+        }
+        EnemyState state = enemies.get(victim.getUUID());
+        return state != null && state.mob == victim;
     }
 
     // ------------------------------------------------------------------
@@ -4004,6 +4312,14 @@ public final class ServerBattle {
             public int rangedCost() { return mobRangedCost(state); }
             public boolean canRangedAttack(GridPos from) { return canShootFrom(state, opponent, from); }
             public void rangedAttackPlayer() { ServerBattle.this.shootOpponent(state); }
+            public int fireballCost() { return blazeVolleyCost(state); }
+            public boolean canFireballFrom(GridPos from) {
+                return ServerBattle.this.canFireballFrom(state, opponent, from);
+            }
+            public boolean inNativeMeleeReach(GridPos from) {
+                return ServerBattle.this.inNativeMeleeReach(state, opponent, from);
+            }
+            public boolean fireballVolley() { return ServerBattle.this.startBlazeVolley(state); }
             public void attackPlayer() { ServerBattle.this.attackPlayer(state); }
             public WitchState witch() { return witchState(state); }
             public boolean canThrowFrom(GridPos from) { return ServerBattle.this.canThrowFrom(state, opponent, from); }
@@ -4058,6 +4374,8 @@ public final class ServerBattle {
         }
         if (finished || !enemy.mob.getUUID().toString().equals(queue.current())) return;
         if(pendingEnemyShot!=null && rangedBusy()) return;
+        // The salvo owns the turn until it hands back itself; advancing here would cut its own charge short.
+        if (blazeVolley != null) return;
         // The presented drink settles itself and only then hands the turn over.
         if (witchDrinking()) return;
         advanceTurn();
@@ -4342,6 +4660,10 @@ public final class ServerBattle {
         Mob mob = state.mob;
         BattleEffects.forget(mob);
         mob.getNavigation().stop();
+        // The salvo and the vanilla charge bit belong to this encounter's control, so releasing the unit gives
+        // both back before anything else is restored.
+        dropBlazeVolleyFor(mob.getUUID(), state);
+        setBlazeCharged(state, false);
         mob.setNoAi(state.originalNoAi);
         // Vanilla has no "set false"; the accessor restores the exact original flag in both directions.
         ((com.tactical.neoforge.mixin.BattleMobPersistenceAccess) mob)
@@ -4691,6 +5013,7 @@ public final class ServerBattle {
                 if (current != null && current.equals(entry.getKey().toString())) removedCurrent = true;
                 EnemyState departed = entry.getValue();
                 iterator.remove();
+                dropBlazeVolleyFor(entry.getKey(), departed);
                 if (departed.companionAdapter != null) {
                     // Death, removal and an unloaded chunk all end this companion's control. The release path
                     // is idempotent and gives the unit's own flags back without teleporting or healing it.
@@ -4878,7 +5201,9 @@ public final class ServerBattle {
     public int paidActionCount() { return successfulPaidActions(); }
 
     private boolean rangedBusy() {
-        return projectiles.pending() || awaitingShotResolution;
+        // A running blaze salvo owns the turn exactly like a tracked projectile does: charge, shots and the
+        // hand-back are one bounded action, so nothing else may act or advance while it lasts.
+        return projectiles.pending() || awaitingShotResolution || blazeVolley != null;
     }
 
     private boolean hasMovingEnemies() {
@@ -5513,6 +5838,7 @@ public final class ServerBattle {
             if (enemy != null) {
                 String id = unit.id().toString();
                 boolean acting = id.equals(queue.current());
+                dropBlazeVolleyFor(unit.id(), enemy);
                 enemies.remove(unit.id());
                 queue.remove(id);
                 BattleEffects.forget(enemy.mob);
@@ -5977,6 +6303,8 @@ public final class ServerBattle {
         final Vec3 originalPosition;
         final LivingEntity originalTarget;
         final float originalFallDistance;
+        /** The blaze charge bit vanilla had at admission, kept only so a failed admission can give it back. */
+        final boolean originalBlazeCharged;
         boolean skillUsed;
         GridPos cell;
         int ap;
@@ -6022,8 +6350,9 @@ public final class ServerBattle {
 
         EnemyState(Mob mob, GridPos cell, int ap, int maxAp, int moveCost, int initiative, BattleSide side,
                    boolean originalNoAi, boolean originalPersistenceRequired, Vec3 originalPosition,
-                   LivingEntity originalTarget, float originalFallDistance) {
+                   LivingEntity originalTarget, float originalFallDistance, boolean originalBlazeCharged) {
             this.mob = mob;
+            this.originalBlazeCharged = originalBlazeCharged;
             this.side = side;
             this.originalNoAi = originalNoAi;
             this.originalPersistenceRequired = originalPersistenceRequired;
