@@ -39,6 +39,14 @@ public final class TacticalAiRegistry {
         // monster may inherit that adapter by sharing a superclass.
         register(ResourceLocation.withDefaultNamespace("blaze"), EntityType.BLAZE,
                 ignored -> new BlazeTacticalAi());
+        // Exact type only: a drowned is the one actor with a native trident throw and real water movement,
+        // and no husk, zombie or other swimmer may inherit either by sharing a superclass.
+        register(ResourceLocation.withDefaultNamespace("drowned"), EntityType.DROWNED,
+                DrownedTacticalAi::new);
+        // Exact type only: a shulker, a wild enderman or any teleporting mod entity must not inherit the priced
+        // teleport, the reaction budget or the water-escape behaviour by sharing a superclass.
+        register(ResourceLocation.withDefaultNamespace("enderman"), EntityType.ENDERMAN,
+                EndermanTacticalAi::new);
     }
 
     private TacticalAiRegistry() { }

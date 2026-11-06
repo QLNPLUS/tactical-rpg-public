@@ -18,6 +18,14 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
         /** Throw one brew at the locked opponent; the real splash potion is created on the server. */
         THROW_POTION,
         /**
+         * Throw the trident this actor really holds in its hands at the locked opponent.
+         *
+         * <p>Deliberately its own kind and not {@code RANGED}: a trident is not a bow or a crossbow, it has no
+         * ammunition, no charge and no reload, and its flight is the thrown projectile's own. Routing it
+         * through the bow path would price it against a bow and validate it against an arrow.</p>
+         */
+        THROW_TRIDENT,
+        /**
          * One blaze salvo at the locked opponent: the vanilla charge and up to three native fireballs.
          *
          * <p>The intent carries nothing the server would trust - the opponent, the price and the geometry are
@@ -26,7 +34,16 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
          */
         FIREBALL_VOLLEY,
         /** Break one closed wooden door pair; ends the own turn and keeps the remaining AP. */
-        BREAK_DOOR
+        BREAK_DOOR,
+        /**
+         * One native enderman teleport: a relocation, not an attack.
+         *
+         * <p>The intent carries no destination on purpose. Vanilla resolves the landing point inside its own
+         * private {@code teleport(DDD)} - after the {@code EnderEntityEvent.Teleport} listeners had their say -
+         * so a destination named here would be a plan the world may already have replaced. What the server
+         * commits is the point the native entry really landed on, validated before the entity is moved.</p>
+         */
+        TELEPORT
     }
 
     /** Preserve existing adapters' constructors. */
@@ -98,4 +115,8 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
     public static AiAction endTurn() { return of(Kind.END_TURN); }
     /** One salvo at the opponent this own turn locked; the server owns charge, count and price. */
     public static AiAction fireballVolley() { return of(Kind.FIREBALL_VOLLEY); }
+    /** One trident throw at the opponent this own turn locked; the server owns the real entity and its price. */
+    public static AiAction throwTrident() { return of(Kind.THROW_TRIDENT); }
+    /** One native teleport; the server owns the landing point, the price and every safety gate. */
+    public static AiAction teleport() { return of(Kind.TELEPORT); }
 }

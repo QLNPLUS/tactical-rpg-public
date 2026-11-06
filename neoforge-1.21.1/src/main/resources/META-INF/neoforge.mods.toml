@@ -21,6 +21,12 @@ config = "tactical.witch.mixins.json"
 config = "tactical.blaze.mixins.json"
 
 [[mixins]]
+config = "tactical.drowned.mixins.json"
+
+[[mixins]]
+config = "tactical.enderman.mixins.json"
+
+[[mixins]]
 config = "tactical.server.mixins.json"
 
 [[mods]]

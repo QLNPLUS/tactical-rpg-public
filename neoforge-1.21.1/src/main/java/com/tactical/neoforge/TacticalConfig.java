@@ -33,6 +33,10 @@ public final class TacticalConfig {
     public final ModConfigSpec.IntValue breakApCost;
     /** Base price of one blaze fireball salvo: the mod's own design value, not a vanilla fact. */
     public final ModConfigSpec.IntValue blazeVolleyApCost;
+    /** Base price of one drowned trident throw: this ruleset's value, not a vanilla fact. */
+    public final ModConfigSpec.IntValue drownedTridentApCost;
+    /** Base price of one enderman teleport: this ruleset's value, not a vanilla fact. */
+    public final ModConfigSpec.IntValue endermanTeleportApCost;
     public final ModConfigSpec.IntValue witchDrinkApCost;
     public final ModConfigSpec.IntValue witchThrowApCost;
     public final ModConfigSpec.IntValue witchDrinkCooldownTurns;
@@ -102,6 +106,14 @@ public final class TacticalConfig {
                 .defineInRange("breakCost", 10, 1, 1_000_000);
         blazeVolleyApCost = builder.comment("Base AP cost of one blaze fireball salvo. A salvo is one main action however many fireballs it really fires, and it shares the same successful-action surcharge as every other main action.")
                 .defineInRange("blazeVolleyCost", com.tactical.core.combat.BattleRules.BLAZE_VOLLEY_COST, 1, 1_000_000);
+        builder.pop();
+        builder.push("drowned");
+        drownedTridentApCost = builder.comment("Base AP cost of one drowned trident throw. Vanilla fires on a fixed 40 tick interval; a turn-based encounter maps that to one throw per own turn, and the throw shares the same successful-action surcharge as every other main action.")
+                .defineInRange("tridentCost", com.tactical.core.combat.BattleRules.DROWNED_TRIDENT_COST, 1, 1_000_000);
+        builder.pop();
+        builder.push("enderman");
+        endermanTeleportApCost = builder.comment("Base AP cost of one enderman teleport, whether it is the own-turn relocation or the single reaction to a hit, and the price charged to that enderman only. The own-turn relocation shares the successful-action surcharge; the reaction is paid at this base price and does not advance that surcharge.")
+                .defineInRange("teleportCost", com.tactical.core.combat.BattleRules.ENDERMAN_TELEPORT_COST, 1, 1_000_000);
         builder.pop();
         builder.push("witch");
         witchDrinkApCost = builder.comment("Base AP cost of one witch self-drink; it shares the same successful-action surcharge as other main actions and is not a player item cost.")

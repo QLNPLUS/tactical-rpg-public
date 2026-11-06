@@ -198,7 +198,7 @@ TacticalAiRegistry.register(ResourceLocation.parse("example:guard"),
         MyEntities.GUARD.get(), actor -> new GuardAi());
 ```
 
-实际签名为 `register(ResourceLocation id, EntityType<?> type, Function<Mob, TacticalMobAi> factory)`。ID 必须是 `BuiltInRegistries.ENTITY_TYPE` 中对应的确切实体类型 ID，不能拿独立的“行为 ID”替代；未知 ID、类型不匹配、重复注册会失败。注册表按实体类型精确匹配，不按继承层级匹配。未注册的 Mob 每次创建时得到一个新的 `GenericMeleeAi`；内置 `minecraft:creeper`、`minecraft:skeleton` 与 `minecraft:phantom` 已注册，不能用同一个 ID 覆盖。
+实际签名为 `register(ResourceLocation id, EntityType<?> type, Function<Mob, TacticalMobAi> factory)`。ID 必须是 `BuiltInRegistries.ENTITY_TYPE` 中对应的确切实体类型 ID，不能拿独立的“行为 ID”替代；未知 ID、类型不匹配、重复注册会失败。注册表按实体类型精确匹配，不按继承层级匹配。未注册的 Mob 每次创建时得到一个新的 `GenericMeleeAi`；内置的 `minecraft:creeper`、`minecraft:skeleton`、`minecraft:phantom`、`minecraft:pillager`、`minecraft:stray`、`minecraft:bogged`、`minecraft:vindicator`、`minecraft:witch`、`minecraft:blaze`、`minecraft:drowned` 与 `minecraft:enderman` 已按确切 ID 注册，不能用同一个 ID 覆盖。0.29.0 起溺尸与末影人不吃弓弩路径：溺尸走独立的三叉戟投掷动作，末影人走原生 `teleport` 位移动作，两者都是精确类型匹配，不向任何父类扩散。
 
 内置 [SkeletonTacticalAi](../neoforge-1.21.1/src/main/java/com/tactical/neoforge/battle/ai/SkeletonTacticalAi.java) 仅注册给 `EntityType.SKELETON`；流浪者与沼骸不会因继承关系获得该行为。普通骷髅无弓时回退近战；持弓时争取 4–16 格射击位置，偏好约 8 格，最多搜索 128 个格子。规划可绕掩体、接近或后退，并在能本回合开火时为当前弓射击报价（默认本回合首次 15 AP）预留预算；不足时可先移动到后续射击位置。4 格是舒适距离而非硬性最近射程，无法退开时仍可近距离开火。每个自身回合最多射击一次。
 

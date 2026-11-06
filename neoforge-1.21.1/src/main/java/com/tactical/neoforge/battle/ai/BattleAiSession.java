@@ -67,6 +67,7 @@ public final class BattleAiSession {
         TacticalMobAi adapter = TacticalAiRegistry.create(actor);
         if (actor instanceof Creeper) access(actor).tactical$setControlled(true);
         if (actor instanceof Witch witch) witchAccess(witch).tactical$setControlled(true);
+        if (actor instanceof net.minecraft.world.entity.monster.Drowned) drownedAccess(actor).tactical$setControlled(true);
         participants.put(actor.getUUID(), new Participant(actor, adapter));
         sendSnapshot();
     }
@@ -78,6 +79,7 @@ public final class BattleAiSession {
         participant.adapter.close();
         if (actor instanceof Creeper) access(actor).tactical$setControlled(false);
         if (actor instanceof Witch witch) witchAccess(witch).tactical$setControlled(false);
+        if (actor instanceof net.minecraft.world.entity.monster.Drowned) drownedAccess(actor).tactical$setControlled(false);
         sendSnapshot();
     }
 
@@ -89,6 +91,9 @@ public final class BattleAiSession {
             participant.adapter.close();
             if (participant.actor instanceof Creeper) access(participant.actor).tactical$setControlled(false);
             if (participant.actor instanceof Witch witch) witchAccess(witch).tactical$setControlled(false);
+            if (participant.actor instanceof net.minecraft.world.entity.monster.Drowned) {
+                drownedAccess(participant.actor).tactical$setControlled(false);
+            }
         }
         participants.clear();
         sendSnapshot();
@@ -133,6 +138,14 @@ public final class BattleAiSession {
                 }
                 return AiResolution.END_TURN;
             }
+            case THROW_TRIDENT -> {
+                // One commit point: the server re-checks the locked opponent, the hand, the real native arc and
+                // the frozen price, and charges only once a real trident of this encounter's own making exists.
+                if (context.throwTrident()) {
+                    participant.adapter.onActionResolved(action.kind());
+                }
+                return AiResolution.END_TURN;
+            }
             case FIREBALL_VOLLEY -> {
                 // One commit point: the server re-checks the locked opponent, the geometry and the frozen price,
                 // starts the vanilla charge and charges nothing until a real fireball has joined the world.
@@ -140,6 +153,14 @@ public final class BattleAiSession {
                     participant.adapter.onActionResolved(action.kind());
                 }
                 return AiResolution.END_TURN;
+            }
+            case TELEPORT -> {
+                // One commit point: the server re-checks the quota, the frozen price and every landing gate, drives
+                // vanilla's own teleport entry and charges only when the entity really relocated and the resulting
+                // cell is legal. The same own turn then continues with at most one follow-up, resolved by the owner.
+                if (!context.teleport()) return AiResolution.END_TURN;
+                participant.adapter.onActionResolved(action.kind());
+                return AiResolution.RELOCATED;
             }
             case BREAK_DOOR -> {
                 // One commit point: the server re-checks the same pair, the real protection chain, the frozen
@@ -275,9 +296,21 @@ public final class BattleAiSession {
                 || context.target() == null || !context.canThrowFrom(context.actorCell()))) {
             return AiAction.endTurn();
         }
+        if (action.kind() == AiAction.Kind.THROW_TRIDENT
+                && (context.tridentCost() <= 0 || context.ap() < context.tridentCost()
+                || context.target() == null || !context.canThrowTridentFrom(context.actorCell()))) {
+            return AiAction.endTurn();
+        }
         if (action.kind() == AiAction.Kind.FIREBALL_VOLLEY
                 && (context.fireballCost() <= 0 || context.ap() < context.fireballCost()
                 || !context.canFireballFrom(context.actorCell()))) {
+            return AiAction.endTurn();
+        }
+        if (action.kind() == AiAction.Kind.TELEPORT
+                && (context.teleportCost() <= 0 || context.ap() < context.teleportCost()
+                || !context.enderman().mayTeleport() || !context.canTeleport())) {
+            // No quota, no price the unit can pay, or no landing point that passes the gates: the relocation is
+            // refused here, before anything is charged or moved.
             return AiAction.endTurn();
         }
         if (action.kind() == AiAction.Kind.BREAK_DOOR) {
@@ -329,5 +362,10 @@ public final class BattleAiSession {
     private static TacticalWitchAccess witchAccess(Mob actor) {
         if (actor instanceof TacticalWitchAccess access) return access;
         throw new IllegalStateException("Witch tactical mixin missing: register tactical.witch.mixins.json");
+    }
+
+    private static com.tactical.neoforge.battle.TacticalDrownedAccess drownedAccess(Mob actor) {
+        if (actor instanceof com.tactical.neoforge.battle.TacticalDrownedAccess access) return access;
+        throw new IllegalStateException("Drowned tactical mixin missing: register tactical.drowned.mixins.json");
     }
 }

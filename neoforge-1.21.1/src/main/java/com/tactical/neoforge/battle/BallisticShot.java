@@ -88,6 +88,23 @@ public final class BallisticShot {
         return null;
     }
 
+    /**
+     * Whether one already-decided launch really reaches the target, using the same tick-by-tick physics.
+     *
+     * <p>This is the narrow entry for a projectile whose own native code decides origin, direction, speed
+     * and spread - the drowned's trident throw. Planning that throw with a bow's {@link Plan} would move the
+     * launch away from the numbers vanilla applies, so the plan is replaced by a yes/no answer about the
+     * very arc that will really exist. Arrows and potions never call this; their behaviour is unchanged.</p>
+     *
+     * @return true only when the whole arc reaches the target without hitting cover or another body
+     */
+    public static boolean reaches(Level level, LivingEntity shooter, Vec3 origin, Vec3 velocity,
+                                  LivingEntity target, boolean gravity, int pierce,
+                                  double drag, double waterDrag) {
+        if (level == null || shooter == null || origin == null || velocity == null || target == null) return false;
+        return clear(level, shooter, origin, velocity, target, gravity, pierce, drag, waterDrag);
+    }
+
     private static boolean clear(Level level, LivingEntity shooter, Vec3 origin, Vec3 velocity,
                                  LivingEntity target, boolean gravity, int pierce,
                                  double drag, double waterDrag) {

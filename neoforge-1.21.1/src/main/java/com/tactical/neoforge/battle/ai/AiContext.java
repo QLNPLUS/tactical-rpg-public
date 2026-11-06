@@ -64,6 +64,66 @@ public interface AiContext {
     default boolean canThrowFrom(GridPos from) { return false; }
 
     /**
+     * Quoted price of one trident throw this own turn, or 0 for an actor that has no trident in its hands.
+     *
+     * <p>Read from the same server state that charges the action, so a planner can never validate a throw
+     * the execution path then prices differently or refuses because the hand is already empty.</p>
+     */
+    default int tridentCost() { return 0; }
+
+    /**
+     * Authoritative legality of one trident throw from a hypothetical feet cell.
+     *
+     * <p>Uses the entity's real spawn point and the native arc that will really exist, so a cell whose throw
+     * would be blocked by cover is refused here instead of being paid for and missed.</p>
+     */
+    default boolean canThrowTridentFrom(GridPos from) { return false; }
+
+    /** One trident throw as this own turn's main action; false when it was refused and nothing was charged. */
+    default boolean throwTrident() { return false; }
+
+    /**
+     * Everything the enderman tactics need, read from the same state that charges the action.
+     *
+     * <p>A context without an enderman (an old adapter, a fixture) answers {@link EndermanState#NONE}, which
+     * makes every teleport tactic decline instead of inventing a free relocation.</p>
+     */
+    default EndermanState enderman() { return EndermanState.NONE; }
+
+    /** Frozen price of one teleport this turn, or 0 for an actor that cannot teleport at all. */
+    default int teleportCost() { return 0; }
+
+    /**
+     * Authoritative answer to "is there a landing point this turn can legally use".
+     *
+     * <p>Resolved from the live world with the same gates the commit re-checks: loaded columns, a real support,
+     * three blocks of body room, no water or danger, no occupied cell and the whole body inside the zone. The
+     * preferred answer to {@link #exposed()} is a dry, sheltered cell.</p>
+     */
+    default boolean canTeleport() { return false; }
+
+    /**
+     * A short walk out of water or rain that this own turn can really pay for, or an empty list when there is
+     * none inside the encounter.
+     *
+     * <p>The answer is a route over the same terrain the movement code validates, ending on a cell whose real
+     * feet point is neither in water nor in rain. Walking toward the opponent is deliberately not this answer:
+     * a unit that is wet has to leave the wet cell, not approach through it.</p>
+     */
+    default List<GridPos> dryEscapePath() { return List.of(); }
+
+    /**
+     * One native teleport as this own turn's action.
+     *
+     * <p>The server owns the one commit point: it re-validates the landing point after the native event had its
+     * say, drives vanilla's own {@code teleport(DDD)} entry, and charges only when the entity really moved and
+     * the resulting cell is legal. A refused teleport charges nothing.</p>
+     *
+     * @return true when the entity really relocated and the action was paid for
+     */
+    default boolean teleport() { return false; }
+
+    /**
      * Drink one self-brew as this own turn's main action.
      *
      * <p>The server owns the one commit point: it re-checks the cooldown, the frozen price and whether the

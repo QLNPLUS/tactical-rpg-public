@@ -58,7 +58,9 @@ import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.ai.attributes.AttributeModifier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.monster.Blaze;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.entity.monster.Vindicator;
 import net.minecraft.world.entity.monster.Witch;
 import net.minecraft.world.entity.projectile.ThrownPotion;
@@ -471,6 +473,20 @@ public final class ServerBattle {
                 if(AerialMovement.isClearAir(level,air.mob,held)) air.mob.setPos(held);
                 air.mob.setDeltaMovement(Vec3.ZERO);air.mob.fallDistance=0;
             }
+            // A drowned in water has no floor to stand on: fluid physics would sink or push it away from the
+            // cell its turn is priced on. It is pinned at its real position for exactly as long as that
+            // position is still legal - a drained lake or a closed shore falls through to the ordinary
+            // unsupported-unit rule below instead of being held in mid air.
+            if(air.amphibious&&!(enemyMoving&&entry.getKey().toString().equals(queue.current()))
+                    &&terrainFall.unit(entry.getKey())==null) {
+                // The position this cell really holds: fractional in water, the exact support height on land.
+                Vec3 held=AmphibiousMovement.holdFeet(level,air.cell,air.airOffset);
+                if(AmphibiousMovement.isHoldable(level,air.mob,held)) {
+                    air.mob.setPos(held);
+                    air.mob.setDeltaMovement(Vec3.ZERO);
+                    air.mob.fallDistance=0;
+                }
+            }
         }
         // A presented drink owns the turn for its bounded window; settle it once it runs out.
         tickWitchDrink();
@@ -488,6 +504,12 @@ public final class ServerBattle {
                 awaitingShotResolution = false;
                 UUID shooter=pendingEnemyShot;
                 pendingEnemyShot=null;
+                // A settled flight is the only moment a marked trident may be reclaimed: the real hit or the
+                // real block impact has already happened, so removing the entity now cannot hide anything.
+                if (shooter != null) {
+                    DrownedTridents.settle(this, shooter);
+                    releaseTridentPose(shooter);
+                }
                 if(shooter!=null && shooter.toString().equals(queue.current())) {
                     advanceTurn();
                     if(finished) return;
@@ -558,6 +580,9 @@ public final class ServerBattle {
         blazeVolley = null;
         if (endingVolley != null) setBlazeCharged(enemies.get(endingVolley.actorId()), false);
         BlazeFireballs.clearBattle(this);
+        // No marked trident and no SPEAR pose may outlive the encounter that owns them.
+        DrownedTridents.clearBattle(this);
+        for (EnemyState state : enemies.values()) releaseTridentPose(state.mob.getUUID());
         ai.clear();
         // Effects belong to the actor, so they are released per unit of THIS encounter. A global
         // clear would also drop another running encounter's effect clocks, burning baselines and
@@ -591,6 +616,7 @@ public final class ServerBattle {
             state.mob.setNoAi(state.originalNoAi);
             state.mob.setTarget(null);
             releaseWitchState(state);
+            releaseEndermanState(state);
         }
         enemies.clear();
         for (Mob bystander : bystanders) {
@@ -1297,6 +1323,9 @@ public final class ServerBattle {
             state.drink = new WitchDrinkCooldown(witchDrinkCooldownTurns());
             enemies.put(mob.getUUID(), state);
             ai.add(mob);
+            // The one routing seam this unit's native teleports and its water clock answer to. Installed here,
+            // after the transaction succeeded, and released by every exit path below.
+            installEndermanHandler(state);
             if (DeveloperTrace.enabled()) {
                 // Development trace: which exact unit joined which encounter. Needed because a client
                 // mirror cannot tell two same-typed mobs apart.
@@ -1372,6 +1401,7 @@ public final class ServerBattle {
     private void restoreAdmission(EnemyState state) {
         if (state == null || state.mob == null) return;
         ai.remove(state.mob);
+        releaseEndermanState(state);
         restoreUnit(state.mob, state.originalNoAi, state.originalPersistenceRequired,
                 state.originalPosition, state.originalTarget, state.originalFallDistance,
                 state.originalBlazeCharged);
@@ -2862,6 +2892,8 @@ public final class ServerBattle {
     }
 
     private java.util.Optional<Vec3> deploymentPosition(Mob mob,java.util.function.Predicate<BlockPos> occupied,java.util.function.Predicate<BlockPos> allowed) {
+        // A drowned is the one unit that may be placed in water; every other actor keeps the ground/aerial rule.
+        if (AmphibiousMovement.supports(mob)) return AmphibiousMovement.findNearestHold(level, mob, occupied, allowed);
         return AerialMovement.supports(mob)?AerialMovement.findNearestClearAir(level,mob,occupied,allowed):BattleDeployment.findNearestStandable(level,mob,occupied,allowed);
     }
 
@@ -2878,6 +2910,7 @@ public final class ServerBattle {
                 enemyPath = List.of();
                 enemyStepping = false;
                 if(enemy.flying){enemy.mob.setPos(AerialMovement.feet(enemy.cell,enemy.airOffset));enemy.mob.setDeltaMovement(Vec3.ZERO);}
+                else if(enemy.amphibious){enemy.mob.setPos(AmphibiousMovement.holdFeet(level,enemy.cell,enemy.airOffset));enemy.mob.setDeltaMovement(Vec3.ZERO);}
                 // A commanded companion never continues on its own: the controller decides whether to attack,
                 // step again or hand the turn over. No AI follow-up and no automatic turn advance here.
                 if (enemy.companionAdapter != null) {
@@ -2921,7 +2954,9 @@ public final class ServerBattle {
         }
         enemyStepProgress++;
         double progress = Math.min(1.0D, enemyStepProgress / (double) Math.max(1, stepTicks));
-        Vec3 target=enemy.flying?AerialMovement.feet(enemyStepTarget,enemy.airOffset):centerOf(enemyStepTarget);
+        Vec3 target=enemy.flying?AerialMovement.feet(enemyStepTarget,enemy.airOffset)
+                :enemy.amphibious?AmphibiousMovement.holdFeet(level,enemyStepTarget,enemy.airOffset)
+                :centerOf(enemyStepTarget);
         Vec3 next=enemyStepFrom.lerp(target,progress);
         if(enemy.flying&&!AerialMovement.isSegmentClear(level,enemy.mob,enemy.mob.position(),next)) {
             int unused=enemyPath.size()-enemyPathIndex+1;
@@ -2932,6 +2967,24 @@ public final class ServerBattle {
                     BattleText.name(enemy.mob)));
             advanceTurn();return;
         }
+        // The water it planned through may be gone: a drained cell, a closed shore or a body that stepped into
+        // the route stops it here. The whole remaining route is re-checked against the live world before a single
+        // tick of it is walked, so the actor never crosses a stale water route through dry air; the steps it will
+        // not walk are given back and the turn ends.
+        if(enemy.amphibious&&!enemyAmphibiousRouteHolds(enemy)) {
+            int unused=enemyPath.size()-enemyPathIndex+1;
+            enemy.ap=Math.min(enemy.maxAp,enemy.ap+unused*enemy.moveCost+enemyDiveReservedCost);
+            enemyDiveReservedCost=0;
+            enemyMoving=false;enemyStepping=false;enemyPath=List.of();enemyDiveAttackIndex=-1;
+            journal.record("enemy",BattleText.translatable(BattleText.KEY_ENEMY_SWIM_BLOCKED,
+                    BattleText.name(enemy.mob)));
+            sendState();
+            advanceTurn();return;
+        }
+        // The step itself is the real route: a step up rises and then moves across, a step down moves across and
+        // then drops, and the position is the point of that path at this progress - exactly the legs the rule
+        // above proved clear.
+        if(enemy.amphibious) next=amphibiousStepPoint(enemyStepFrom,target,progress);
         enemy.mob.setPos(next);
         enemy.mob.setDeltaMovement(Vec3.ZERO);
         if (progress >= 1.0D) {
@@ -2954,6 +3007,37 @@ public final class ServerBattle {
                 sendState();
             }
         }
+    }
+
+    /** The real point of one amphibious step at this progress, on the leg that step really takes. */
+    private static Vec3 amphibiousStepPoint(Vec3 from, Vec3 to, double progress) {
+        Vec3 middle = AmphibiousMovement.via(from, to);
+        if (middle == null) return from.lerp(to, progress);
+        double half = 0.5D;
+        return progress <= half
+                ? from.lerp(middle, progress / half)
+                : middle.lerp(to, (progress - half) / half);
+    }
+
+    /**
+     * Whether every remaining step of this route is still legal against the live world.
+     *
+     * <p>Each edge is re-proved from the position the previous edge ends at, including the destination cell
+     * itself: a pool that was drained, a shore that was closed or a body that stepped into the route refuses the
+     * edge instead of letting the actor finish a route that no longer exists.</p>
+     */
+    private boolean enemyAmphibiousRouteHolds(EnemyState enemy) {
+        if (enemyPath.isEmpty()) return true;
+        Vec3 from = enemyStepping ? enemyStepFrom : AmphibiousMovement.holdFeet(level, enemy.cell, enemy.airOffset);
+        int start = enemyStepping ? enemyPathIndex - 1 : enemyPathIndex;
+        for (int index = Math.max(0, start); index < enemyPath.size(); index++) {
+            GridPos step = enemyPath.get(index);
+            if (!zone.contains(step) || occupiedByOtherOnly(step)) return false;
+            Vec3 to = AmphibiousMovement.holdFeet(level, step, enemy.airOffset);
+            if (!AmphibiousMovement.canStep(level, enemy.mob, from, to)) return false;
+            from = to;
+        }
+        return true;
     }
 
     private static void faceDirection(LivingEntity mob, GridPos target) {
@@ -3035,7 +3119,8 @@ public final class ServerBattle {
     /** A main action that must hit the locked opponent, so losing that opponent cannot be silently re-aimed. */
     private static boolean targetedAction(AiAction.Kind kind) {
         return kind == AiAction.Kind.MELEE || kind == AiAction.Kind.RANGED || kind == AiAction.Kind.SKILL
-                || kind == AiAction.Kind.THROW_POTION || kind == AiAction.Kind.FIREBALL_VOLLEY;
+                || kind == AiAction.Kind.THROW_POTION || kind == AiAction.Kind.FIREBALL_VOLLEY
+                || kind == AiAction.Kind.THROW_TRIDENT;
     }
 
     /**
@@ -3086,6 +3171,10 @@ public final class ServerBattle {
         if (target == null || !opposed(enemy.mob, target)
                 || target.level() != level || !target.isAlive() || target.isRemoved()
                 || enemy.mob.getAttribute(Attributes.ATTACK_DAMAGE)==null) return false;
+        // The charge decision asked the context; the real hit asks the body. A drowned whose held position cannot
+        // touch the target must not damage it, and must therefore not pay either.
+        if ((enemy.amphibious || isEndermanActor(enemy.mob))
+                && !amphibiousMeleeReach(enemy, enemy.cell, target)) return false;
         GridPos targetCell = participantCell(target);
         if (targetCell != null) faceDirection(enemy.mob, targetCell);
         journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_ENEMY_MELEE,
@@ -3094,6 +3183,26 @@ public final class ServerBattle {
         enemy.mob.setTarget(target);
         return enemy.mob.doHurtTarget(target);
     }
+
+    /**
+     * The shared real-body melee gate for the drowned and enderman, keeping tactical grid adjacency.
+     *
+     * <p>Vanilla decides a melee hit by intersecting {@code Mob#getAttackBoundingBox} - the body box widened by the
+     * attack reach - with the target's own hitbox. Grid adjacency says nothing about that, and for a swimmer the
+     * vertical part matters: two cells can be adjacent while the bodies are a whole block apart. The box is
+     * therefore moved to the position this cell really holds before the intersection is asked for.</p>
+     */
+    private boolean amphibiousMeleeReach(EnemyState state, GridPos from, LivingEntity target) {
+        if (target == null || from == null) return false;
+        Vec3 feet = feetAtCell(state, from);
+        AABB attackBox = state.mob.getBoundingBox().move(feet.subtract(state.mob.position()))
+                .inflate(MELEE_ATTACK_REACH, 0.0D, MELEE_ATTACK_REACH);
+        if (!attackBox.intersects(target.getHitbox())) return false;
+        return inMeleeRange(from, participantCell(target));
+    }
+
+    /** Vanilla's own melee reach widening ({@code Mob.DEFAULT_ATTACK_REACH}); never a per-mob guess. */
+    private static final double MELEE_ATTACK_REACH = Math.sqrt(2.04F) - 0.6F;
 
     /** Legacy name: attacks this actor's locked opponent, never its allied owner. */
     private void attackPlayer(EnemyState enemy) {
@@ -3507,11 +3616,209 @@ public final class ServerBattle {
         sendState();
     }
 
+    /** The water-and-land edges of one drowned: the same list its own steps are revalidated against. */
+    private List<GridPos> amphibiousNeighbours(EnemyState state, GridPos cell) {
+        if (state == null || cell == null) return List.of();
+        return AmphibiousMovement.neighbors(level, state.mob, cell, state.airOffset,
+                this::occupiedByOtherOnly, zone::contains);
+    }
+
+    /** Occupancy as the AI sees it: every other participant, never this exact unit itself. */
+    private boolean occupiedByOtherOnly(GridPos cell) {
+        for (PlayerMember member : members.values()) if (member.state.cell().equals(cell)) return true;
+        for (EnemyState other : enemies.values()) {
+            if (other.mob.isAlive() && !other.mob.isRemoved() && other.cell.equals(cell)) return true;
+        }
+        return false;
+    }
+
     /** Record one ranged refusal as structure; the refusal itself changed nothing and costs nothing. */
     private void refuseShot(EnemyState enemy, String key) {
         journal.record("enemy", BattleText.translatable(key, BattleText.name(enemy.mob)));
         sendState();
     }
+
+    // ------------------------------------------------------------------
+    // drowned: one native trident throw per own turn, real water included
+    // ------------------------------------------------------------------
+
+    /**
+     * A drowned really holds a trident in its main hand.
+     *
+     * <p>Exact entity type and exact main-hand item, which is the same pair of checks vanilla applies before
+     * its own throw goal runs: a trident in the off hand, a fishing rod or an empty hand never gains a ranged
+     * action, and no other zombie-like type inherits this one.</p>
+     */
+    private static boolean isDrownedTridentActor(Mob mob) {
+        return mob != null && mob.getType() == EntityType.DROWNED && mob.getMainHandItem().is(Items.TRIDENT);
+    }
+
+    /**
+     * Quoted price of one trident throw, or 0 when this actor cannot throw at all.
+     *
+     * <p>20 AP is the ruleset's own value for one throw and is configurable; the +25% per prior paid action of
+     * this own turn comes from the same quote every other main action uses.</p>
+     */
+    private int mobTridentCost(EnemyState enemy) {
+        if (enemy == null || !isDrownedTridentActor(enemy.mob)) return 0;
+        return quote(intConfig(TacticalConfig.INSTANCE.drownedTridentApCost,
+                com.tactical.core.combat.BattleRules.DROWNED_TRIDENT_COST), enemy.paidActions);
+    }
+
+    /** The feet position this actor would really stand at, for one hypothetical grid cell. */
+    private Vec3 feetAtCell(EnemyState state, GridPos cell) {
+        Vec3 real = state.mob.position();
+        if (cell == null || cell.equals(state.cell)) return real;
+        // A drowned's feet depend on the medium of the cell it would stand in, so a hypothetical cell is
+        // resolved the same way its real position is - not by shifting a fractional water altitude onto land.
+        if (state.amphibious) return AmphibiousMovement.holdFeet(level, cell, state.airOffset);
+        return real.add(centerOf(cell).subtract(centerOf(state.cell)));
+    }
+
+    /**
+     * Authoritative legality of one trident throw from a hypothetical feet cell.
+     *
+     * <p>Two independent gates, both read from the entity's real numbers: the vanilla 10 block radius against
+     * the target's own position, and the native nominal arc - vanilla's aim with the {@code horizontal * 0.2}
+     * lift, launched at 1.6 with the air and water inertia of a thrown trident - actually reaching the target
+     * without cover or another body in the way. Dispersion is vanilla's and only widens the arc, so a blocked
+     * arc is a real refusal rather than a shot that would fly through a wall.</p>
+     */
+    private boolean canThrowTridentFrom(EnemyState state, LivingEntity opponent, GridPos from) {
+        if (opponent == null || from == null || !isDrownedTridentActor(state.mob)) return false;
+        if (opponent.level() != level || !opponent.isAlive() || opponent.isRemoved()) return false;
+        Vec3 feet = feetAtCell(state, from);
+        double dx = feet.x - opponent.getX();
+        double dy = feet.y - opponent.getY();
+        double dz = feet.z - opponent.getZ();
+        if (Math.sqrt(dx * dx + dy * dy + dz * dz) > com.tactical.core.combat.TridentThrow.MAX_RANGE + 0.001D) {
+            return false;
+        }
+        Vec3 origin = DrownedTridents.spawnPoint(state.mob, feet);
+        return DrownedTridents.nominalReaches(level, state.mob, origin, opponent);
+    }
+
+    /**
+     * One real vanilla trident throw at the opponent this own turn locked.
+     *
+     * <p>The entity's own {@code performRangedAttack} creates the trident, so the spawn point, the aim with its
+     * 0.2 lift, the 1.6 launch speed, the difficulty inaccuracy, the water inertia, the 8.0 base damage and the
+     * native sound are all vanilla's. This method adds only the encounter's boundary: the real trident must
+     * exist before anything is paid, the throw never consumes or copies the held trident, and the projectile is
+     * marked from creation until it really leaves the level.</p>
+     *
+     * <p>The price is frozen before the native call. A cancelled join, an exception or a refused/non-native
+     * projectile charges nothing and leaves nothing behind; a trident that really joined is final even if it
+     * misses.</p>
+     */
+    private boolean throwTrident(EnemyState state) {
+        if (state == null || !(state.mob instanceof net.minecraft.world.entity.monster.Drowned drowned)) return false;
+        if (!isActorTurn(drowned) || isBusy()) return false;
+        LivingEntity target = actionOpponent(state);
+        if (target == null || !opposed(drowned, target) || target.level() != level) return false;
+        // Re-read the hand now: an action never pays for a throw the entity could not really perform.
+        if (!isDrownedTridentActor(drowned)) {
+            refuseShot(state, BattleText.KEY_ENEMY_NO_SHOT);
+            return false;
+        }
+        int cost = mobTridentCost(state);
+        if (cost <= 0 || state.ap < cost) return false;
+        if (!canThrowTridentFrom(state, target, state.cell)) {
+            refuseShot(state, BattleText.KEY_ENEMY_NO_SHOT);
+            return false;
+        }
+        GridPos targetCell = participantCell(target);
+        if (targetCell != null) faceDirection(drowned, targetCell);
+        drowned.setTarget(target);
+        // Vanilla's own throw pose while this action runs. The renderer picks THROW_SPEAR from
+        // "main hand holds a trident && isAggressive", and the entity's own ranged goal sets both, so both are set
+        // here and both are cleared when the projectile settles.
+        drowned.setAggressive(true);
+        drowned.startUsingItem(InteractionHand.MAIN_HAND);
+        RuntimeException[] nativeFailure = new RuntimeException[1];
+        int marked;
+        try {
+            marked = DrownedTridents.throwNative(this, projectiles, drowned, target, () -> {
+                try {
+                    DrownedTridents.performNative(drowned, target);
+                } catch (RuntimeException failure) {
+                    nativeFailure[0] = failure;
+                }
+            });
+        } catch (RuntimeException failure) {
+            nativeFailure[0] = failure;
+            marked = 0;
+        }
+        if (nativeFailure[0] != null) {
+            Tactical.LOGGER.error("[Tactical] native trident throw failed for {} after {} trident(s)",
+                    drowned.getUUID(), Math.max(0, marked), nativeFailure[0]);
+        }
+        if (marked <= 0) {
+            releaseTridentPose(state.mob.getUUID());
+            refuseShot(state, BattleText.KEY_ENEMY_NO_SHOT);
+            return false;
+        }
+        state.ap -= cost;
+        state.paidActions++;
+        pendingEnemyShot = drowned.getUUID();
+        awaitingShotResolution = true;
+        shotRecoveryTicks = -1;
+        journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_ENEMY_TRIDENT,
+                BattleText.name(drowned), BattleText.name(target)));
+        sendState();
+        return true;
+    }
+
+    /**
+     * The encounter's rule for a marked trident, mirroring the marked fireball's.
+     *
+     * <p>Only this encounter's living, opposed participants count: the thrower, a same-side unit, a bystander,
+     * an uninvited pet and another encounter's unit are refused at the collision entry, and a non-living body
+     * is refused because it is not a participant at all.</p>
+     */
+    public boolean acceptsTrident(UUID actorId, Entity candidate) {
+        return acceptsMarkedProjectile(actorId, candidate);
+    }
+
+    /**
+     * Fixture-only: fire this actor's own native trident throw at one body and answer whether it really joined.
+     *
+     * <p>It exists because the encounter's collision rule can only be exercised by a real projectile reaching a
+     * body the plan would never aim at: the AI refuses such a shot on purpose, so a fixture could otherwise only
+     * assert the refusal, never the collision itself. This is the same kind of fixture entry as the injected
+     * admission faults - it changes nothing unless a fixture calls it, and what it creates is the vanilla
+     * entity through the vanilla method.</p>
+     */
+    public boolean fixtureNativeTrident(LivingEntity actor, LivingEntity target) {
+        if (!(actor instanceof net.minecraft.world.entity.monster.Drowned drowned) || target == null) return false;
+        int joined = DrownedTridents.throwNative(this, projectiles, drowned, target,
+                () -> DrownedTridents.performNative(drowned, target));
+        return joined > 0;
+    }
+
+    /**
+     * Read-only view of the trident legality gate for one actor, from the live state.
+     *
+     * <p>Fixtures use it to separate "the rule refused this position" from "the AI never tried", so a silent
+     * no-throw can never be mistaken for a passing scenario. It changes nothing and prices nothing.</p>
+     */
+    public boolean tridentThrowLegal(LivingEntity actor) {
+        if (actor == null) return false;
+        EnemyState state = enemies.get(actor.getUUID());
+        return state != null && state.mob == actor && canThrowTridentFrom(state, actionOpponent(state), state.cell);
+    }
+
+    /** End the vanilla SPEAR pose of one thrower once its trident is settled or its turn is over. */
+    private void releaseTridentPose(UUID actorId) {
+        if (actorId == null) return;
+        EnemyState state = enemies.get(actorId);
+        if (state == null || !(state.mob instanceof net.minecraft.world.entity.monster.Drowned drowned)) return;
+        if (drowned.isUsingItem()) drowned.stopUsingItem();
+        // The aggressive bit is part of the pose condition, so it is cleared with the pose - never left set, which
+        // would keep the native throw stance on a unit that is not throwing.
+        if (drowned.isAggressive()) drowned.setAggressive(false);
+    }
+
 
     // ------------------------------------------------------------------
     // blaze: one native salvo per own turn
@@ -3774,6 +4081,15 @@ public final class ServerBattle {
      * never ignited, hurt or given post-attack enchantment effects in the first place.</p>
      */
     public boolean acceptsFireball(UUID actorId, Entity candidate) {
+        return acceptsMarkedProjectile(actorId, candidate);
+    }
+
+    /**
+     * The one predicate both marked-projectile rules share: a real participant of this encounter that is
+     * opposed to the shooter, and nothing else. Extracted rather than copied, so a fireball and a trident can
+     * never disagree about what "legal target" means.
+     */
+    private boolean acceptsMarkedProjectile(UUID actorId, Entity candidate) {
         if (finished || ending || actorId == null || candidate == null) return false;
         EnemyState shooter = enemies.get(actorId);
         if (shooter == null || shooter.mob == null || shooter.mob.isRemoved() || !shooter.mob.isAlive()) return false;
@@ -4264,6 +4580,503 @@ public final class ServerBattle {
         return charged != null && !charged.isEmpty() && charged.contains(Items.FIREWORK_ROCKET);
     }
 
+    // ------------------------------------------------------------------
+    // enderman: one native relocation, one bounded reaction, one water clock
+    // ------------------------------------------------------------------
+
+    /** An enderman is the one actor this ruleset relocates through the native entry; never a superclass check. */
+    private static boolean isEndermanActor(Mob mob) {
+        return mob != null && mob.getType() == EntityType.ENDERMAN;
+    }
+
+    private static TacticalEndermanAccess endermanAccess(Mob mob) {
+        if (mob instanceof TacticalEndermanAccess access) return access;
+        throw new IllegalStateException("Enderman tactical mixin missing: register tactical.enderman.mixins.json");
+    }
+
+    /**
+     * Quoted price of this actor's next own-turn relocation, or 0 for anything that is not an enderman.
+     *
+     * <p>The 20 AP base is this ruleset's own value and is configurable; the +25% per prior paid action of the
+     * own turn is applied by the same quote every other main action uses, which is why a melee after a teleport
+     * really costs its own increased price.</p>
+     */
+    private int endermanTeleportCost(EnemyState enemy) {
+        if (enemy == null || !isEndermanActor(enemy.mob)) return 0;
+        return quote(intConfig(TacticalConfig.INSTANCE.endermanTeleportApCost,
+                BattleRules.ENDERMAN_TELEPORT_COST), enemy.paidActions);
+    }
+
+    /**
+     * The fixed base price of one reaction.
+     *
+     * <p>A reaction is not a main action: it neither reads nor advances the paid-action surcharge, so it always
+     * costs the same configured base AP of the unit it protects.</p>
+     */
+    private int endermanReactionCost(EnemyState enemy) {
+        if (enemy == null || !isEndermanActor(enemy.mob)) return 0;
+        return intConfig(TacticalConfig.INSTANCE.endermanTeleportApCost, BattleRules.ENDERMAN_TELEPORT_COST);
+    }
+
+    /** This encounter's own members are what a landing point may not already contain. */
+    private boolean occupiedByOthers(EnemyState actor, GridPos cell) {
+        for (PlayerMember member : members.values()) {
+            if (member.state.cell().equals(cell)) return true;
+        }
+        for (EnemyState other : enemies.values()) {
+            if (other == actor) continue;
+            if (other.mob.isAlive() && !other.mob.isRemoved() && other.cell.equals(cell)) return true;
+        }
+        return false;
+    }
+
+    /** True while that state is still this encounter's live unit, and this encounter is still running. */
+    private boolean liveEndermanState(EnemyState state) {
+        if (state == null || finished || ending) return false;
+        if (enemies.get(state.mob.getUUID()) != state) return false;
+        Mob mob = state.mob;
+        return mob.isAlive() && !mob.isRemoved() && mob.level() == level && isEndermanActor(mob);
+    }
+
+    /**
+     * One relocation proposal for this own turn, resolved at most once and then only re-validated.
+     *
+     * <p>The bounded scan is the expensive part, so planning, validation and the commit all read the same
+     * proposal instead of each opening a new search. A proposal that stopped being legal is refused - it is
+     * never replaced by an endless hunt for another point inside one turn.</p>
+     */
+    private EndermanLanding.Landing endermanProposal(EnemyState state) {
+        if (!liveEndermanState(state)) return null;
+        if (state.endermanScanned) return state.endermanProposal;
+        state.endermanScanned = true;
+        state.endermanProposal = nearestLanding(state, state.endermanEscapeThisTurn,
+                BattleRules.ENDERMAN_TELEPORT_CANDIDATES);
+        return state.endermanProposal;
+    }
+
+    /**
+     * The best landing this action may use, examining at most {@code examined} cells.
+     *
+     * <p>An escape only accepts a dry, sheltered point: relocating out of the rain into more rain would be a
+     * paid move that fixes nothing, which is why "no dry point" stays a refusal instead of a cheaper answer.</p>
+     */
+    private EndermanLanding.Landing nearestLanding(EnemyState state, boolean escape, int examined) {
+        if (!(state.mob instanceof EnderMan enderman)) return null;
+        GridPos targetCell = participantCell(actionOpponent(state));
+        List<GridPos> cells = EndermanLanding.candidates(state.cell, targetCell, escape,
+                BattleRules.ENDERMAN_TELEPORT_RANGE, examined);
+        for (GridPos cell : cells) {
+            EndermanLanding.Landing landing = new EndermanLanding.Landing(cell, centerOf(cell));
+            if (!EndermanLanding.legal(level, enderman, landing, other -> occupiedByOthers(state, other), zone)) {
+                continue;
+            }
+            if (escape && EndermanLanding.exposed(level, enderman, landing.feet())) continue;
+            return landing;
+        }
+        return null;
+    }
+
+    /** Whether one landing this turn would really pass every gate, from the same proposal the commit uses. */
+    private boolean endermanCanTeleport(EnemyState state) {
+        if (!liveEndermanState(state) || state.endermanTeleportsLeft <= 0) return false;
+        return endermanProposal(state) != null;
+    }
+
+    /** What the planner is allowed to know, read from the same state that prices and commits the action. */
+    private EndermanState endermanState(EnemyState state) {
+        if (state == null || !isEndermanActor(state.mob) || !liveEndermanState(state)) return EndermanState.NONE;
+        boolean falling = terrainFall.unit(state.mob.getUUID()) != null;
+        boolean busy = isBusy() || !isActorTurn(state.mob);
+        boolean landing = endermanCanTeleport(state);
+        return new EndermanState(state.endermanTeleportsLeft, state.endermanExposed, state.endermanEscapeThisTurn,
+                falling, busy, landing);
+    }
+
+    /**
+     * One authorized native relocation request.
+     *
+     * <p>Valid only while the encounter is driving the native entry: it carries where the body really was when the
+     * request started, what the relocation is for, and how many native attempts are still allowed. The landing
+     * gate answers inside this scope and nowhere else, so a native entry can never relocate this unit on its own
+     * authority - and the scope is released in a {@code finally}, including when the native call throws.</p>
+     */
+    private static final class EndermanRequest {
+        private final GridPos originCell;
+        private final Vec3 originFeet;
+        private final boolean escape;
+        private final int attemptsAllowed;
+        private int attempts;
+        private EndermanLanding.Landing allowed;
+
+        private EndermanRequest(GridPos originCell, Vec3 originFeet, boolean escape, int attemptsAllowed) {
+            this.originCell = originCell;
+            this.originFeet = originFeet;
+            this.escape = escape;
+            this.attemptsAllowed = Math.max(0, attemptsAllowed);
+        }
+    }
+
+    /**
+     * One own-turn relocation through vanilla's own teleport entry.
+     *
+     * <p>The one commit point: quota, price, and the cached proposal are re-validated against the live world,
+     * then vanilla's private {@code teleport(DDD)} runs inside a scoped request. That method had already let the
+     * {@code EnderEntity} event re-point the destination before the landing gate sees it, so what this commits is
+     * the point the gate really allowed - never a position the entity was moved to first and pulled back from.</p>
+     */
+    private boolean teleport(EnemyState state) {
+        if (!liveEndermanState(state)) return false;
+        if (!isActorTurn(state.mob) || isBusy()) return false;
+        if (state.endermanTeleportsLeft <= 0) return false;
+        if (!(state.mob instanceof EnderMan enderman)) return false;
+        int cost = endermanTeleportCost(state);
+        if (cost <= 0 || state.ap < cost) return false;
+        EndermanLanding.Landing proposal = endermanProposal(state);
+        if (proposal == null) {
+            refuseTeleport(state);
+            return false;
+        }
+        if (!EndermanLanding.legal(level, enderman, proposal, other -> occupiedByOthers(state, other), zone)) {
+            // The world changed under the proposal. It is dropped for this turn instead of scanning again.
+            state.endermanProposal = null;
+            refuseTeleport(state);
+            return false;
+        }
+        if (!commitEndermanTeleport(state, enderman, proposal, state.endermanEscapeThisTurn)) {
+            refuseTeleport(state);
+            return false;
+        }
+        state.ap -= cost;
+        state.paidActions++;
+        state.endermanTeleportsLeft = Math.max(0, state.endermanTeleportsLeft - 1);
+        state.endermanProposal = null;
+        journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_TELEPORT,
+                BattleText.name(state.mob), BattleText.literal(state.cell.toString())));
+        sendState();
+        return true;
+    }
+
+    /**
+     * Drive the native entry once inside a scoped request and commit the position it really produced.
+     *
+     * <p>The landing gate already validated the final point (range from the real origin, purpose, full support)
+     * before vanilla moved the body; this only reads the result and makes the encounter's state agree with it. A
+     * point that is somehow not the allowed one is refused without charging and without dragging the body back.
+     * A refused or vetoed attempt costs nothing: the caller's own quotas stay untouched.</p>
+     */
+    private boolean commitEndermanTeleport(EnemyState state, EnderMan enderman, EndermanLanding.Landing proposal,
+                                           boolean escape) {
+        EndermanRequest request = new EndermanRequest(state.cell, enderman.position(), escape, 1);
+        boolean returned;
+        state.endermanRequest = request;
+        try {
+            returned = EndermanNative.teleportTo(enderman, proposal.feet().x, proposal.feet().y, proposal.feet().z);
+        } catch (RuntimeException failure) {
+            Tactical.LOGGER.error("[Tactical] native enderman teleport failed for {}; nothing was charged",
+                    enderman.getUUID(), failure);
+            returned = false;
+        } finally {
+            state.endermanRequest = null;
+        }
+        EndermanLanding.Landing allowed = request.allowed;
+        if (!returned || allowed == null) return false;
+        Vec3 after = enderman.position();
+        GridPos real = new GridPos(Mth.floor(after.x), Mth.floor(after.y + 1.0E-7D), Mth.floor(after.z));
+        // The gate allowed exactly one point; anything else means the world moved under it.
+        if (!real.equals(allowed.cell())) {
+            Tactical.LOGGER.warn("[Tactical] enderman {} landed on {} instead of the allowed {}", enderman.getUUID(),
+                    real, allowed.cell());
+            return false;
+        }
+        state.cell = real;
+        // The feet the body really holds now are the feet every later range check must use.
+        state.airOffset = after.subtract(centerOf(real));
+        state.endermanProposal = null;
+        state.endermanScanned = false;
+        enderman.setDeltaMovement(Vec3.ZERO);
+        enderman.fallDistance = 0;
+        return true;
+    }
+
+    private void refuseTeleport(EnemyState state) {
+        journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_TELEPORT_REFUSED,
+                BattleText.name(state.mob)));
+        sendState();
+    }
+
+    /**
+     * The one successful reaction of this cycle.
+     *
+     * <p>Only a real attack on the native projectile/potion branch, from this encounter's other side, is
+     * considered at all: a bystander, a same-side unit or another encounter's member cannot make this unit pay AP
+     * or move, and a plain melee or a blast is never a dodge. The search is bounded by
+     * {@link BattleRules#ENDERMAN_HURT_CANDIDATES} cells and one native attempt, and the success quota is spent
+     * only when the body really moved - a refused attempt stays free.</p>
+     */
+    private boolean endermanReaction(EnemyState state, EnderMan enderman, DamageSource source) {
+        if (!liveEndermanState(state) || state.endermanReactionSuccess) return false;
+        if (!endermanAttackIsOpposed(state, source)) return false;
+        // That unit's own exclusive flows only: a global busy check would also refuse a real shot resolution.
+        if (endermanSelfBusy(state, enderman)) return false;
+        int cost = endermanReactionCost(state);
+        // No price the unit can pay: no search at all, nothing charged.
+        if (cost <= 0 || state.ap < cost) return false;
+        EndermanLanding.Landing landing = nearestLanding(state, false, BattleRules.ENDERMAN_HURT_CANDIDATES);
+        if (landing == null) return false;
+        if (!commitEndermanTeleport(state, enderman, landing, false)) return false;
+        state.ap -= cost;
+        state.endermanReactionSuccess = true;
+        // The body really left the spot it was hit on, so nothing is left to escape from on its own turn.
+        state.endermanEscapeThisTurn = false;
+        state.endermanPendingEscape = false;
+        journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_TELEPORT_REACTION,
+                BattleText.name(state.mob)));
+        sendState();
+        return true;
+    }
+
+    /**
+     * Whether that unit itself is inside a flow a relocation may not interrupt.
+     *
+     * <p>Deliberately per unit and not {@link #isBusy()}: another unit's projectile still in the air is exactly
+     * the window this reaction exists for, so a global "something is happening" check would refuse the very case
+     * the rules name.</p>
+     */
+    private boolean endermanSelfBusy(EnemyState state, EnderMan enderman) {
+        if (terrainFall.unit(enderman.getUUID()) != null) return true;
+        if (state.endermanRequest != null) return true;
+        if (enemyMoving && enderman.getUUID().toString().equals(queue.current())) return true;
+        return enderman.fallDistance > 1.0F;
+    }
+
+    /** A projectile or a cast is only this unit's business when its source belongs to the other side. */
+    private boolean endermanAttackIsOpposed(EnemyState state, DamageSource source) {
+        if (source == null) return false;
+        Entity attacker = source.getEntity();
+        if (attacker instanceof LivingEntity living && living != state.mob && opposed(state.mob, living)) return true;
+        Entity direct = source.getDirectEntity();
+        return direct instanceof LivingEntity living && living != state.mob && opposed(state.mob, living);
+    }
+
+    /**
+     * Start one own turn of a controlled enderman.
+     *
+     * <p>Fresh quotas for this turn, the exposure fact read from the entity itself, and - when it is really
+     * standing in water or rain - one real native hit of the same drown source vanilla would have applied per
+     * tick. This is the encounter's whole water clock: vanilla's per-tick call is suspended while this handler
+     * is installed, so nothing is lost on wall-clock ticks and nothing is settled twice.</p>
+     */
+    private void beginEndermanTurn(EnemyState state) {
+        if (!isEndermanActor(state.mob) || !(state.mob instanceof EnderMan enderman)) return;
+        state.endermanTeleportsLeft = 1;
+        state.endermanReactionSuccess = false;
+        state.endermanScanned = false;
+        state.endermanProposal = null;
+        state.endermanRequest = null;
+        state.endermanEscapeThisTurn = state.endermanPendingEscape;
+        state.endermanPendingEscape = false;
+        state.endermanExposed = enderman.isInWaterRainOrBubble();
+        if (!state.endermanExposed) return;
+        state.endermanEscapeThisTurn = true;
+        if (enderman.isAlive() && !enderman.isRemoved()) {
+            journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_WATER_CLOCK, BattleText.name(enderman)));
+            enderman.hurt(level.damageSources().drown(), 1.0F);
+        }
+    }
+
+    /** Install the single routing handler this unit's native teleports answer to. */
+    private void installEndermanHandler(EnemyState state) {
+        if (!isEndermanActor(state.mob)) return;
+        state.endermanHandler = new EndermanHandler(state);
+        endermanAccess(state.mob).tactical$setLandingHandler(state.endermanHandler);
+    }
+
+    /**
+     * Give the unit back to its own vanilla behaviour and drop every transient of this encounter.
+     *
+     * <p>Idempotent and safe on a dead, removed or already-released unit: the carried block, the equipment and
+     * the final position are the entity's own and are never restored from an admission snapshot.</p>
+     */
+    private void releaseEndermanState(EnemyState state) {
+        if (state == null || state.endermanHandler == null) return;
+        state.endermanHandler = null;
+        state.endermanTeleportsLeft = 0;
+        state.endermanReactionSuccess = false;
+        state.endermanScanned = false;
+        state.endermanProposal = null;
+        state.endermanRequest = null;
+        state.endermanPendingEscape = false;
+        state.endermanEscapeThisTurn = false;
+        state.endermanHurtDepth = 0;
+        state.endermanHurtBranch = false;
+        if (state.mob instanceof TacticalEndermanAccess access) access.tactical$setLandingHandler(null);
+    }
+
+    /**
+     * The mixin-facing view of one controlled enderman.
+     *
+     * <p>Everything it answers is read from the encounter's live state and re-validated against the live world,
+     * so a stale handler can never move a released unit or charge a finished encounter.</p>
+     */
+    private final class EndermanHandler implements EndermanLandingHandler {
+        private final EnemyState state;
+
+        private EndermanHandler(EnemyState state) {
+            this.state = state;
+        }
+
+        /**
+         * The landing gate: the point vanilla is about to use, after every event listener re-pointed it.
+         *
+         * <p>Answers only inside a request the encounter itself opened. The point must still be within this
+         * ruleset's range of where the body really stood when the request began, must not be the cell it already
+         * occupies, must be a real supported stand, and - when the request exists to leave water or rain - must
+         * really be dry. Anything else is refused before the body moves.</p>
+         */
+        @Override
+        public boolean tactical$mayUseLanding(EnderMan enderman, double x, double y, double z) {
+            if (!liveEndermanState(state) || state.mob != enderman) return false;
+            EndermanRequest request = state.endermanRequest;
+            if (request == null || request.attempts >= request.attemptsAllowed) return false;
+            request.attempts++;
+            EndermanLanding.Landing landing = EndermanLanding.resolve(level, enderman, x, y, z);
+            if (landing == null) return false;
+            // The upper bound is about the point that will really be used, not about the proposal.
+            if (request.originFeet.distanceTo(landing.feet()) > BattleRules.ENDERMAN_TELEPORT_RANGE) return false;
+            // A "relocation" onto the cell it already occupies is a paid no-op, and its real feet prove it.
+            if (landing.cell().equals(request.originCell)
+                    && request.originFeet.distanceTo(landing.feet()) < 0.5D) return false;
+            // The purpose the request was opened for has to survive the event's own answer as well.
+            if (request.escape && EndermanLanding.exposed(level, enderman, landing.feet())) return false;
+            if (!EndermanLanding.legal(level, enderman, landing,
+                    cell -> occupiedByOthers(state, cell), zone)) return false;
+            request.allowed = landing;
+            return true;
+        }
+
+        /**
+         * One real damage call: vanilla's own path first, then at most the one reaction the native
+         * projectile/potion branch is allowed.
+         *
+         * <p>Vanilla answers the branch with {@code true} exactly when one of its own free teleports succeeded;
+         * this ruleset keeps that immunity but replaces the free dodge with one bounded, paid one, so a
+         * legitimate projectile or water-bottle hit stays absorbed while the relocation itself may be refused.
+         * Everything else - a plain melee, a blast, an unowned environment hit, an invulnerable source - keeps
+         * vanilla's own answer and never buys a dodge.</p>
+         */
+        @Override
+        public boolean tactical$hurt(EnderMan enderman, DamageSource source, float amount,
+                                     java.util.function.BooleanSupplier vanillaHurt) {
+            if (!liveEndermanState(state) || state.mob != enderman) return vanillaHurt.getAsBoolean();
+            // One hurt, one reaction: a nested damage call inside this one reuses the outer decision.
+            if (state.endermanHurtDepth > 0) return vanillaHurt.getAsBoolean();
+            boolean branch = endermanDamageBranch(source);
+            boolean invulnerable = enderman.isInvulnerableTo(source);
+            state.endermanHurtDepth++;
+            state.endermanHurtBranch = branch;
+            try {
+                // Vanilla's own damage path first: the clean-water hit, the real melee damage and the death
+                // handling are vanilla's, and vanilla's own order settles the bottle before any dodge.
+                boolean vanilla = vanillaHurt.getAsBoolean();
+                if (!branch || invulnerable || !enderman.isAlive() || enderman.isRemoved()) return vanilla;
+                boolean moved = endermanReaction(state, enderman, source);
+                // A successful paid dodge replaces vanilla's successful teleport answer; a rejected dodge
+                // keeps the native hurt result (including false for an immune arrow/trident hit).
+                return vanilla || moved;
+            } finally {
+                state.endermanHurtDepth--;
+                state.endermanHurtBranch = false;
+            }
+        }
+
+        @Override
+        public boolean tactical$ownsWaterClock(EnderMan enderman) {
+            return liveEndermanState(state) && state.mob == enderman;
+        }
+
+        /**
+         * A vanilla free relocation was attempted for this unit.
+         *
+         * <p>The dodge loop of one projectile/potion hit is not an escape request: that hit is answered by the
+         * one bounded reaction, and turning every refused attempt into a paid escape next turn would let a
+         * bystander's arrow cost this unit AP. Only a genuinely unowned environmental escape survives.</p>
+         */
+        @Override
+        public void tactical$onFreeTeleportRefused(EnderMan enderman) {
+            if (!liveEndermanState(state) || state.mob != enderman) return;
+            if (state.endermanHurtDepth > 0 && state.endermanHurtBranch) return;
+            state.endermanPendingEscape = true;
+        }
+    }
+
+    /**
+     * Vanilla's own projectile/potion branch of {@code EnderMan.hurt}, read from its own condition.
+     *
+     * <p>That branch is the only place vanilla dodges a hit for free, so it is the only place this ruleset may
+     * replace the dodge with its bounded, paid one. A plain melee, a blast or an unowned environment hit never
+     * teleports a vanilla enderman and therefore never buys a reaction here.</p>
+     */
+    private static boolean endermanDamageBranch(DamageSource source) {
+        return source != null && (source.is(net.minecraft.tags.DamageTypeTags.IS_PROJECTILE)
+                || source.getDirectEntity() instanceof ThrownPotion);
+    }
+
+    /** The cells this enderman's real 2.9 high body could really stand in, from the same gate as its landings. */
+    private List<GridPos> endermanEdges(EnemyState state, List<GridPos> edges) {
+        if (!(state.mob instanceof EnderMan enderman)) return edges;
+        List<GridPos> legal = new ArrayList<>(edges.size());
+        for (GridPos edge : edges) {
+            EndermanLanding.Landing landing = new EndermanLanding.Landing(edge, feetAtCell(state, edge));
+            if (EndermanLanding.legal(level, enderman, landing, cell -> false, zone)) legal.add(edge);
+        }
+        return legal;
+    }
+
+    /**
+     * A short affordable walk out of water or rain, or an empty path when there is none.
+     *
+     * <p>The route is the same terrain the movement code validates against, and it is limited by what this own
+     * turn can really pay for. Walking toward the opponent is never a substitute for it: the whole point is
+     * leaving the exposed cell, so a route that ends anywhere else is not this answer.</p>
+     */
+    private List<GridPos> dryEscapePath(EnemyState state) {
+        if (state == null || !isEndermanActor(state.mob)) return List.of();
+        if (!liveEndermanState(state)) return List.of();
+        if (!(state.mob instanceof EnderMan enderman) || !isActorTurn(state.mob)) return List.of();
+        int moveCost = Math.max(1, state.moveCost);
+        int budget = Math.min(state.ap / moveCost, 8);
+        if (budget <= 0) return List.of();
+        if (!EndermanLanding.exposed(level, enderman, enderman.position())) return List.of();
+        java.util.Map<GridPos, GridPos> parent = new LinkedHashMap<>();
+        java.util.Map<GridPos, Integer> depth = new LinkedHashMap<>();
+        java.util.ArrayDeque<GridPos> frontier = new java.util.ArrayDeque<>();
+        parent.put(state.cell, null);
+        depth.put(state.cell, 0);
+        frontier.add(state.cell);
+        int examined = 0;
+        GridPos dry = null;
+        while (!frontier.isEmpty() && dry == null) {
+            GridPos from = frontier.poll();
+            int step = depth.get(from);
+            if (step >= budget) continue;
+            for (GridPos next : endermanEdges(state, navigator.neighbours(from))) {
+                if (parent.containsKey(next) || occupiedByOthers(state, next) || !zone.contains(next)) continue;
+                parent.put(next, from);
+                depth.put(next, step + 1);
+                if (++examined > 512) return List.of();
+                if (!EndermanLanding.exposed(level, enderman, feetAtCell(state, next))) {
+                    dry = next;
+                    break;
+                }
+                frontier.add(next);
+            }
+        }
+        if (dry == null) return List.of();
+        java.util.LinkedList<GridPos> path = new java.util.LinkedList<>();
+        for (GridPos at = dry; at != null && !at.equals(state.cell); at = parent.get(at)) path.addFirst(at);
+        return List.copyOf(path);
+    }
+
     private AiContext aiContext(EnemyState state) {
         LivingEntity opponent = actionOpponent(state);
         GridPos opponentCell = participantCell(opponent);
@@ -4288,16 +5101,33 @@ public final class ServerBattle {
             public List<GridPos> airNeighbors(GridPos from) { return AerialMovement.neighbors(level, state.mob, from, state.airOffset, this::occupied, zone::contains); }
             public List<GridPos> pathToPlayer() {
                 if (opponent == null) return List.of();
-                return state.flying ? AerialMovement.approach(state.cell, state.ap / Math.max(1, state.moveCost), this::airNeighbors,
-                        c -> inMeleeRange(c, selectedCell), c -> c.manhattanDistance(selectedCell))
-                        : navigator.path(state.cell, selectedCell, ServerBattle.this::passable, 4096, true);
+                if (state.flying) return AerialMovement.approach(state.cell, state.ap / Math.max(1, state.moveCost), this::airNeighbors,
+                        c -> inMeleeRange(c, selectedCell), c -> c.manhattanDistance(selectedCell));
+                // A drowned crosses water: its route comes from the same amphibious edges its steps are
+                // validated against, and the opponent's own cell stays a legal final edge so the approach can
+                // end in melee exactly as the ground route does.
+                if (state.amphibious) return AerialMovement.approach(state.cell,
+                        state.ap / Math.max(1, state.moveCost),
+                        cell -> {
+                            List<GridPos> edges = new java.util.ArrayList<>(
+                                    ServerBattle.this.amphibiousNeighbours(state, cell));
+                            if (AerialMovement.adjacent(cell, selectedCell)) edges.add(selectedCell);
+                            return edges;
+                        },
+                        c -> inMeleeRange(c, selectedCell), c -> c.manhattanDistance(selectedCell));
+                return navigator.path(state.cell, selectedCell, ServerBattle.this::passable, 4096, true);
             }
             public List<GridPos> standableNeighbors(GridPos cell) {
                 if (state.flying) return airNeighbors(cell);
+                if (state.amphibious) return ServerBattle.this.amphibiousNeighbours(state, cell);
                 // A door-capable actor asks the door-aware view, so the cells it was planned through - an
                 // already open doorway included - are exactly the cells its movement is validated against.
                 DoorRouteTerrain terrain = doorTerrain(state);
-                return terrain == null ? navigator.neighbours(cell) : terrain.enterableNeighbours(cell);
+                List<GridPos> edges = terrain == null ? navigator.neighbours(cell) : terrain.enterableNeighbours(cell);
+                // An enderman is 2.9 blocks tall: the two-block grid view would walk it through a hole its real
+                // body cannot pass. Its own walk view is therefore the same full-body gate its landings use.
+                if (!isEndermanActor(state.mob)) return edges;
+                return endermanEdges(state, edges);
             }
             public boolean occupied(GridPos cell) {
                 for (PlayerMember member : members.values())
@@ -4306,7 +5136,14 @@ public final class ServerBattle {
                     if (other != state && other.mob.isAlive() && !other.mob.isRemoved() && other.cell.equals(cell)) return true;
                 return false;
             }
-            public boolean inMeleeRange(GridPos from, GridPos to) { return state.flying ? Math.abs(from.x()-to.x())<=1 && Math.abs(from.y()-to.y())<=1 && Math.abs(from.z()-to.z())<=1 : ServerBattle.inMeleeRange(from,to); }
+            public boolean inMeleeRange(GridPos from, GridPos to) {
+                if (state.flying) return Math.abs(from.x()-to.x())<=1 && Math.abs(from.y()-to.y())<=1 && Math.abs(from.z()-to.z())<=1;
+                // A drowned's cell adjacency is not reach: its feet depend on the medium, so the real attack box is
+                // evaluated at the position it would really hold on that cell, exactly as the native attack does.
+                if (state.amphibious || isEndermanActor(state.mob))
+                    return ServerBattle.this.amphibiousMeleeReach(state, from, opponent);
+                return ServerBattle.inMeleeRange(from,to);
+            }
             public boolean hasLineOfSight(GridPos from, GridPos to) { return ServerBattle.this.hasLineOfSight(from,to,state.mob); }
             public int meleeCost() { return mobMeleeCost(state); }
             public int rangedCost() { return mobRangedCost(state); }
@@ -4325,6 +5162,16 @@ public final class ServerBattle {
             public boolean canThrowFrom(GridPos from) { return ServerBattle.this.canThrowFrom(state, opponent, from); }
             public boolean drinkPotion(WitchBrew brew) { return ServerBattle.this.drinkPotion(state, brew); }
             public boolean throwPotion(WitchBrew brew) { return ServerBattle.this.throwPotion(state, brew); }
+            public int tridentCost() { return ServerBattle.this.mobTridentCost(state); }
+            public boolean canThrowTridentFrom(GridPos from) {
+                return ServerBattle.this.canThrowTridentFrom(state, opponent, from);
+            }
+            public boolean throwTrident() { return ServerBattle.this.throwTrident(state); }
+            public EndermanState enderman() { return endermanState(state); }
+            public int teleportCost() { return ServerBattle.this.endermanTeleportCost(state); }
+            public boolean canTeleport() { return endermanCanTeleport(state); }
+            public boolean teleport() { return ServerBattle.this.teleport(state); }
+            public List<GridPos> dryEscapePath() { return ServerBattle.this.dryEscapePath(state); }
             public void clearPendingDrink() { state.pendingDrink = null; }
             public VindicatorRoute vindicator() { return vindicatorRoute(state); }
             public boolean breakDoor(DoorRoutePlanner.Door door) { return ServerBattle.this.breakDoor(state, door); }
@@ -4370,6 +5217,17 @@ public final class ServerBattle {
         if(result==AiResolution.ROSTER_CHANGED) {
             removeDeadEnemies();
             pruneMembers();
+            return;
+        }
+        if (result == AiResolution.RELOCATED) {
+            // The same own turn continues after a controlled relocation, with exactly one follow-up and only
+            // towards a melee or its end: no second relocation, no new walk and no fresh plan inside this turn.
+            if (finished || !enemy.mob.getUUID().toString().equals(queue.current())) return;
+            AiAction followUp = ai.afterMovement(aiContext(enemy));
+            if (followUp.kind() != AiAction.Kind.MELEE && followUp.kind() != AiAction.Kind.END_TURN) {
+                followUp = AiAction.endTurn();
+            }
+            resolveAiAction(enemy, followUp);
             return;
         }
         if (finished || !enemy.mob.getUUID().toString().equals(queue.current())) return;
@@ -4931,6 +5789,10 @@ public final class ServerBattle {
                 enemy.skillUsed=false;
                 // A guard lasts until this actor's own next turn begins, for every actor that can raise one.
                 enemy.defending=false;
+                // A controlled enderman gets its own-turn quotas here, and settles its water clock once:
+                // vanilla's per-tick water call is suspended for exactly as long as this encounter holds it.
+                beginEndermanTurn(enemy);
+                if (finished || !enemy.mob.isAlive()) return;
             }
             aiDelay = companion ? 0 : AI_TURN_DELAY;
             enemyMoving = false;
@@ -5022,6 +5884,10 @@ public final class ServerBattle {
                     terrainFall.end(entry.getKey());
                     queue.remove(entry.getKey().toString());
                     BattleEffects.forget(departed.mob);
+                    // A departed thrower's trident and pose end with its control, not later in the world.
+                    DrownedTridents.clearOwner(this, entry.getKey());
+                    releaseTridentPose(entry.getKey());
+                    releaseEndermanState(departed);
                     ai.remove(departed.mob);
                     // A departed unit gives up its ownership claim, but only this encounter's: another
                     // encounter's identical UUID or a same-UUID respawn must keep its own routing.
@@ -5839,6 +6705,9 @@ public final class ServerBattle {
                 String id = unit.id().toString();
                 boolean acting = id.equals(queue.current());
                 dropBlazeVolleyFor(unit.id(), enemy);
+                // A unit that disappears mid-fall also stops owning its trident and its throw pose.
+                DrownedTridents.clearOwner(this, unit.id());
+                releaseTridentPose(unit.id());
                 enemies.remove(unit.id());
                 queue.remove(id);
                 BattleEffects.forget(enemy.mob);
@@ -6314,6 +7183,12 @@ public final class ServerBattle {
         int moveCost;
         final int initiative;
         final boolean flying;
+        /**
+         * True for the one vanilla type that really swims: the drowned keeps water cells as cells, is pinned
+         * where it really is instead of being snapped onto a floor, and steps with the 26-way water rule.
+         * It is deliberately not {@link #flying}: a drowned in clear air is not a supported position.
+         */
+        final boolean amphibious;
         Vec3 airOffset;
         /**
          * Set only for a hand-commanded companion: the adapter that claimed it and the controller it answers
@@ -6347,6 +7222,35 @@ public final class ServerBattle {
         TacticalWitchAccess.WitchDrink witchDrink;
         /** True once this encounter really settled that carried-over drink, so it is never recreated. */
         boolean witchDrinkResolved;
+        /**
+         * Enderman transients. The handler is the routing seam the native mixins ask while this encounter holds
+         * that unit; every other field is this encounter's own decision state and is dropped on release, so a
+         * released or dead enderman is a plain vanilla enderman with no leftover quota.
+         */
+        EndermanLandingHandler endermanHandler;
+        /** Own-turn relocation quota: one attempt per own turn, reset when that turn begins. */
+        int endermanTeleportsLeft;
+        /**
+         * The one successful reaction of this cycle. Only a reaction that really moved the body spends it, so a
+         * refused attempt (no price, no point, a vetoing event) stays free and a later real hit may still react.
+         */
+        boolean endermanReactionSuccess;
+        /** The raw water/rain exposure this own turn started with, read from the entity itself. */
+        boolean endermanExposed;
+        /** A free relocation vanilla would have performed became a request for this unit's own turn. */
+        boolean endermanPendingEscape;
+        /** That request, handed to exactly one own turn's plan. */
+        boolean endermanEscapeThisTurn;
+        /** The bounded proposal scan of this own turn already ran; it never runs twice. */
+        boolean endermanScanned;
+        /** The single landing proposal this own turn plans, validates and commits against. */
+        EndermanLanding.Landing endermanProposal;
+        /** The one native relocation request in flight; the landing gate answers only inside it. */
+        EndermanRequest endermanRequest;
+        /** Depth guard: one hurt call owns one reaction, and a nested damage reuses that decision. */
+        int endermanHurtDepth;
+        /** Whether that hurt is the native projectile/potion branch, so its refused dodge is not an escape. */
+        boolean endermanHurtBranch;
 
         EnemyState(Mob mob, GridPos cell, int ap, int maxAp, int moveCost, int initiative, BattleSide side,
                    boolean originalNoAi, boolean originalPersistenceRequired, Vec3 originalPosition,
@@ -6360,6 +7264,7 @@ public final class ServerBattle {
             this.originalTarget = originalTarget;
             this.originalFallDistance = originalFallDistance;
             this.flying=AerialMovement.supports(mob);
+            this.amphibious=AmphibiousMovement.supports(mob);
             this.airOffset=mob.position().subtract(new Vec3(cell.x()+.5,cell.y(),cell.z()+.5));
             this.cell = cell;
             this.ap = ap;

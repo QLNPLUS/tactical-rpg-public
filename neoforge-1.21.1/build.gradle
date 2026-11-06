@@ -144,6 +144,24 @@ neoForge {
         // Vindicator axe/door fixture: own isolated world and its own port, so it can never share a battle.
         // Real oak doors, real axe damage and the real cancellable entity-break event are only decidable on a
         // booted dedicated server; no client and no shared dev world is involved.
+        serverDrownedTest {
+            server()
+            gameDirectory = file('run-server-drowned-test')
+            // A real pool, a real water cell admission and a real thrown trident are only decidable on a booted
+            // server; the throwaway world and ephemeral port keep it away from every other fixture.
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'drowned'
+            systemProperty 'tactical.dev.trace', 'true'
+        }
+        // Enderman fixture: its own throwaway world and ephemeral port, so a native teleport can be proven on a
+        // booted server without touching any other fixture.
+        serverEndermanTest {
+            server()
+            gameDirectory = file('run-server-enderman-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'enderman'
+            systemProperty 'tactical.dev.trace', 'true'
+        }
         serverVindicatorTest {
             server()
             gameDirectory = file('run-server-vindicator-test')

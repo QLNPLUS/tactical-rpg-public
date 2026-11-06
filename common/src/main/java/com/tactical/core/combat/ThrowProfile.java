@@ -15,6 +15,17 @@ public record ThrowProfile(float speed, boolean gravity, double drag, double wat
     /** Vanilla splash potion thrown by a witch: 0.75 speed, 0.05 gravity, 0.99 air / 0.8 water drag. */
     public static final ThrowProfile SPLASH_POTION = new ThrowProfile(0.75F, true, 0.99D, 0.8D);
 
+    /**
+     * The trident a drowned really throws: 1.6 speed, 0.05 gravity, and a 0.99 multiplier in water just as
+     * in air.
+     *
+     * <p>This is deliberately its own profile rather than an arrow's: a thrown trident keeps almost all of
+     * its speed under water, which is exactly why a drowned can hit a target from inside a lake. The numbers
+     * come from {@link TridentThrow} so the launch, the flight and the prediction cannot drift apart.</p>
+     */
+    public static final ThrowProfile TRIDENT =
+            new ThrowProfile(TridentThrow.SPEED, true, TridentThrow.AIR_DRAG, TridentThrow.WATER_DRAG);
+
     public ThrowProfile {
         if (!(speed > 0.0F)) throw new IllegalArgumentException("A thrown projectile needs a launch speed");
         if (!(drag > 0.0D && drag <= 1.0D)) throw new IllegalArgumentException("Drag must be in (0, 1]");

@@ -1,0 +1,14 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.tactical.neoforge.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "EnderManTeleportInvoker",
+    "TacticalEndermanMixin",
+    "EndermanWaterClockMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

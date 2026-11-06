@@ -68,6 +68,8 @@ public final class BattleText {
     public static final String KEY_ATTACK_ENEMY_THROW = "tactical.journal.attack.enemy_throw";
     /** One blaze salvo: a single paid main action however many fireballs it really fired. */
     public static final String KEY_ATTACK_ENEMY_FIREBALL = "tactical.journal.attack.enemy_fireball";
+    /** One drowned trident throw: the entity's own native ranged attack, not a player throw. */
+    public static final String KEY_ATTACK_ENEMY_TRIDENT = "tactical.journal.attack.enemy_trident";
     public static final String KEY_WEAPON_BOW = "tactical.journal.weapon.bow";
     public static final String KEY_WEAPON_CROSSBOW = "tactical.journal.weapon.crossbow";
 
@@ -85,6 +87,8 @@ public final class BattleText {
     // ---- enemy actions --------------------------------------------------------------------
 
     public static final String KEY_ENEMY_FLIGHT_BLOCKED = "tactical.journal.enemy.flight_blocked";
+    /** A swim or shore step is no longer legal; the unwalked steps are given back and the turn ends. */
+    public static final String KEY_ENEMY_SWIM_BLOCKED = "tactical.journal.enemy.swim_blocked";
     public static final String KEY_ENEMY_DIVE_MISSED = "tactical.journal.enemy.dive_missed";
     public static final String KEY_ENEMY_NO_SHOT = "tactical.journal.enemy.no_shot";
     /** The blaze's own charge started; the wall-clock number is the vanilla charge length. */
@@ -103,6 +107,14 @@ public final class BattleText {
     public static final String KEY_ENEMY_DOOR_REFUSED = "tactical.journal.enemy.door_refused";
     /** The route changed under the actor, so the unwalked steps were given back and the turn ended. */
     public static final String KEY_ENEMY_ROUTE_BLOCKED = "tactical.journal.enemy.route_blocked";
+    /** The enderman really relocated through vanilla's own teleport entry, at its own price. */
+    public static final String KEY_ENEMY_TELEPORT = "tactical.journal.enemy.teleport";
+    /** No landing point, price or quota this turn: nothing moved and nothing was charged. */
+    public static final String KEY_ENEMY_TELEPORT_REFUSED = "tactical.journal.enemy.teleport_refused";
+    /** The enderman spent its one reaction of this cycle to leave the spot it was hit from. */
+    public static final String KEY_ENEMY_TELEPORT_REACTION = "tactical.journal.enemy.teleport_reaction";
+    /** Its own turn starts with one real native water/rain hit instead of wall-clock ticks. */
+    public static final String KEY_ENEMY_WATER_CLOCK = "tactical.journal.enemy.water_clock";
     /** Prefix of the potion names a witch row carries as an argument, e.g. {@code tactical.brew.healing}. */
     public static final String BREW_PREFIX = "tactical.brew.";
     public static final String KEY_ENEMY_FLIGHT_MOVE = "tactical.journal.enemy.flight_move";
