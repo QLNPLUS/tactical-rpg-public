@@ -122,6 +122,7 @@ public final class BattleAiSession {
         AiAction action = validate(context, proposed);
         switch (action.kind()) {
             case MOVE, DIVE -> throw new IllegalArgumentException("Battle owner must animate MOVE/DIVE; never resolve DIVE as an instant attack");
+            case SPIDER_LEAP -> throw new IllegalArgumentException("Battle owner must animate SPIDER_LEAP; never resolve a leap as an instant attack");
             case MELEE -> context.attackPlayer();
             case RANGED -> context.rangedAttackPlayer();
             case DRINK_POTION -> {
@@ -277,8 +278,27 @@ public final class BattleAiSession {
                 return AiAction.endTurn();
             }
         }
+        if (action.kind() == AiAction.Kind.SURFACE_MOVE) {
+            // Only an actor with a real surface policy may route this way, the route has to hold in the live
+            // world node by node, and it may not cost more edges than the actor can still pay for while
+            // keeping one melee. A refused route charges nothing and is never walked halfway.
+            int budget = context.surfaceEdgeBudget();
+            if (context.surfaceHere() == null || budget <= 0 || action.surface().size() > budget
+                    || !context.surfaceRouteHolds(action.surface())) {
+                Tactical.LOGGER.debug("[Tactical] AI surface route rejected for {}: no surface, no budget or a "
+                        + "route the live world no longer holds", context.actor().getUUID());
+                return AiAction.endTurn();
+            }
+        }
+        if (action.kind() == AiAction.Kind.SPIDER_LEAP
+                && (context.leapCost() <= 0 || context.ap() < context.leapCost() || !context.canLeap())) {
+            // No quote, no price the unit can pay, no unused leap this own turn, or a proposal the live world
+            // no longer carries: refused here, before anything is charged and before the body leaves the floor.
+            return AiAction.endTurn();
+        }
         if (action.kind() == AiAction.Kind.MELEE && (context.meleeCost() <= 0 || context.ap() < context.meleeCost()
-                || !context.inMeleeRange(context.actorCell(), context.targetCell()))) {
+                || !context.inMeleeRange(context.actorCell(), context.targetCell())
+                || (context.surfaceHere() != null && !context.surfaceMeleeReach(context.surfaceHere())))) {
             return AiAction.endTurn();
         }
         if (action.kind() == AiAction.Kind.RANGED

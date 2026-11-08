@@ -42,6 +42,16 @@ public final class BattleRules {
     public static final int ENDERMAN_NATIVE_CALLS = 64;
     /** Below this real distance the unit walks instead of teleporting, unless the environment forces it out. */
     public static final double ENDERMAN_SHORT_RANGE = 6.0D;
+    /**
+     * Base price of one short leap: this ruleset's value, not a vanilla fact.
+     *
+     * <p>Vanilla's leap goal is free and randomly scheduled; an encounter spends one main action on it, so it
+     * shares the same successful-action surcharge as every other main action. At the default prices a spider
+     * that has not acted yet pays 10 for the leap and then the ordinary 13 for the follow-up bite.</p>
+     */
+    public static final int SPIDER_LEAP_COST = 10;
+    /** The fixed animation length of one short leap, in server ticks. */
+    public static final int SPIDER_LEAP_TICKS = 12;
     public static final int FLEE_COST = 50;
 
     public static final int FLEE_IMMUNITY_TICKS = 200;

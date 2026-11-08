@@ -107,6 +107,8 @@ public final class BattleText {
     public static final String KEY_ENEMY_DOOR_REFUSED = "tactical.journal.enemy.door_refused";
     /** The route changed under the actor, so the unwalked steps were given back and the turn ended. */
     public static final String KEY_ENEMY_ROUTE_BLOCKED = "tactical.journal.enemy.route_blocked";
+    /** A spider really left the floor on its one short leap of this own turn. */
+    public static final String KEY_ENEMY_LEAP = "tactical.journal.enemy.leap";
     /** The enderman really relocated through vanilla's own teleport entry, at its own price. */
     public static final String KEY_ENEMY_TELEPORT = "tactical.journal.enemy.teleport";
     /** No landing point, price or quota this turn: nothing moved and nothing was charged. */

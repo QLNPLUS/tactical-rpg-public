@@ -61,6 +61,7 @@ import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.monster.Blaze;
 import net.minecraft.world.entity.monster.EnderMan;
+import net.minecraft.world.entity.monster.Spider;
 import net.minecraft.world.entity.monster.Vindicator;
 import net.minecraft.world.entity.monster.Witch;
 import net.minecraft.world.entity.projectile.ThrownPotion;
@@ -460,6 +461,9 @@ public final class ServerBattle {
         boolean projectileChanged = projectiles.tick();
         removeDeadEnemies();
         if (finished) return;
+        // A wall removed under a held spider must not stay a phantom hold: the pose is dropped here, before the
+        // fall rule asks whether the unit carries itself.
+        maintainSpiderSurfaces();
         // The blaze salvo owns the turn while it runs: charge first, then its three shots, then hand back.
         tickBlazeVolley();
         if (finished) return;
@@ -595,6 +599,7 @@ public final class ServerBattle {
         // No fall may outlive the encounter: its state and its reservations. The client interpolation of
         // each member is cancelled by releaseMemberVisuals below, on the same exit snapshot.
         terrainFall.clear();
+        spiderFallFeet.clear();
         pendingTurnAdvance = false;
         // Dead/disconnected players still own a connection and must receive the exit snapshot.
         for (PlayerMember member : List.copyOf(members.values())) {
@@ -617,6 +622,7 @@ public final class ServerBattle {
             state.mob.setTarget(null);
             releaseWitchState(state);
             releaseEndermanState(state);
+            releaseSpiderState(state);
         }
         enemies.clear();
         for (Mob bystander : bystanders) {
@@ -1326,6 +1332,9 @@ public final class ServerBattle {
             // The one routing seam this unit's native teleports and its water clock answer to. Installed here,
             // after the transaction succeeded, and released by every exit path below.
             installEndermanHandler(state);
+            // The same single commit point for a spider's surface: the node it was really admitted on, plus
+            // the pose seam its own tick answers. From here until release, this encounter owns that surface.
+            installSpiderState(state);
             if (DeveloperTrace.enabled()) {
                 // Development trace: which exact unit joined which encounter. Needed because a client
                 // mirror cannot tell two same-typed mobs apart.
@@ -1402,6 +1411,7 @@ public final class ServerBattle {
         if (state == null || state.mob == null) return;
         ai.remove(state.mob);
         releaseEndermanState(state);
+        releaseSpiderState(state);
         restoreUnit(state.mob, state.originalNoAi, state.originalPersistenceRequired,
                 state.originalPosition, state.originalTarget, state.originalFallDistance,
                 state.originalBlazeCharged);
@@ -2904,6 +2914,16 @@ public final class ServerBattle {
             advanceTurn();
             return;
         }
+        // A leap in flight owns the turn its own arc, exactly like a walked edge owns its segment.
+        if (enemy.leap != null) {
+            stepSpiderLeap(enemy);
+            return;
+        }
+        // A spider walks surfaces, not cells: its own bounded control is the only thing that moves that body.
+        if (enemy.spider != null) {
+            stepSpider(enemy);
+            return;
+        }
         if (!enemyStepping) {
             if (enemyPathIndex >= enemyPath.size()) {
                 enemyMoving = false;
@@ -3007,6 +3027,348 @@ public final class ServerBattle {
                 sendState();
             }
         }
+    }
+
+    /**
+     * One surface step of a spider: the same animation budget, the same re-check before every edge and the same
+     * bounded hand-back as an ordinary move, only along real surface nodes instead of plain cells.
+     *
+     * <p>Each edge is re-proved against the live world before a single tick of it is walked - a wall broken in
+     * the meantime stops the body where it really is, gives back the edges it will not walk and ends the turn
+     * instead of walking through the hole. The route's end and the follow-up melee are the same single
+     * {@code afterMovement} call every adapter gets, so a spider can never plan a second route in one turn.</p>
+     */
+    private void stepSpider(EnemyState enemy) {
+        SpiderTraversal walk = enemy.spider;
+        if (!walk.walking()) {
+            enemyMoving = false;
+            enemyStepping = false;
+            if (enemy.companionAdapter != null) {
+                enemyDiveAttackIndex = -1;
+                enemyDiveAttacked = false;
+                enemyDiveReservedCost = 0;
+                sendState();
+                return;
+            }
+            if (!targetLost(enemy)) resolveAiAction(enemy, ai.afterMovement(aiContext(enemy)));
+            else if (!replanAfterLostTarget(enemy)) advanceTurn();
+            return;
+        }
+        if (!enemyStepping) {
+            SpiderSurface.Node from = walk.node();
+            SpiderSurface.Node to = walk.stepTarget();
+            boolean hold = from != null && spiderHoldStillHolds(enemy, from);
+            boolean edge = hold && to != null && spiderEdgeStillHolds(enemy, from, to);
+            if (!hold || !edge) {
+                if (DeveloperTrace.enabled()) {
+                    Tactical.LOGGER.info("[Tactical] dev-trace spider edge refused session={} tick={} uuid={} "
+                                    + "hold={} edge={} from={} to={}",
+                            session.sessionId(), ticks, enemy.mob.getUUID(), hold, edge, from, to);
+                }
+                stopSpiderSurface(enemy);
+                return;
+            }
+            enemyStepFrom = enemy.mob.position();
+            faceDirection(enemy.mob, to.cell());
+            enemyStepProgress = 0;
+            enemyStepping = true;
+            walk.motion(enemyStepFrom);
+        }
+        SpiderSurface.Node target = walk.stepTarget();
+        if (target == null) {
+            stopSpiderSurface(enemy);
+            return;
+        }
+        // The leg the body is really on is re-proved on every animation tick: a wall taken out mid-edge, a
+        // block placed in front of it, a body stepping into the sweep or the battlefield shrinking stop the
+        // body where it really is instead of letting it finish a segment that no longer exists.
+        int frames = SpiderSurface.stepFrames(stepTicks, enemyStepFrom, target.feet());
+        double progress = Math.min(1.0D, (enemyStepProgress + 1) / (double) frames);
+        Vec3 point = SpiderSurface.stepPoint(enemyStepFrom, target.feet(), progress);
+        if (!spiderLegStillHolds(enemy, enemy.mob.position(), point, target)) {
+            stopSpiderSurface(enemy);
+            return;
+        }
+        enemyStepProgress++;
+        enemy.mob.setPos(point);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        walk.motion(point);
+        if (progress >= 1.0D) {
+            walk.landed();
+            SpiderSurface.Node arrived = walk.node();
+            enemy.cell = arrived.cell();
+            enemy.mob.setPos(arrived.feet());
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            enemyStepping = false;
+        }
+    }
+
+    /**
+     * One frame of a short leap: the same bounded, re-proved animation every other movement here uses, along the
+     * one arc that was proposed for this own turn.
+     *
+     * <p>Before the body is displaced at all, the leg it is about to fly is re-proved as a full-body sweep - a
+     * block placed in the arc, a pool, another body, an unloaded chunk or a shrunken battlefield stops it - and
+     * so is the landing. If nothing has moved yet the whole leap is refused for free and the body keeps the node
+     * it stands on. Once the body really left the floor the leap is not refunded: it is stopped exactly where it
+     * really is, the hold is dropped and the existing fall rule owns the rest of the descent. The body is never
+     * pulled back to its take-off point and the encounter is never left busy.</p>
+     */
+    private void stepSpiderLeap(EnemyState enemy) {
+        LeapRun run = enemy.leap;
+        if (run == null) {
+            enemyMoving = false;
+            advanceTurn();
+            return;
+        }
+        if (finished || ending) {
+            // The encounter is over: no turn is advanced and no fall is started from here.
+            enemy.leap = null;
+            enemyMoving = false;
+            enemyStepping = false;
+            return;
+        }
+        if (enemy.spider == null || run.epoch != turnEpoch() || !isActorTurn(enemy.mob)) {
+            abandonLeap(enemy, !run.paid);
+            return;
+        }
+        Vec3 real = enemy.mob.position();
+        Vec3 point = run.point(run.frames + 1);
+        boolean untouched = run.frames == 0 && !run.paid;
+        if (untouched && !spiderLeapLaunchHolds(enemy, run)) {
+            // Nothing has moved and nothing is owed: the launch conditions themselves are gone.
+            abandonLeap(enemy, true);
+            return;
+        }
+        if (!SpiderLeap.sliceClear(level, enemy.mob, real, point, zone::contains)
+                || !SpiderLeap.footPathClear(real, point, cell -> occupiedByOthers(enemy, cell))
+                || !spiderLeapLandingHolds(enemy, run)) {
+            abandonLeap(enemy, untouched);
+            return;
+        }
+        enemy.mob.setPos(point);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        enemy.spider.motion(point);
+        run.frames++;
+        if (!run.paid) {
+            // The first real displacement is the moment the leap is bought: the frozen quote, one paid action
+            // and the single leap this own turn may take, all at this one point. The untouched gate above
+            // already proved this pool really covers that exact frozen price, so it is subtracted exactly and
+            // never clamped to hide a shortfall.
+            run.paid = true;
+            enemy.ap -= run.cost;
+            enemy.paidActions++;
+            enemy.spiderLeapsUsed++;
+            if (DeveloperTrace.enabled()) {
+                Tactical.LOGGER.info("[Tactical] dev-trace spider leap paid session={} tick={} uuid={} from={} "
+                                + "to={} cost={} ap={} frames={}",
+                        session.sessionId(), ticks, enemy.mob.getUUID(), run.start, point, run.cost, enemy.ap,
+                        run.frames);
+            }
+            sendState();
+        }
+        if (run.frames >= run.ticks()) landLeap(enemy, run);
+    }
+
+    /**
+     * Stop a leap that can no longer be flown and give the body back cleanly.
+     *
+     * <p>{@code free} is the untouched case: the body never left its node, so nothing was charged, no success
+     * was counted and the hold it stands on is kept. Otherwise the leap really happened, its price stays with
+     * the actor, and the body stops at the position it really reached - the hold is dropped so the existing
+     * fall rule takes over, exactly as any other unsupported unit.</p>
+     */
+    private void abandonLeap(EnemyState enemy, boolean free) {
+        LeapRun run = enemy.leap;
+        enemy.leap = null;
+        enemyMoving = false;
+        enemyStepping = false;
+        enemyPath = List.of();
+        enemyPathIndex = 0;
+        enemyDiveAttackIndex = -1;
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        SpiderTraversal walk = enemy.spider;
+        if (walk != null) walk.motion(null);
+        if (free && run != null && !run.paid) {
+            // Nothing moved, so nothing is owed: the body keeps the node it stands on, but only while the live
+            // world still carries that node - otherwise the fall rule must own it, never a phantom hold.
+            if (walk != null) walk.heldValid(SpiderSurface.isLegal(level, enemy.mob, walk.node()));
+            if (DeveloperTrace.enabled()) {
+                Tactical.LOGGER.info("[Tactical] dev-trace spider leap refused free session={} tick={} uuid={} "
+                                + "at={} proposal={}", session.sessionId(), ticks, enemy.mob.getUUID(),
+                        enemy.mob.position(), run.proposal);
+            }
+            endSpiderMotionTurn(enemy);
+            return;
+        }
+        stopLeapAtRealPosition(enemy);
+        journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_ROUTE_BLOCKED,
+                BattleText.name(enemy.mob)));
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace spider leap stopped session={} tick={} uuid={} real={} "
+                            + "paid={} ap={} cell={}", session.sessionId(), ticks, enemy.mob.getUUID(),
+                    enemy.mob.position(), run != null && run.paid, enemy.ap, enemy.cell);
+        }
+        endSpiderMotionTurn(enemy);
+    }
+
+    /**
+     * Stop an interrupted leap exactly where the body really is and give the pose back.
+     *
+     * <p>Shared by the executor's own stop and by a turn that moved for any other reason while a body was in the
+     * air: the hold is re-read from the real position, a hold the world no longer carries is dropped so the
+     * existing fall rule owns the descent, and the body is never moved back to its take-off point.</p>
+     */
+    private void stopLeapAtRealPosition(EnemyState enemy) {
+        SpiderTraversal walk = enemy.spider;
+        if (walk != null) walk.motion(null);
+        Vec3 real = enemy.mob.position();
+        GridPos realCell = new GridPos(Mth.floor(real.x), Mth.floor(real.y + 1.0E-7D), Mth.floor(real.z));
+        SpiderSurface.Node node = walk == null ? null : SpiderSurface.nodeAt(level, enemy.mob, realCell, real);
+        boolean holds = node != null && SpiderSurface.isLegal(level, enemy.mob, node);
+        if (walk != null && node != null) walk.settle(node);
+        if (walk != null) walk.heldValid(holds);
+        enemy.cell = node == null ? realCell : node.cell();
+        if (!holds && enemy.mob instanceof Spider spider) spider.setClimbing(false);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+    }
+
+    /**
+     * Set the body down on the landing it really reached and hand the turn over.
+     *
+     * <p>The landing is re-proved from the real body, then the context is asked exactly once for a follow-up,
+     * and only a melee is accepted: no second walk, no second leap and no fresh plan inside this own turn. A
+     * landing that finds its opponent gone simply ends the turn - the leap is never refunded and nothing is
+     * invented to hit.</p>
+     */
+    private void landLeap(EnemyState enemy, LeapRun run) {
+        SpiderSurface.Node landing = run.proposal.landing();
+        enemy.leap = null;
+        enemyMoving = false;
+        enemyStepping = false;
+        enemyPath = List.of();
+        enemyPathIndex = 0;
+        enemyDiveAttackIndex = -1;
+        enemy.mob.setPos(landing.feet());
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        SpiderTraversal walk = enemy.spider;
+        boolean holds = SpiderSurface.isLegal(level, enemy.mob, landing);
+        if (walk != null) {
+            walk.motion(null);
+            walk.settle(landing);
+            walk.heldValid(holds);
+        }
+        enemy.cell = landing.cell();
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace spider leap landed session={} tick={} uuid={} at={} "
+                            + "holds={} ap={} paid={}", session.sessionId(), ticks, enemy.mob.getUUID(),
+                    landing.feet(), holds, enemy.ap, enemy.paidActions);
+        }
+        if (targetLost(enemy)) {
+            sendState();
+            advanceTurn();
+            return;
+        }
+        AiAction followUp = ai.afterMovement(aiContext(enemy));
+        if (followUp.kind() == AiAction.Kind.MELEE) {
+            resolveAiAction(enemy, followUp);
+            return;
+        }
+        sendState();
+        advanceTurn();
+    }
+
+    /** One edge, re-proved: both nodes legal now, the leg swept, nobody standing on it, inside the zone. */
+    private boolean spiderEdgeStillHolds(EnemyState enemy, SpiderSurface.Node from, SpiderSurface.Node to) {
+        if (to == null) return false;
+        if (occupiedByOthers(enemy, to.cell()) || !zone.contains(to.cell())) return false;
+        if (!SpiderSurface.bodyInsideZone(enemy.mob, to, zone::contains)) return false;
+        return SpiderSurface.canStep(level, enemy.mob, from, to, zone::contains);
+    }
+
+    /** The node the body is standing on still carries it: the wall is really there, or the floor is. */
+    private boolean spiderHoldStillHolds(EnemyState enemy, SpiderSurface.Node node) {
+        if (node == null) return false;
+        if (!zone.contains(node.cell()) || occupiedByOthers(enemy, node.cell())) return false;
+        if (!SpiderSurface.bodyInsideZone(enemy.mob, node, zone::contains)) return false;
+        return SpiderSurface.isLegal(level, enemy.mob, node);
+    }
+
+    /** The part of the edge the body is really about to walk, re-proved before it is displaced any further. */
+    private boolean spiderLegStillHolds(EnemyState enemy, Vec3 from, Vec3 to, SpiderSurface.Node target) {
+        if (!SpiderSurface.sweptInsideZone(enemy.mob, from, to, zone::contains)) return false;
+        if (!spiderLegClear(enemy, from, to)) return false;
+        if (occupiedByOthers(enemy, target.cell())) return false;
+        return SpiderSurface.isLegal(level, enemy.mob, target);
+    }
+
+    /** No solid block and no liquid at all in the swept body of one leg, exactly as a planned edge required. */
+    private boolean spiderLegClear(EnemyState enemy, Vec3 from, Vec3 to) {
+        AABB swept = SpiderSurface.swept(enemy.mob, from, to);
+        return level.noCollision(enemy.mob, swept)
+                && !AmphibiousMovement.overlapsBody(level, enemy.mob, swept)
+                && !AmphibiousMovement.hazardous(level, swept)
+                && !level.containsAnyLiquid(swept);
+    }
+
+    /**
+     * Stop a spider where it really is and give back exactly the edges it will not walk.
+     *
+     * <p>No success is counted and nothing is charged again. The body is never pulled back to a node it already
+     * left: the encounter re-reads the surface from the real position, keeps the price of every edge that
+     * really moved it, and gives back only the edges in front of it. When no legal hold exists where the body
+     * really is, the hold is dropped so the existing fall rule - which no longer sees a climbing body - owns it
+     * from there.</p>
+     */
+    private void stopSpiderSurface(EnemyState enemy) {
+        SpiderTraversal walk = enemy.spider;
+        if (walk == null) {
+            advanceTurn();
+            return;
+        }
+        int unused = walk.refundable().size();
+        int spent = walk.spentEdges();
+        walk.abandonRoute();
+        enemy.ap = Math.min(enemy.maxAp, enemy.ap + unused * enemy.moveCost + enemyDiveReservedCost);
+        enemyDiveReservedCost = 0;
+        enemyPath = List.of();
+        enemyPathIndex = 0;
+        enemyMoving = false;
+        enemyStepping = false;
+        enemyDiveAttackIndex = -1;
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        Vec3 real = enemy.mob.position();
+        GridPos realCell = new GridPos(net.minecraft.util.Mth.floor(real.x), net.minecraft.util.Mth.floor(real.y),
+                net.minecraft.util.Mth.floor(real.z));
+        SpiderSurface.Node node = SpiderSurface.nodeAt(level, enemy.mob, realCell, real);
+        boolean holds = node != null && SpiderSurface.isLegal(level, enemy.mob, node);
+        if (node != null) walk.settle(node);
+        walk.heldValid(holds);
+        enemy.cell = node == null ? realCell : node.cell();
+        if (!holds && enemy.mob instanceof Spider spider) spider.setClimbing(false);
+        journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_ROUTE_BLOCKED,
+                BattleText.name(enemy.mob)));
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace spider stop session={} tick={} uuid={} real={} holds={} "
+                            + "edgesSpent={} edgesRefunded={} ap={}",
+                    session.sessionId(), ticks, enemy.mob.getUUID(), real, holds, spent, unused, enemy.ap);
+        }
+        endSpiderMotionTurn(enemy);
+    }
+
+    /** Publish the fall barrier before handing off an interrupted spider's own turn. */
+    private void endSpiderMotionTurn(EnemyState enemy) {
+        // Starting the fall next tick leaves a command/recovery window while this unsupported body is in air.
+        // Establish it now; advanceTurn then defers through the existing pendingTurnAdvance barrier.
+        startFallIfUnsupported(enemy.mob.getUUID(), false, enemy.cell, enemy.mob);
+        sendState();
+        advanceTurn();
     }
 
     /** The real point of one amphibious step at this progress, on the leg that step really takes. */
@@ -3175,6 +3537,8 @@ public final class ServerBattle {
         // touch the target must not damage it, and must therefore not pay either.
         if ((enemy.amphibious || isEndermanActor(enemy.mob))
                 && !amphibiousMeleeReach(enemy, enemy.cell, target)) return false;
+        // A spider is short: its own box decides, never the grid's one-block tolerance.
+        if (enemy.spider != null && !spiderMeleeReach(enemy, enemy.spider.node(), target)) return false;
         GridPos targetCell = participantCell(target);
         if (targetCell != null) faceDirection(enemy.mob, targetCell);
         journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_ENEMY_MELEE,
@@ -3203,6 +3567,273 @@ public final class ServerBattle {
 
     /** Vanilla's own melee reach widening ({@code Mob.DEFAULT_ATTACK_REACH}); never a per-mob guess. */
     private static final double MELEE_ATTACK_REACH = Math.sqrt(2.04F) - 0.6F;
+
+    // ------------------------------------------------------------------
+    // spiders: the surface policy, its price and its real attack box
+    // ------------------------------------------------------------------
+
+    /**
+     * The feet position one surface node really holds.
+     *
+     * <p>For the node the body occupies right now the real position is the answer - a body mid-animation or a
+     * body displaced by a knockback must be judged where it really is, not where a plan wished it. Every other
+     * node answers with the geometry it was resolved from.</p>
+     */
+    private Vec3 surfaceFeet(EnemyState state, SpiderSurface.Node node) {
+        if (node == null) return state.mob.position();
+        if (state.spider != null && node.equals(state.spider.node())) return state.mob.position();
+        return node.feet();
+    }
+
+    /**
+     * The shared melee gate for the two vanilla spider types: the real attack box, the encounter's own
+     * four-way adjacency, and the real eye position.
+     *
+     * <p>The box is vanilla's - the body widened horizontally only - so an integer-foot short body does not
+     * reach a whole block up merely because the cell is adjacent, while a fractional height is decided by the
+     * real intersection instead of a rule about integers. The line of sight starts at the actor's own eye height
+     * rather than a fixed one, so a 0.45 tall cave spider is not credited with a 1.5 tall view.</p>
+     */
+    private boolean spiderMeleeReach(EnemyState state, SpiderSurface.Node node, LivingEntity target) {
+        if (target == null || node == null) return false;
+        GridPos targetCell = participantCell(target);
+        if (targetCell == null || !inMeleeRange(node.cell(), targetCell)) return false;
+        Vec3 feet = surfaceFeet(state, node);
+        if (!SpiderSurface.attackBoxAt(state.mob, feet).intersects(target.getHitbox())) return false;
+        return realEyeLineOfSight(feet, state.mob, target);
+    }
+
+    /** A line of sight asked from the real eye, not from a fixed height that flatters a short body. */
+    private boolean realEyeLineOfSight(Vec3 feet, LivingEntity viewer, LivingEntity target) {
+        Vec3 start = new Vec3(feet.x, feet.y + viewer.getEyeHeight(), feet.z);
+        Vec3 end = target.getEyePosition();
+        BlockHitResult hit = level.clip(new ClipContext(start, end,
+                ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, viewer));
+        if (hit.getType() == HitResult.Type.MISS) return true;
+        return hit.getLocation().distanceToSqr(start) >= end.distanceToSqr(start) - 0.05D;
+    }
+
+    /** How many surface edges this actor can still pay for while keeping one melee affordable. */
+    private int spiderEdgeBudget(EnemyState state) {
+        if (state == null || state.spider == null) return 0;
+        int move = Math.max(1, state.moveCost);
+        int reserve = mobMeleeCost(state);
+        return Math.max(0, Math.min(SpiderSurface.MAX_SEARCH_NODES, (state.ap - reserve) / move));
+    }
+
+    /**
+     * Every gate a surface route has to pass, asked once against the live world.
+     *
+     * <p>Legality of every node, the swept legs between them, the roster and the whole body inside the zone. A
+     * refused route charges nothing and is never walked halfway.</p>
+     */
+    private boolean spiderRouteHolds(EnemyState state, SpiderSurface.Node start, List<SpiderSurface.Node> route) {
+        if (state == null || state.spider == null || start == null || route == null || route.isEmpty()) return false;
+        if (route.size() > SpiderSurface.MAX_SEARCH_NODES) return false;
+        if (!SpiderSurface.routeHolds(level, state.mob, route, start, zone::contains)) return false;
+        SpiderSurface.Node previous = start;
+        for (SpiderSurface.Node node : route) {
+            if (occupiedByOthers(state, node.cell()) || !zone.contains(node.cell())) return false;
+            if (!SpiderSurface.bodyInsideZone(state.mob, node, zone::contains)) return false;
+            if (!SpiderSurface.canStep(level, state.mob, previous, node, zone::contains)) return false;
+            previous = node;
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------------------
+    // spiders: the short leap - one bounded proposal, one fixed arc, one price
+    // ------------------------------------------------------------------
+
+    /** Quoted price of one short leap this own turn; zero for an actor that cannot leap at all. */
+    private int spiderLeapCost(EnemyState state) {
+        if (state == null || state.spider == null) return 0;
+        return quote(intConfig(TacticalConfig.INSTANCE.spiderLeapApCost, BattleRules.SPIDER_LEAP_COST),
+                state.paidActions);
+    }
+
+    /**
+     * The one bounded leap proposal of this own turn, resolved once and then only re-checked.
+     *
+     * <p>The cache is keyed on the authoritative turn epoch and this actor's own turn count, so the answer is
+     * stable for as long as planning, validation and the commit of that same turn can ask it, and a new own
+     * turn - or a new turn generation - resolves a fresh one. The body itself is only asked about the cached
+     * landing again, which is what keeps "is a leap available" from turning into a world scan on every getter.</p>
+     */
+    private SpiderLeap.Proposal spiderLeapProposal(EnemyState state) {
+        if (state == null || state.spider == null || finished) return null;
+        long epoch = turnEpoch();
+        if (state.leapProposalDone && state.leapProposalEpoch == epoch
+                && state.leapProposalTurn == state.ownTurns) return state.leapProposal;
+        state.leapProposalDone = true;
+        state.leapProposalEpoch = epoch;
+        state.leapProposalTurn = state.ownTurns;
+        state.leapProposal = resolveSpiderLeap(state);
+        return state.leapProposal;
+    }
+
+    /**
+     * Resolve that one proposal against the live world.
+     *
+     * <p>A leap is only worth having when it really forms an approach: the locked opponent is alive and at a
+     * real distance of two to four blocks, the body is not already able to bite it, this own turn has not
+     * leaped yet, and one of at most sixteen real landing positions is a legal floor from which the shared
+     * native attack gate reaches that opponent with a clear arc on top.</p>
+     */
+    private SpiderLeap.Proposal resolveSpiderLeap(EnemyState state) {
+        SpiderTraversal walk = state.spider;
+        if (walk == null || walk.walking() || state.leap != null || state.spiderLeapsUsed > 0) return null;
+        if (!SpiderSurface.controllable(state.mob)) return null;
+        LivingEntity target = actionOpponent(state);
+        if (target == null || !opposed(state.mob, target)) return null;
+        SpiderSurface.Node here = walk.node();
+        if (here == null || here.onWall()) return null;
+        if (spiderMeleeReach(state, here, target)) return null;
+        if (spiderLeapCost(state) <= 0) return null;
+        java.util.Optional<SpiderLeap.Proposal> found = SpiderLeap.propose(level, state.mob, here, target,
+                cell -> occupiedByOthers(state, cell), zone::contains,
+                node -> spiderMeleeReach(state, node, target));
+        if (DeveloperTrace.enabled() && found.isEmpty()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace spider leap declined session={} tick={} uuid={} here={} "
+                            + "target={} feet={} targetFeet={} range={}", session.sessionId(), ticks,
+                    state.mob.getUUID(), here, participantCell(target), state.mob.position(), target.position(),
+                    SpiderLeap.rangeTo(state.mob, target));
+        }
+        return found.orElse(null);
+    }
+
+    /**
+     * Whether this actor may spend this own turn on the leap right now, from the same state the commit uses.
+     *
+     * <p>The price, the unused quota and the cached proposal are the whole answer: nothing here moves, charges
+     * or searches for a second landing.</p>
+     */
+    private boolean spiderCanLeap(EnemyState state) {
+        if (state == null || state.spider == null || finished || ending) return false;
+        if (state.leap != null || state.spiderLeapsUsed > 0 || state.spider.walking()) return false;
+        if (!isActorTurn(state.mob) || isBusy()) {
+            if (DeveloperTrace.enabled()) {
+                Tactical.LOGGER.info("[Tactical] dev-trace spider leap not now session={} tick={} uuid={} "
+                                + "actorTurn={} busy={} fall={}", session.sessionId(), ticks, state.mob.getUUID(),
+                        isActorTurn(state.mob), isBusy(), terrainFall.busy());
+            }
+            return false;
+        }
+        int cost = spiderLeapCost(state);
+        if (cost <= 0 || state.ap < cost) return false;
+        return spiderLeapProposal(state) != null;
+    }
+
+    /**
+     * Whether the landing this leap is already flying towards is still a real place to come down.
+     *
+     * <p>Only terrain, the roster and the battlefield are re-proved here. The opponent is deliberately not
+     * part of it: once the body has left the floor a vanished target changes what happens after the landing,
+     * never whether the leap itself may finish - a leap is not refunded and never becomes a fall because the
+     * victim stepped away.</p>
+     */
+    private boolean spiderLeapLandingHolds(EnemyState state, LeapRun run) {
+        if (state == null || run == null) return false;
+        SpiderSurface.Node landing = run.proposal.landing();
+        if (!zone.contains(landing.cell()) || occupiedByOthers(state, landing.cell())) return false;
+        if (!SpiderSurface.bodyInsideZone(state.mob, landing, zone::contains)) return false;
+        return SpiderSurface.isLegal(level, state.mob, landing);
+    }
+
+    /** Every gate the commit needs, asked once against the cached proposal and the live world. */
+    private boolean spiderLeapStillHolds(EnemyState state, SpiderLeap.Proposal proposal) {
+        if (state == null || state.spider == null || proposal == null) return false;
+        if (state.spiderLeapsUsed > 0 || state.spider.walking()) return false;
+        LivingEntity target = actionOpponent(state);
+        if (target == null || !opposed(state.mob, target)) return false;
+        if (!proposal.from().equals(state.spider.node())) return false;
+        if (!SpiderSurface.isLegal(level, state.mob, proposal.from())) return false;
+        if (spiderMeleeReach(state, proposal.from(), target)) return false;
+        Vec3 start = state.mob.position();
+        if (!SpiderLeap.inRange(state.mob, target)) return false;
+        if (!zone.contains(proposal.landing().cell())
+                || occupiedByOthers(state, proposal.landing().cell())) return false;
+        if (!SpiderSurface.bodyInsideZone(state.mob, proposal.landing(), zone::contains)) return false;
+        if (!spiderMeleeReach(state, proposal.landing(), target)) return false;
+        return SpiderLeap.arcHolds(level, state.mob, start, proposal,
+                cell -> occupiedByOthers(state, cell), zone::contains);
+    }
+
+    /**
+     * Every gate the launch itself has to pass again at the first frame of the arc.
+     *
+     * <p>The commit and the first real displacement are different ticks, and anything may happen between them:
+     * the floor under the take-off can be taken away, the rest of the arc can be sealed, the opponent can leave
+     * the terms the leap was priced under, or the pool can be spent elsewhere. Until the body has really moved
+     * nothing has been charged, so a failure here is refused for free - and it is proved against the same cached
+     * proposal: no second search, no refreshed price, no widened budget.</p>
+     */
+    private boolean spiderLeapLaunchHolds(EnemyState state, LeapRun run) {
+        if (state == null || run == null || state.spider == null) return false;
+        if (finished || ending) return false;
+        if (run.epoch != turnEpoch() || !isActorTurn(state.mob)) return false;
+        if (!state.mob.isAlive() || state.mob.isRemoved() || state.mob.level() != level) return false;
+        // The frozen price has to still fit the pool exactly; a shortfall is never masked by a clamp.
+        if (state.ap < run.cost) return false;
+        if (state.spiderLeapsUsed > 0) return false;
+        if (!run.proposal.from().equals(state.spider.node())) return false;
+        // The floor it stands on is still a real floor, and the opponent is still one it cannot already bite.
+        if (!SpiderSurface.isLegal(level, state.mob, run.proposal.from())) return false;
+        LivingEntity target = lockedOpponent(state);
+        if (target == null) return false;
+        if (spiderMeleeReach(state, run.proposal.from(), target)) return false;
+        if (!SpiderLeap.inRange(state.mob, target)) return false;
+        // The whole arc is proved again, on the same proposal, with the same roster and zone gates.
+        return SpiderLeap.arcHolds(level, state.mob, state.mob.position(), run.proposal,
+                cell -> occupiedByOthers(state, cell), zone::contains)
+                && spiderLeapLandingHolds(state, run);
+    }
+
+    /** Resolve one spider's held surface again from where its body really is, dropping any stale route. */
+    private void resyncSpiderSurface(EnemyState state, GridPos cell) {
+        if (state == null || state.spider == null || cell == null) return;
+        if (!(state.mob instanceof Spider spider)) return;
+        state.spider.abandonRoute();
+        SpiderSurface.Node node = SpiderSurface.nodeAt(level, spider, cell, spider.position());
+        if (node != null) state.spider.settle(node);
+        // The hold is only as good as the live world says it is; the native movement gate answers from this.
+        state.spider.heldValid(node != null && SpiderSurface.isLegal(level, spider, node));
+        enemyStepping = false;
+    }
+
+    /**
+     * Whether the surface state of every spider still holds, once per encounter tick.
+     *
+     * <p>A wall that is gone must not remain a phantom hold: the native climbing bit is cleared first and the
+     * hold is dropped, so the existing fall rule then sees an unsupported body instead of a unit carrying
+     * itself, and the encounter's own descent settles the landing. Nothing about the surface is fabricated to
+     * keep a body in place - a node the world no longer carries is reported as such, and the outcome is the
+     * same one every other unsupported unit gets.</p>
+     */
+    private void maintainSpiderSurfaces() {
+        for (EnemyState state : List.copyOf(enemies.values())) {
+            SpiderTraversal walk = state.spider;
+            if (walk == null) continue;
+            if (state.mob.isRemoved() || !state.mob.isAlive()) continue;
+            // An edge in flight is re-proved on every animation tick by the executor itself.
+            if (walk.walking() || state.leap != null) {
+                walk.heldValid(true);
+                continue;
+            }
+            SpiderSurface.Node node = walk.node();
+            if (SpiderSurface.isLegal(level, state.mob, node)) {
+                walk.heldValid(true);
+                continue;
+            }
+            // The support is gone. Drop the claim, clear the borrowed climbing bit and let the fall rule ask.
+            walk.heldValid(false);
+            if (!node.onWall()) continue;
+            if (state.mob instanceof Spider spider) spider.setClimbing(false);
+            state.mob.setDeltaMovement(Vec3.ZERO);
+            state.mob.fallDistance = 0.0F;
+            walk.settle(SpiderSurface.Node.groundAt(node.cell(), state.mob.position()));
+        }
+    }
 
     /** Legacy name: attacks this actor's locked opponent, never its allied owner. */
     private void attackPlayer(EnemyState enemy) {
@@ -4913,6 +5544,96 @@ public final class ServerBattle {
     }
 
     /**
+     * Take this exact spider's real surface into this encounter's own state.
+     *
+     * <p>Installed after the admission transaction committed, like the enderman handler: from here the pose the
+     * vanilla tick asks for is the encounter's, so a wall position is neither overridden back to "not climbing"
+     * nor allowed to start climbing on somebody else's turn. The node is resolved from where the body really
+     * stands after deployment - never from a guess - and a failed admission clears it again.</p>
+     */
+    private void installSpiderState(EnemyState state) {
+        if (state == null || state.mob == null) return;
+        // Exact type, not riding anything and carrying no rider: those individuals keep vanilla behaviour, and
+        // this encounter neither detaches a rider nor shares another owner's mount to make its own turn easier.
+        if (!SpiderSurface.controllable(state.mob)) return;
+        if (!(state.mob instanceof Spider spider)) return;
+        SpiderSurface.Node start = SpiderSurface.nodeAt(level, spider, state.cell, spider.position());
+        if (start == null) return;
+        SpiderTraversal walk = new SpiderTraversal(start);
+        walk.heldValid(SpiderSurface.isLegal(level, spider, start));
+        state.spider = walk;
+        ((TacticalSpiderAccess) spider).tactical$setPoseHandler(new SpiderHandler(state));
+    }
+
+    /**
+     * Give a spider back to its own vanilla tick and drop every surface transient.
+     *
+     * <p>Idempotent, and it never moves, heals or re-positions the unit: a normal exit keeps the real final
+     * position, and only the borrowed pose seam is given back. A unit this encounter never took has nothing to
+     * give back, so another encounter's seam is never cleared by this path. The climbing bit is left false so a
+     * released spider starts from vanilla's own answer at its next tick instead of this encounter's last one.</p>
+     */
+    private void releaseSpiderState(EnemyState state) {
+        if (state == null) return;
+        SpiderTraversal walk = state.spider;
+        state.spider = null;
+        // A leap and its proposal belong to the controlled body: releasing the surface drops both, so a released
+        // spider is a plain vanilla one with no arc, no quota and no cached landing left behind.
+        state.leap = null;
+        state.spiderLeapsUsed = 0;
+        state.leapProposal = null;
+        state.leapProposalDone = false;
+        if (walk == null) return;
+        if (state.mob instanceof Spider spider) {
+            ((TacticalSpiderAccess) spider).tactical$setPoseHandler(null);
+            spider.setClimbing(false);
+        }
+    }
+
+    /**
+     * The mixin-facing view of one controlled spider.
+     *
+     * <p>Everything it answers is read from this encounter's live state: the exact entity, the roster entry, a
+     * live encounter and a surface it can still prove. A stale handler can therefore neither pin a released
+     * unit, nor hold a body the fall rule has taken, nor declare a wall pose for a body standing on a floor.</p>
+     */
+    private final class SpiderHandler implements SpiderPoseHandler {
+        private final EnemyState state;
+
+        private SpiderHandler(EnemyState state) {
+            this.state = state;
+        }
+
+        /** The live traversal for that exact body, or null when this encounter does not own it any more. */
+        private SpiderTraversal live(Spider spider) {
+            if (spider == null || finished || state.mob != spider) return null;
+            if (state.spider == null || enemies.get(spider.getUUID()) != state) return null;
+            if (spider.isRemoved() || !spider.isAlive() || spider.level() != level) return null;
+            // A forced fall owns the body: the encounter must not pin it back into the air.
+            if (terrainFall.unit(spider.getUUID()) != null) return null;
+            return state.spider;
+        }
+
+        @Override
+        public boolean tactical$controls(Spider spider) {
+            SpiderTraversal walk = live(spider);
+            return walk != null && walk.controls();
+        }
+
+        @Override
+        public Vec3 tactical$pinFeet(Spider spider) {
+            SpiderTraversal walk = live(spider);
+            return walk == null ? null : walk.pinFeet();
+        }
+
+        @Override
+        public boolean tactical$wallPose(Spider spider) {
+            SpiderTraversal walk = live(spider);
+            return walk != null && walk.onWall() && walk.heldValid();
+        }
+    }
+
+    /**
      * The mixin-facing view of one controlled enderman.
      *
      * <p>Everything it answers is read from the encounter's live state and re-validated against the live world,
@@ -5145,6 +5866,27 @@ public final class ServerBattle {
                 return ServerBattle.inMeleeRange(from,to);
             }
             public boolean hasLineOfSight(GridPos from, GridPos to) { return ServerBattle.this.hasLineOfSight(from,to,state.mob); }
+            // ---- surface policy: only the exact two vanilla spider types answer these ----
+            public SpiderSurface.Node surfaceHere() { return state.spider == null ? null : state.spider.node(); }
+            public List<SpiderSurface.Node> surfaceNeighbours(SpiderSurface.Node from) {
+                if (state.spider == null || from == null) return List.of();
+                return SpiderSurface.neighbours(level, state.mob, from, this::occupied, zone::contains);
+            }
+            public boolean surfaceLegal(SpiderSurface.Node node) {
+                return state.spider != null && node != null && SpiderSurface.isLegal(level, state.mob, node);
+            }
+            public boolean surfaceMeleeReach(SpiderSurface.Node node) {
+                return state.spider != null && node != null && spiderMeleeReach(state, node, opponent);
+            }
+            public boolean surfaceInsideZone(SpiderSurface.Node node) {
+                return state.spider != null && node != null && SpiderSurface.bodyInsideZone(state.mob, node, zone::contains);
+            }
+            public boolean surfaceRouteHolds(List<SpiderSurface.Node> route) {
+                return state.spider != null && spiderRouteHolds(state, state.spider.node(), route);
+            }
+            public int surfaceEdgeBudget() { return spiderEdgeBudget(state); }
+            public boolean canLeap() { return spiderCanLeap(state); }
+            public int leapCost() { return spiderLeapCost(state); }
             public int meleeCost() { return mobMeleeCost(state); }
             public int rangedCost() { return mobRangedCost(state); }
             public boolean canRangedAttack(GridPos from) { return canShootFrom(state, opponent, from); }
@@ -5204,6 +5946,58 @@ public final class ServerBattle {
             journal.record("move",BattleText.translatable(BattleText.KEY_ENEMY_MOVE,
                     BattleText.name(enemy.mob), BattleText.literal(steps.get(steps.size()-1).toString())));
             sendState();return;
+        }
+        if(action.kind()==AiAction.Kind.SURFACE_MOVE) {
+            /* One surface route for a spider. The plan is re-proved node by node against the live world and the
+               price is charged once, per edge, exactly like an ordinary move: the unwalked edges are given back
+               when the world changes under it, and movement never touches the success counter. */
+            List<SpiderSurface.Node> nodes=action.surface();
+            if(enemy.spider==null||nodes.isEmpty()||!spiderRouteHolds(enemy,enemy.spider.node(),nodes)) {advanceTurn();return;}
+            long total=(long)nodes.size()*enemy.moveCost;
+            if(total>enemy.ap){advanceTurn();return;}
+            enemy.ap-=(int)total;
+            if (DeveloperTrace.enabled()) {
+                StringBuilder route = new StringBuilder();
+                for (SpiderSurface.Node node : nodes) route.append(' ').append(node);
+                Tactical.LOGGER.info("[Tactical] dev-trace spider route session={} tick={} uuid={} from={} "
+                                + "budget={} cost={} route={}",
+                        session.sessionId(), ticks, enemy.mob.getUUID(), enemy.spider.node(),
+                        spiderEdgeBudget(enemy), total, route);
+            }
+            enemy.spider.beginRoute(nodes);
+            enemyPath=List.of();enemyPathIndex=0;enemyStepping=false;enemyMoving=true;
+            journal.record("move",BattleText.translatable(BattleText.KEY_ENEMY_MOVE,
+                    BattleText.name(enemy.mob), BattleText.literal(nodes.get(nodes.size()-1).cell().toString())));
+            sendState();return;
+        }
+        if (action.kind() == AiAction.Kind.SPIDER_LEAP) {
+            /* One short leap. The one proposal of this own turn is the only thing it may fly, and it is re-proved
+               here against the live world before the body leaves the floor: the take-off node it really holds, the
+               landing, the price, the unused quota and every frame of the arc. Nothing is charged here - the price
+               is frozen and taken out of the pool on the first frame that really displaces the body. */
+            SpiderLeap.Proposal proposal = spiderLeapProposal(enemy);
+            int cost = spiderLeapCost(enemy);
+            if (enemy.spider == null || enemy.leap != null || cost <= 0 || enemy.ap < cost
+                    || enemy.spiderLeapsUsed > 0 || !spiderLeapStillHolds(enemy, proposal)) {
+                advanceTurn();
+                return;
+            }
+            enemy.leap = new LeapRun(proposal, enemy.mob.position(), cost, turnEpoch());
+            enemyPath = List.of();
+            enemyPathIndex = 0;
+            enemyStepping = false;
+            enemyMoving = true;
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            enemy.mob.fallDistance = 0.0F;
+            journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_LEAP,
+                    BattleText.name(enemy.mob), BattleText.literal(proposal.landing().cell().toString())));
+            if (DeveloperTrace.enabled()) {
+                Tactical.LOGGER.info("[Tactical] dev-trace spider leap commit session={} tick={} uuid={} "
+                                + "from={} landing={} cost={} ap={}", session.sessionId(), ticks,
+                        enemy.mob.getUUID(), proposal.from(), proposal.landing(), cost, enemy.ap);
+            }
+            sendState();
+            return;
         }
         if (targetedAction(action.kind()) && targetLost(enemy)) {
             // The opponent this action was planned against is gone. One bounded replan is allowed; anything
@@ -5743,6 +6537,19 @@ public final class ServerBattle {
         enemyStepping = false;
         enemyPath = List.of();
         enemyDiveAttackIndex=-1;enemyDiveAttacked=false;enemyDiveReservedCost=0;
+        // A leap belongs to exactly one own turn. If the turn moved for any other reason (a member leaving, a
+        // queue rebuild) while a body was still in the air, that arc is over: it stops where it really is and
+        // the fall rule owns what happens next, so no arc can outlive its turn as a phantom hold.
+        for (EnemyState flying : enemies.values()) {
+            if (flying.leap == null) continue;
+            if (DeveloperTrace.enabled()) {
+                Tactical.LOGGER.info("[Tactical] dev-trace spider leap abandoned with its turn session={} "
+                                + "tick={} uuid={} real={} paid={}", session.sessionId(), ticks,
+                        flying.mob.getUUID(), flying.mob.position(), flying.leap.paid);
+            }
+            flying.leap = null;
+            stopLeapAtRealPosition(flying);
+        }
         for (PlayerMember member : members.values()) member.state.pendingMove(null);
         UUID id = UUID.fromString(actorId);
         PlayerMember member = members.get(id);
@@ -5793,6 +6600,15 @@ public final class ServerBattle {
                 // vanilla's per-tick water call is suspended for exactly as long as this encounter holds it.
                 beginEndermanTurn(enemy);
                 if (finished || !enemy.mob.isAlive()) return;
+                // A new own turn may leap once, and it starts with no leap from the previous turn still in
+                // flight and no cached proposal to reuse.
+                enemy.leap = null;
+                enemy.spiderLeapsUsed = 0;
+                enemy.leapProposal = null;
+                enemy.leapProposalDone = false;
+                // A spider's surface is re-read from where the body really is now: a landing, a knockback or a
+                // fall since the last own turn must never leave this turn planning on a stale node.
+                resyncSpiderSurface(enemy, enemy.cell);
             }
             aiDelay = companion ? 0 : AI_TURN_DELAY;
             enemyMoving = false;
@@ -5888,6 +6704,7 @@ public final class ServerBattle {
                     DrownedTridents.clearOwner(this, entry.getKey());
                     releaseTridentPose(entry.getKey());
                     releaseEndermanState(departed);
+                    releaseSpiderState(departed);
                     ai.remove(departed.mob);
                     // A departed unit gives up its ownership claim, but only this encounter's: another
                     // encounter's identical UUID or a same-UUID respawn must keep its own routing.
@@ -6100,6 +6917,8 @@ public final class ServerBattle {
             // physical tail onto a safe grid cell before any next action/turn.
             moveEntity(mob, state.cell);
             mob.fallDistance = 0;
+            // A spider knocked off its surface is re-read where it really ended up.
+            resyncSpiderSurface(state, state.cell);
         }
     }
 
@@ -6320,6 +7139,16 @@ public final class ServerBattle {
      * no successful action and restores nothing. While any unit of this encounter is falling the
      * encounter is busy, so no new command is accepted and the turn queue does not advance.</p>
      */
+    /**
+     * The real feet each falling spider keeps, keyed by the falling unit's id.
+     *
+     * <p>The encounter's forced fall is cell based - every unit of every type descends one <em>cell</em> at a
+     * time - and that is right for a body the size of a cell. A spider is 1.4 wide and holds a lateral offset
+     * against the wall it was on, so animating it through cell centres would push its body into the wall it just
+     * left. Only the exact two spider types are recorded here; every other unit keeps the untouched path.</p>
+     */
+    private final java.util.Map<UUID, Vec3> spiderFallFeet = new java.util.HashMap<>();
+
     private final com.tactical.neoforge.battle.terrain.TerrainFall terrainFall =
             new com.tactical.neoforge.battle.terrain.TerrainFall();
 
@@ -6355,6 +7184,10 @@ public final class ServerBattle {
         if (holdsItselfUp(unit)) return;
         if (hasSupportBelow(cell)) return;
         TerrainFall.Unit falling = terrainFall.begin(id, player, cell);
+        // A wide spider holds its own lateral position against the wall it lost; the cells it falls through are
+        // only half of that fact. Remembering the real feet here is what lets the descent keep them instead of
+        // sliding the whole body onto the centre of every cell, which would put it back inside the wall.
+        if (!player && SpiderSurface.supports(unit)) spiderFallFeet.put(id, unit.position());
         // The landing is a reservation that keeps two falling units apart, and it is recomputed from the
         // live world for as long as the descent lasts.
         refreshFallLanding(falling);
@@ -6591,7 +7424,16 @@ public final class ServerBattle {
 
     private void stepFallingEnemy(TerrainFall.Unit unit) {
         EnemyState enemy = enemies.get(unit.id());
-        if (enemy == null || !enemy.mob.isAlive() || enemy.mob.isRemoved()) { terrainFall.end(unit.id()); return; }
+        if (enemy == null || !enemy.mob.isAlive() || enemy.mob.isRemoved()) {
+            terrainFall.end(unit.id());
+            spiderFallFeet.remove(unit.id());
+            return;
+        }
+        Vec3 held = spiderFallFeet.get(unit.id());
+        if (held != null) {
+            stepFallingSpider(unit, enemy, held.x, held.z);
+            return;
+        }
         if (unit.stepTo() == null) {
             refreshFallLanding(unit);
             com.tactical.neoforge.battle.terrain.FallPlanner.Step step =
@@ -6626,6 +7468,88 @@ public final class ServerBattle {
         }
     }
 
+    /**
+     * One slice of a wide spider's forced descent, at the lateral position it really held.
+     *
+     * <p>The existing fall decides <em>where</em> and <em>how far</em>: the same cells, the same landing, the same
+     * deadline, the same damage settlement. Only the geometry of the body is bridged here, and only for the exact
+     * two spider types: the body keeps its real X and Z, the first slice starts from its real fractional feet
+     * instead of the cell centre, and every slice sweeps the whole body between the two positions it really
+     * occupies. That is what stops a wide body from being dragged back into the wall it just lost, which is what
+     * made a normal landing unprovable.</p>
+     */
+    private void stepFallingSpider(TerrainFall.Unit unit, EnemyState enemy, double x, double z) {
+        if (unit.stepTo() == null) {
+            refreshFallLanding(unit);
+            com.tactical.neoforge.battle.terrain.FallPlanner.Step step =
+                    com.tactical.neoforge.battle.terrain.FallPlanner.next(unit.cell(), this::hasSupportBelow,
+                            cell -> enterableForFall(cell, unit.id()));
+            if (step == com.tactical.neoforge.battle.terrain.FallPlanner.Step.LAND) {
+                settleSpiderFall(unit, enemy, x, z);
+                return;
+            }
+            if (step == com.tactical.neoforge.battle.terrain.FallPlanner.Step.STUCK) return;
+            GridPos next = below(unit.cell());
+            if (!zone.contains(next)) { abandonTerrainFall(unit); return; }
+            unit.beginStep(unit.cell(), next, fallStepTicks());
+        }
+        double from = enemy.mob.getY();
+        double target = unit.stepFrom().y() + (unit.stepTo().y() - unit.stepFrom().y())
+                * fallFraction(unit, unit.progress() + 1);
+        if (!spiderFallSliceClear(enemy.mob, x, from, target, z)) {
+            // Something really is in the way of the body it would sweep: keep its own cell and re-plan next
+            // tick, exactly as every other falling unit does.
+            unit.endStep();
+            return;
+        }
+        unit.progress(unit.progress() + 1);
+        enemy.mob.setPos(x, target, z);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        if (unit.fraction() >= 1.0D) {
+            GridPos arrived = unit.stepTo();
+            unit.stepLanded(arrived);
+            enemy.cell = arrived;
+        }
+    }
+
+    /** The whole body between the position it holds and the one it is about to take, cleared as one box. */
+    private boolean spiderFallSliceClear(LivingEntity body, double x, double fromY, double toY, double z) {
+        AABB swept = SpiderSurface.bodyAt(body, new Vec3(x, fromY, z))
+                .minmax(SpiderSurface.bodyAt(body, new Vec3(x, toY, z)));
+        if (!AmphibiousMovement.loaded(level, swept)) return false;
+        if (!level.noCollision(body, swept)) return false;
+        return !AmphibiousMovement.overlapsBody(level, body, swept);
+    }
+
+    /**
+     * Land a spider where it really is.
+     *
+     * <p>The ordinary landing snaps the body onto the centre of its cell, which for a wide body that held a wall
+     * is a position it may not be able to stand in. Only the real, legal feet can settle the fall; otherwise
+     * its existing deadline keeps running. An invalid stand must never be repaired by an unswept snap.</p>
+     */
+    private void settleSpiderFall(TerrainFall.Unit unit, EnemyState enemy, double x, double z) {
+        GridPos landing = unit.cell();
+        GridPos origin = unit.origin();
+        int cells = unit.cells();
+        Vec3 feet = new Vec3(x, landing.y(), z);
+        if (!SpiderSurface.isLegal(level, enemy.mob, SpiderSurface.Node.groundAt(landing, feet))) return;
+        terrainFall.end(unit.id());
+        spiderFallFeet.remove(unit.id());
+        enemy.cell = landing;
+        enemy.mob.setPos(feet);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        // A landed spider holds the floor it really reached, not the wall it left.
+        resyncSpiderSurface(enemy, landing);
+        settleFallDamage(enemy.mob, landing, cells);
+        journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL,
+                BattleText.name(enemy.mob), BattleText.literal(origin.toString()),
+                BattleText.literal(landing.toString()), cells));
+        if (!finished) sendState();
+    }
+
     private void settlePlayerFall(TerrainFall.Unit unit, PlayerMember member) {
         GridPos landing = unit.cell();
         GridPos origin = unit.origin();
@@ -6649,6 +7573,8 @@ public final class ServerBattle {
         terrainFall.end(unit.id());
         enemy.cell = landing;
         moveEntity(enemy.mob, landing);
+        // A landed spider holds the floor it really reached, not the wall it left.
+        resyncSpiderSurface(enemy, landing);
         settleFallDamage(enemy.mob, landing, cells);
         journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL,
                 BattleText.name(enemy.mob), BattleText.literal(origin.toString()),
@@ -6691,6 +7617,7 @@ public final class ServerBattle {
      */
     private void abandonTerrainFall(TerrainFall.Unit unit) {
         terrainFall.end(unit.id());
+        spiderFallFeet.remove(unit.id());
         Tactical.LOGGER.error("[Tactical] forced fall did not settle within {} ticks: {} {} from {} at {} ({} cells); "
                         + "releasing it to vanilla physics", TerrainFall.TIMEOUT_TICKS,
                 unit.player() ? "player" : "mob", unit.id(), unit.origin(), unit.cell(), unit.cells());
@@ -6713,8 +7640,14 @@ public final class ServerBattle {
                 BattleEffects.forget(enemy.mob);
                 ai.remove(enemy.mob);
                 BattleManager.releaseActor(this, unit.id());
+                // A unit that leaves the battle this way must not keep this encounter's own pose seam or
+                // surface state: nothing of this encounter may still be pinning the body it gave back.
+                releaseEndermanState(enemy);
+                releaseSpiderState(enemy);
+                releaseWitchState(enemy);
                 enemy.mob.setNoAi(enemy.originalNoAi);
                 enemy.mob.setTarget(null);
+                enemy.mob.setDeltaMovement(Vec3.ZERO);
                 if (acting && !finished) advanceTurn();
             }
         }
@@ -6818,6 +7751,69 @@ public final class ServerBattle {
 
     public BattleJournal journal() { return journal; }
     public BattleZone zone() { return zone; }
+
+    /**
+     * Read-only fixture view of one roster unit's authoritative state.
+     *
+     * <p>No setter and no mutation: a fixture may observe what the encounter really decided (its cell, its AP,
+     * its surface node, whether a trajectory is still advancing) instead of inferring it from a client mirror.</p>
+     */
+    record EnemyView(GridPos cell, int ap, int maxAp, int moveCost, int paidActions,
+                     SpiderSurface.Node node, boolean moving, boolean alive, Vec3 feet,
+                     boolean leaping, int leapFrames, boolean leapPaid, int leapsUsed,
+                     GridPos leapLanding) { }
+
+    /**
+     * Fixture-only: set one enemy's own AP, so a deterministic case can prove a transaction whose pool changes
+     * between the commit and the first real displacement. Like the other fixture hooks it changes nothing
+     * unless a fixture asks for it.
+     */
+    void fixtureEnemyAp(UUID id, int ap) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        if (state == null) return;
+        state.ap = Math.max(0, Math.min(state.maxAp, ap));
+    }
+
+    EnemyView fixtureEnemy(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        if (state == null || state.mob == null) return null;
+        SpiderLeap.Proposal proposal = state.leap != null ? state.leap.proposal : state.leapProposal;
+        return new EnemyView(state.cell, state.ap, state.maxAp, state.moveCost, state.paidActions,
+                state.spider == null ? null : state.spider.node(), enemyMoving,
+                state.mob.isAlive() && !state.mob.isRemoved(), state.mob.position(),
+                state.leap != null, state.leap == null ? 0 : state.leap.frames,
+                state.leap != null && state.leap.paid, state.spiderLeapsUsed,
+                proposal == null ? null : proposal.landing().cell());
+    }
+
+    /**
+     * One short leap really in flight: the proposal being walked, where it started, its frozen price and how
+     * many of its fixed frames have already happened.
+     *
+     * <p>The price is frozen when the leap is committed, exactly like every other action, and it is only taken
+     * out of the pool once the body has really left the floor - so a leap the world refuses at its first frame
+     * costs nothing and leaves no success behind.</p>
+     */
+    private static final class LeapRun {
+        final SpiderLeap.Proposal proposal;
+        final Vec3 start;
+        final int cost;
+        final long epoch;
+        int frames;
+        boolean paid;
+
+        LeapRun(SpiderLeap.Proposal proposal, Vec3 start, int cost, long epoch) {
+            this.proposal = proposal;
+            this.start = start;
+            this.cost = cost;
+            this.epoch = epoch;
+        }
+
+        int ticks() { return proposal.ticks(); }
+
+        Vec3 point(int frame) { return proposal.point(start, frame); }
+    }
+
     public com.tactical.neoforge.network.CreeperTelegraphPacket creeperSnapshot() { return ai.snapshot(); }
     private static GridPos cellOf(Entity entity) { return new GridPos(entity.getBlockX(),entity.getBlockY(),entity.getBlockZ()); }
     AABB zoneBounds() {
@@ -7189,6 +8185,27 @@ public final class ServerBattle {
          * It is deliberately not {@link #flying}: a drowned in clear air is not a supported position.
          */
         final boolean amphibious;
+        /**
+         * The surface this exact unit really holds, for the two vanilla spider types only.
+         *
+         * <p>A spider keeps its node (cell, real feet, floor or wall side) instead of a bare cell, because a
+         * cell alone cannot say whether the body is standing on a floor or holding a wall - and a stale "it was
+         * on a wall" is exactly what would leave it hovering after the wall is gone.</p>
+         */
+        SpiderTraversal spider;
+        /**
+         * The one bounded short-leap proposal of this own turn, cached with the turn and epoch it was resolved
+         * in. A getter re-asks the live world about this same proposal instead of scanning for another one, so
+         * planning, validation and the commit all name one immutable landing.
+         */
+        SpiderLeap.Proposal leapProposal;
+        boolean leapProposalDone;
+        long leapProposalEpoch;
+        int leapProposalTurn;
+        /** How many short leaps really left the ground this own turn: never more than one. */
+        int spiderLeapsUsed;
+        /** The leap in flight, or null; it owns the turn and the busy flag until it lands or is stopped. */
+        LeapRun leap;
         Vec3 airOffset;
         /**
          * Set only for a hand-commanded companion: the adapter that claimed it and the controller it answers

@@ -145,6 +145,69 @@ public interface AiContext {
     default void clearPendingDrink() { }
 
     /**
+     * The surface node this actor really holds right now, or null for an actor with no surface policy.
+     *
+     * <p>A node is not a cell: it carries the feet the body really has and, on a wall, which side the wall is
+     * on. Only the exact two vanilla spider types answer here; every other actor, and every fixture context
+     * written against an older version, answers null and keeps the plain four-way rule.</p>
+     */
+    default com.tactical.neoforge.battle.SpiderSurface.Node surfaceHere() { return null; }
+
+    /**
+     * Every surface node this body may step to, in one bounded pass, with the same occupancy and zone gates
+     * the encounter's own movement uses. Empty for an actor with no surface policy.
+     */
+    default List<com.tactical.neoforge.battle.SpiderSurface.Node> surfaceNeighbours(
+            com.tactical.neoforge.battle.SpiderSurface.Node from) {
+        return List.of();
+    }
+
+    /** Whether that node is still a legal standing position in the live world. */
+    default boolean surfaceLegal(com.tactical.neoforge.battle.SpiderSurface.Node node) { return false; }
+
+    /**
+     * Whether the actor's <em>real</em> native attack box at that node's feet reaches the locked opponent.
+     *
+     * <p>Asked separately from {@link #inMeleeRange} because the two are different facts: grid adjacency is a
+     * movement rule, and a short body's box does not reach a whole block up even though the cell is adjacent.</p>
+     */
+    default boolean surfaceMeleeReach(com.tactical.neoforge.battle.SpiderSurface.Node node) { return false; }
+
+    /** Whether the whole body - not only its feet cell - stays inside the battlefield at that node. */
+    default boolean surfaceInsideZone(com.tactical.neoforge.battle.SpiderSurface.Node node) { return false; }
+
+    /**
+     * Whether that whole route still holds in the live world: every node legal, every leg swept, every cell
+     * free and inside the battlefield.
+     *
+     * <p>Asked once against the same state the commit charges from, so a plan built a moment ago cannot walk a
+     * wall that has already been broken.</p>
+     */
+    default boolean surfaceRouteHolds(List<com.tactical.neoforge.battle.SpiderSurface.Node> route) { return false; }
+
+    /**
+     * How many surface edges this actor may still walk this own turn while keeping one melee affordable.
+     *
+     * <p>Read from the same AP and price the commit charges, so a planner can never propose a route the
+     * execution path then refuses halfway.</p>
+     */
+    default int surfaceEdgeBudget() { return 0; }
+
+    /**
+     * Whether this actor may spend this own turn on one short leap right now.
+     *
+     * <p>True only when every gate really holds at the same moment: the exact body is on a legal floor and not
+     * already able to bite, this own turn has not leaped yet, the frozen price is affordable, and the one
+     * bounded proposal of this turn names a landing the live world still carries and from which the locked
+     * opponent is really reachable. The answer is cached once per own turn, so asking it never re-scans the
+     * world; the commit re-proves the same proposal instead of widening the search.</p>
+     */
+    default boolean canLeap() { return false; }
+
+    /** Quoted price of one short leap this own turn, or 0 for an actor that cannot leap at all. */
+    default int leapCost() { return 0; }
+
+    /**
      * Quoted price of one blaze salvo this own turn, or 0 for an actor with no native fireball at all.
      *
      * <p>Read from the same server state that charges the action, so a planner can never validate a salvo the

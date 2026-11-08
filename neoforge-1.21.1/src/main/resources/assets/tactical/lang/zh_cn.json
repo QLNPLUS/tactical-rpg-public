@@ -87,6 +87,7 @@
   "tactical.journal.enemy.break_door": "%s 破开了 %s 的木门",
   "tactical.journal.enemy.door_refused": "%s 放弃了破门：门已被打开、拆除或不允许破坏，本次不计费",
   "tactical.journal.enemy.route_blocked": "%s 的通路被改变，未走过的格费已退回，本回合结束",
+  "tactical.journal.enemy.leap": "%s 扑向 %s",
   "tactical.journal.enemy.teleport": "%s 瞬移到 %s",
   "tactical.journal.enemy.teleport_refused": "%s 留在原地：本回合没有可用落点、费用或瞬移额度",
   "tactical.journal.enemy.teleport_reaction": "%s 躲开了这次命中",

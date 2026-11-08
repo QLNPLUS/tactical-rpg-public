@@ -47,6 +47,12 @@ public final class TacticalAiRegistry {
         // teleport, the reaction budget or the water-escape behaviour by sharing a superclass.
         register(ResourceLocation.withDefaultNamespace("enderman"), EntityType.ENDERMAN,
                 EndermanTacticalAi::new);
+        // Exact type only, and one registration each: a spider may hold a real wall and a cave spider is narrow
+        // enough to pass a one-block gap the wide one cannot, so neither may inherit the other by superclass.
+        register(ResourceLocation.withDefaultNamespace("spider"), EntityType.SPIDER,
+                ignored -> new SpiderTacticalAi());
+        register(ResourceLocation.withDefaultNamespace("cave_spider"), EntityType.CAVE_SPIDER,
+                ignored -> new SpiderTacticalAi());
     }
 
     private TacticalAiRegistry() { }

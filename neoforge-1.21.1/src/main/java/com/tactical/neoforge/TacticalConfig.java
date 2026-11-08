@@ -35,6 +35,8 @@ public final class TacticalConfig {
     public final ModConfigSpec.IntValue blazeVolleyApCost;
     /** Base price of one drowned trident throw: this ruleset's value, not a vanilla fact. */
     public final ModConfigSpec.IntValue drownedTridentApCost;
+    /** Base price of one spider short leap: the mod's own design value, not a vanilla fact. */
+    public final ModConfigSpec.IntValue spiderLeapApCost;
     /** Base price of one enderman teleport: this ruleset's value, not a vanilla fact. */
     public final ModConfigSpec.IntValue endermanTeleportApCost;
     public final ModConfigSpec.IntValue witchDrinkApCost;
@@ -110,6 +112,10 @@ public final class TacticalConfig {
         builder.push("drowned");
         drownedTridentApCost = builder.comment("Base AP cost of one drowned trident throw. Vanilla fires on a fixed 40 tick interval; a turn-based encounter maps that to one throw per own turn, and the throw shares the same successful-action surcharge as every other main action.")
                 .defineInRange("tridentCost", com.tactical.core.combat.BattleRules.DROWNED_TRIDENT_COST, 1, 1_000_000);
+        builder.pop();
+        builder.push("spider");
+        spiderLeapApCost = builder.comment("Base AP cost of one short leap by a spider or cave spider. It is paid once, on the first real displacement, and shares the same successful-action surcharge as every other main action; a leap that never really moved the body costs nothing.")
+                .defineInRange("leapCost", com.tactical.core.combat.BattleRules.SPIDER_LEAP_COST, 1, 1_000_000);
         builder.pop();
         builder.push("enderman");
         endermanTeleportApCost = builder.comment("Base AP cost of one enderman teleport, whether it is the own-turn relocation or the single reaction to a hit, and the price charged to that enderman only. The own-turn relocation shares the successful-action surcharge; the reaction is paid at this base price and does not advance that surcharge.")

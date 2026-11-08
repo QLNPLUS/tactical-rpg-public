@@ -1,6 +1,7 @@
 package com.tactical.neoforge.battle.ai;
 
 import com.tactical.core.grid.GridPos;
+import com.tactical.neoforge.battle.SpiderSurface;
 import com.tactical.neoforge.skill.SkillTarget;
 import net.minecraft.resources.ResourceLocation;
 
@@ -10,7 +11,7 @@ import java.util.Objects;
 /** An intent, not a callback: roster mutation and skill cost/effects resolve on the server. */
 public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
                        ResourceLocation skill, SkillTarget skillTarget, WitchBrew brew,
-                       DoorRoutePlanner.Door door) {
+                       DoorRoutePlanner.Door door, List<SpiderSurface.Node> surface) {
     public enum Kind {
         MOVE, DIVE, MELEE, RANGED, SKILL, PREPARE_EXPLOSION, DETONATE, END_TURN,
         /** Drink one self-brew; ends the own turn and starts the shared drink cooldown. */
@@ -43,25 +44,53 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
          * so a destination named here would be a plan the world may already have replaced. What the server
          * commits is the point the native entry really landed on, validated before the entity is moved.</p>
          */
-        TELEPORT
+        TELEPORT,
+        /**
+         * One surface route: cells that carry their own support surface, for a spider only.
+         *
+         * <p>Deliberately its own kind and not {@code MOVE}: a {@link GridPos} is a floor cell, and a body that
+         * holds a wall needs the surface it holds as well. Flattening those nodes into plain cells would let a
+         * stale plan confront the server with a route the wall underneath no longer supports. The server
+         * re-validates every node and every leg against the live world, and charges per edge exactly as an
+         * ordinary move does.</p>
+         */
+        SURFACE_MOVE,
+        /**
+         * One short leap: an arc from a real floor to a real floor, for a spider only.
+         *
+         * <p>Deliberately its own kind and never a {@code MOVE} with a long edge: the leap is not a surface
+         * route, it has one fixed arc, one fixed animation and its own price. It carries no destination at all,
+         * because the proposal is the encounter's own bounded answer - a payload here would let a stale plan
+         * name a landing the live world has already refused. The server re-resolves the same cached proposal,
+         * re-proves every frame of the arc and charges only when the body really left the ground.</p>
+         */
+        SPIDER_LEAP
     }
 
     /** Preserve existing adapters' constructors. */
-    public AiAction(Kind kind, List<GridPos> path) { this(kind, path, -1, null, null, null, null); }
-    public AiAction(Kind kind, List<GridPos> path, int attackIndex) { this(kind, path, attackIndex, null, null, null, null); }
+    public AiAction(Kind kind, List<GridPos> path) { this(kind, path, -1, null, null, null, null, null); }
+    public AiAction(Kind kind, List<GridPos> path, int attackIndex) { this(kind, path, attackIndex, null, null, null, null, null); }
     public AiAction(Kind kind, List<GridPos> path, int attackIndex, ResourceLocation skill, SkillTarget skillTarget) {
-        this(kind, path, attackIndex, skill, skillTarget, null, null);
+        this(kind, path, attackIndex, skill, skillTarget, null, null, null);
     }
     public AiAction(Kind kind, List<GridPos> path, int attackIndex, ResourceLocation skill, SkillTarget skillTarget,
                     WitchBrew brew) {
-        this(kind, path, attackIndex, skill, skillTarget, brew, null);
+        this(kind, path, attackIndex, skill, skillTarget, brew, null, null);
+    }
+    public AiAction(Kind kind, List<GridPos> path, int attackIndex, ResourceLocation skill, SkillTarget skillTarget,
+                    WitchBrew brew, DoorRoutePlanner.Door door) {
+        this(kind, path, attackIndex, skill, skillTarget, brew, door, null);
     }
 
     public AiAction {
         Objects.requireNonNull(kind, "kind");
         path = List.copyOf(path);
+        surface = surface == null ? List.of() : List.copyOf(surface);
         boolean moving = kind == Kind.MOVE || kind == Kind.DIVE;
         if (moving == path.isEmpty()) throw new IllegalArgumentException("Only MOVE/DIVE have a non-empty path");
+        if (kind == Kind.SURFACE_MOVE ? surface.isEmpty() || !path.isEmpty() : !surface.isEmpty()) {
+            throw new IllegalArgumentException("Only SURFACE_MOVE carries a non-empty surface route, and it has no plain path");
+        }
         if (kind == Kind.DIVE ? attackIndex < 0 || attackIndex >= path.size() - 1 : attackIndex != -1) {
             throw new IllegalArgumentException("DIVE requires a zero-based attack index followed by a return path");
         }
@@ -113,10 +142,16 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
     }
     public static AiAction of(Kind kind) { return new AiAction(kind, List.of()); }
     public static AiAction endTurn() { return of(Kind.END_TURN); }
+    /** One surface route (a spider's floor/wall nodes); the server owns every gate and every edge price. */
+    public static AiAction surfaceMove(List<SpiderSurface.Node> route) {
+        return new AiAction(Kind.SURFACE_MOVE, List.of(), -1, null, null, null, null, route);
+    }
     /** One salvo at the opponent this own turn locked; the server owns charge, count and price. */
     public static AiAction fireballVolley() { return of(Kind.FIREBALL_VOLLEY); }
     /** One trident throw at the opponent this own turn locked; the server owns the real entity and its price. */
     public static AiAction throwTrident() { return of(Kind.THROW_TRIDENT); }
     /** One native teleport; the server owns the landing point, the price and every safety gate. */
     public static AiAction teleport() { return of(Kind.TELEPORT); }
+    /** One short leap; the server owns the proposal, the arc, the price and every safety gate. */
+    public static AiAction spiderLeap() { return of(Kind.SPIDER_LEAP); }
 }

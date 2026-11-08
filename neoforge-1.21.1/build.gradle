@@ -162,8 +162,17 @@ neoForge {
             systemProperty 'tactical.selftest', 'enderman'
             systemProperty 'tactical.dev.trace', 'true'
         }
-        serverVindicatorTest {
+        // Spider surface fixture: its own throwaway world and ephemeral port. A real wall, a real wide and a
+        // real narrow body, a real removed surface and the real attack box are only decidable on a booted
+        // server; it starts no client and touches no other fixture's world.
+        serverSpiderTest {
             server()
+            gameDirectory = file('run-server-spider-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'spider'
+            systemProperty 'tactical.dev.trace', 'true'
+        }
+        serverVindicatorTest {            server()
             gameDirectory = file('run-server-vindicator-test')
             systemProperty 'tactical.selftest', 'vindicator'
             programArguments.addAll '--nogui'

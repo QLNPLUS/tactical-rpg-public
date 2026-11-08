@@ -87,6 +87,7 @@
   "tactical.journal.enemy.break_door": "%s broke the wooden door at %s",
   "tactical.journal.enemy.door_refused": "%s gave up breaking the door: it was opened, removed or protected, and nothing was charged",
   "tactical.journal.enemy.route_blocked": "%s' route changed, the unwalked steps were given back, and the turn ended",
+  "tactical.journal.enemy.leap": "%s leaped at %s",
   "tactical.journal.enemy.teleport": "%s teleported to %s",
   "tactical.journal.enemy.teleport_refused": "%s stays where it is: no landing point, price or teleport left this turn",
   "tactical.journal.enemy.teleport_reaction": "%s slipped away from the hit",
