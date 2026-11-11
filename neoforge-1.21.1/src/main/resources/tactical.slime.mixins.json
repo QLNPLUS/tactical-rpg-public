@@ -1,0 +1,10 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.tactical.neoforge.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": ["TacticalSlimeMixin", "SlimeTravelMixin", "SlimeDealDamageInvoker", "SlimeSplitMixin"],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

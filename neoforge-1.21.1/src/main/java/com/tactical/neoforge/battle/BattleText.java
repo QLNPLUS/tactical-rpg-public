@@ -228,6 +228,7 @@ public final class BattleText {
     public static final String KEY_END_PATH_BLOCKED = "tactical.end.path_blocked";
     public static final String KEY_END_EMPTY_QUEUE = "tactical.end.empty_queue";
     public static final String KEY_END_ENEMIES_DEFEATED = "tactical.end.enemies_defeated";
+    public static final String KEY_END_SPLIT_UNRESOLVED = "tactical.end.split_unresolved";
     public static final String KEY_END_RESET = "tactical.end.reset";
 
     // ---- chat -----------------------------------------------------------------------------
@@ -495,6 +496,7 @@ public final class BattleText {
             case PATH_BLOCKED -> translatable(KEY_END_PATH_BLOCKED);
             case EMPTY_QUEUE -> translatable(KEY_END_EMPTY_QUEUE);
             case ENEMIES_DEFEATED -> translatable(KEY_END_ENEMIES_DEFEATED);
+            case SPLIT_UNRESOLVED -> translatable(KEY_END_SPLIT_UNRESOLVED);
             case RESET -> translatable(KEY_END_RESET);
         };
     }
@@ -518,6 +520,13 @@ public final class BattleText {
         PATH_BLOCKED,
         EMPTY_QUEUE,
         ENEMIES_DEFEATED,
+        /**
+         * The battlefield emptied while a native split was still owed and never confirmed.
+         *
+         * <p>Not a victory: nobody could prove that the dead body really produced no children, so the encounter
+         * ends with the anomaly instead of claiming all enemies were defeated.</p>
+         */
+        SPLIT_UNRESOLVED,
         RESET
     }
 

@@ -53,6 +53,14 @@ public final class TacticalAiRegistry {
                 ignored -> new SpiderTacticalAi());
         register(ResourceLocation.withDefaultNamespace("cave_spider"), EntityType.CAVE_SPIDER,
                 ignored -> new SpiderTacticalAi());
+        // Exact type only, and one registration each: a slime and a magma cube share vanilla's body and split,
+        // but a tiny slime cannot damage anything while a tiny magma cube can, and a magma cube is fire immune
+        // and jumps higher. Neither may inherit the other's answer by sharing a superclass, and no other slime
+        // subclass, mod slime or scaled entity gains these tactics.
+        register(ResourceLocation.withDefaultNamespace("slime"), EntityType.SLIME,
+                ignored -> new SlimeTacticalAi());
+        register(ResourceLocation.withDefaultNamespace("magma_cube"), EntityType.MAGMA_CUBE,
+                ignored -> new SlimeTacticalAi());
     }
 
     private TacticalAiRegistry() { }

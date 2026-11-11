@@ -39,6 +39,19 @@ public final class BattleDeployment {
      */
     public static Optional<Vec3> findNearestStandable(ServerLevel level, LivingEntity entity,
             Predicate<BlockPos> occupied, Predicate<BlockPos> zone) {
+        return findNearestStandable(level, entity, occupied, zone, null);
+    }
+
+    /**
+     * The same bounded search with one extra gate asked at the real candidate feet before any block is read.
+     *
+     * <p>It exists for the bodies whose footprint is not one cell: a candidate whose own chunk - or any chunk
+     * its whole body would touch, or the zone it would be committed into - is not already loaded must be
+     * refused, not silently read as free air, and nothing here force-loads a column to make a candidate work.
+     * The gate answers about a position only, so it can never move, claim or mutate the entity.</p>
+     */
+    public static Optional<Vec3> findNearestStandable(ServerLevel level, LivingEntity entity,
+            Predicate<BlockPos> occupied, Predicate<BlockPos> zone, Predicate<Vec3> ready) {
         Vec3 source = entity.position();
         List<Vec3> candidates = new ArrayList<>();
         candidates.add(source);
@@ -62,6 +75,7 @@ public final class BattleDeployment {
         for (Vec3 candidate : candidates) {
             BlockPos feet = BlockPos.containing(candidate);
             if (occupied.test(feet) || !zone.test(feet)) continue;
+            if (ready != null && !ready.test(candidate)) continue;
             if (isStandable(level, entity, candidate)) return Optional.of(candidate);
         }
         return Optional.empty();

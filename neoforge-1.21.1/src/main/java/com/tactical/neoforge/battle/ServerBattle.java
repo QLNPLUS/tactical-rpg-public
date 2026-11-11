@@ -61,6 +61,7 @@ import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.monster.Blaze;
 import net.minecraft.world.entity.monster.EnderMan;
+import net.minecraft.world.entity.monster.Slime;
 import net.minecraft.world.entity.monster.Spider;
 import net.minecraft.world.entity.monster.Vindicator;
 import net.minecraft.world.entity.monster.Witch;
@@ -178,6 +179,15 @@ public final class ServerBattle {
     private int aggroPulse;
     /** Hostiles the roster cap refuses: evicted from the battlefield and held out while it stays full. */
     private final MobIsolation isolation = new MobIsolation();
+    /**
+     * The native split this encounter is still owed children by.
+     *
+     * <p>A dead size-4 body leaves the roster on the tick it dies, but vanilla only produces its children about
+     * twenty death ticks later, outside this encounter's tick. Until that has really happened the encounter
+     * owes a split: no victory, no deferred turn and no new order may be decided as if the battlefield were
+     * empty.</p>
+     */
+    private final SlimeSplitLifecycle splits = new SlimeSplitLifecycle(this);
     private int ticks;
 
     private final int zoneHeight;
@@ -190,6 +200,15 @@ public final class ServerBattle {
     private int aiDelay;
     private boolean finished;
     private boolean ending;
+    /** The coded reason this encounter ended with, when it ended through one of the enumerated paths. */
+    private BattleText.End endCode;
+    /**
+     * A victory both barriers had to hold back.
+     *
+     * <p>An emptied roster is only an end once the owed split and the forced fall are both clear; until then the
+     * decision is remembered instead of being re-derived from counters that a later tick may have changed.</p>
+     */
+    private boolean victoryDeferred;
     private int actionCount;
     private int stateRevision;
     private final Map<Integer,Float> lastHealth=new java.util.HashMap<>();
@@ -211,6 +230,15 @@ public final class ServerBattle {
     private ItemStack pendingWitchBorrowed = ItemStack.EMPTY;
     /** The exact bottle this presentation put in her hand, so only that slot is ever written back. */
     private ItemStack pendingWitchBottle = ItemStack.EMPTY;
+
+    /**
+     * The real feet each falling body of the slime family keeps, keyed by unit id.
+     *
+     * <p>The same idea as the spider slot: the cells a fall passes through are only half of the fact, and a
+     * body dragged onto the centre of every cell would be put back inside the wall or the ceiling it just lost.
+     * </p>
+     */
+    private final java.util.Map<UUID, Vec3> slimeFallFeet = new java.util.LinkedHashMap<>();
 
     private List<GridPos> enemyPath = List.of();
     private int enemyPathIndex;
@@ -311,9 +339,12 @@ public final class ServerBattle {
 
         for (Mob mob : candidates) {
             if(hostileCount()>=participantCap)break;
+            // This family's body is not a cell: the candidate is proved as a whole loaded body inside the
+            // battlefield before it is read or admitted, so a wide body is never taken and then found not to fit.
             var safe=deploymentPosition(mob,
                     pos->occupied(new GridPos(pos.getX(),pos.getY(),pos.getZ())),
-                    pos->zone.contains(new GridPos(pos.getX(),pos.getY(),pos.getZ())));
+                    pos->zone.contains(new GridPos(pos.getX(),pos.getY(),pos.getZ())),
+                    feet->slimeCandidateFits(mob, feet, zone::contains));
             if(safe.isEmpty()) continue;
             Vec3 position=safe.get();
             GridPos cell=new GridPos(net.minecraft.util.Mth.floor(position.x),net.minecraft.util.Mth.floor(position.y),net.minecraft.util.Mth.floor(position.z));
@@ -461,9 +492,21 @@ public final class ServerBattle {
         boolean projectileChanged = projectiles.tick();
         removeDeadEnemies();
         if (finished) return;
+        // A split this encounter is owed is settled here, on its own tick: the children the world really
+        // registered are confirmed and handed over, and the wait is closed once nothing is outstanding. The
+        // barrier itself is part of isBusy and of the victory test, so nothing acts on an empty-looking
+        // battlefield while a dead parent is still going to split.
+        boolean wasWaiting = splits.pending();
+        splits.tick();
+        if (finished) return;
+        if (wasWaiting && !splits.pending()) settleSplitBarrier();
         // A wall removed under a held spider must not stay a phantom hold: the pose is dropped here, before the
         // fall rule asks whether the unit carries itself.
         maintainSpiderSurfaces();
+        // A body of this family that is really above the floor it holds is not standing: the descent is a sweep,
+        // and it is established here - on the encounter's own tick - instead of being pinned down by the pose
+        // seam on the next entity tick.
+        maintainSlimeHold();
         // The blaze salvo owns the turn while it runs: charge first, then its three shots, then hand back.
         tickBlazeVolley();
         if (finished) return;
@@ -543,6 +586,9 @@ public final class ServerBattle {
         for (PlayerMember member : members.values()) pinPlayer(member);
         beginTerrainFallIfNeeded();
         if (terrainFall.busy()) return;
+        // Both barriers are clear: a victory one of them was holding is settled here, once.
+        settleDeferredVictory();
+        if (finished) return;
         if (rangedBusy()) return;
 
         // A mob's own trajectory advances in both mob phases: an automatic enemy turn and a companion turn
@@ -551,6 +597,10 @@ public final class ServerBattle {
             stepEnemy();
             return;
         }
+        // A split this encounter is still owed blocks new plans exactly as a fall does: an order already in
+        // flight keeps its own tick, but nobody starts anything on a battlefield whose dead parent has not
+        // produced its children yet.
+        if (splits.pending()) return;
         if (phase == BattlePhase.ENEMY_TURN) {
             if (aiDelay > 0) {
                 aiDelay--;
@@ -619,10 +669,16 @@ public final class ServerBattle {
                 continue;
             }
             state.mob.setNoAi(state.originalNoAi);
+            // A unit that was not persistent before admission is not left persistently saved by this encounter:
+            // vanilla has no "set false", so the same bidirectional accessor every rollback uses restores the
+            // exact original flag in both directions.
+            ((com.tactical.neoforge.mixin.BattleMobPersistenceAccess) state.mob)
+                    .tactical$persistenceRequired(state.originalPersistenceRequired);
             state.mob.setTarget(null);
             releaseWitchState(state);
             releaseEndermanState(state);
             releaseSpiderState(state);
+            releaseSlimeState(state);
         }
         enemies.clear();
         for (Mob bystander : bystanders) {
@@ -633,6 +689,10 @@ public final class ServerBattle {
         // Isolated hostiles were never mutated (no AI/persistence change) and are not teleported
         // back; only this encounter's suppression ends with the encounter.
         isolation.clear();
+        // No owed split and no separated child may outlive the encounter: a child this encounter was still
+        // holding gets its own flags back and is left to the world, and a late join can never revive this
+        // session's wait.
+        splits.clear();
         for (LivingEntity actor : released) BattleEffects.forget(actor);
         // Drop this encounter's registry entries and ownership claims; other encounters keep theirs.
         BattleManager.onBattleFinished(this);
@@ -1239,13 +1299,25 @@ public final class ServerBattle {
 
     /** Safe, explicit recruitment only. Friendly slots never consume the hostile cap. */
     public boolean tryAddFriendly(Mob mob) {
+        return addFriendly(mob, true);
+    }
+
+    /**
+     * The one friendly admission path, also used by a native split child of a friendly parent.
+     *
+     * <p>The rules are unchanged: one safe deployment of the whole real body inside this battlefield, one
+     * admission transaction, one queue entry, one rollback. {@code announce} only decides whether the journal
+     * says a friendly unit joined, because a split's own line already names the birth.</p>
+     */
+    private boolean addFriendly(Mob mob, boolean announce) {
         if (mob == null || finished || ending || queue.current() == null || members.isEmpty()
                 || mob.level() != level || !mob.isAlive() || mob.isRemoved()
                 || enemies.containsKey(mob.getUUID()) || enemies.values().stream()
                         .filter(state -> state.side == BattleSide.PLAYER).count() >= BattleParticipation.MAX_FRIENDLIES) return false;
         var safe = deploymentPosition(mob,
                 pos -> occupied(new GridPos(pos.getX(), pos.getY(), pos.getZ())),
-                pos -> zone.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ())));
+                pos -> zone.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ())),
+                feet -> slimeCandidateFits(mob, feet, zone::contains));
         if (safe.isEmpty()) return false;
         Vec3 position = safe.get();
         GridPos cell = new GridPos(net.minecraft.util.Mth.floor(position.x), net.minecraft.util.Mth.floor(position.y), net.minecraft.util.Mth.floor(position.z));
@@ -1253,7 +1325,9 @@ public final class ServerBattle {
         if (state == null) return false;
         try {
             queue.add(mob.getUUID().toString(), TacticalAttributes.chargeRate(mob, state.initiative));
-            journal.record("battle", BattleText.translatable(BattleText.KEY_BATTLE_FRIENDLY, BattleText.name(mob)));
+            if (announce) {
+                journal.record("battle", BattleText.translatable(BattleText.KEY_BATTLE_FRIENDLY, BattleText.name(mob)));
+            }
             sendState();
             return true;
         } catch (RuntimeException failure) {
@@ -1283,6 +1357,10 @@ public final class ServerBattle {
      * @return the admitted state, or null when the claim was refused or the admission rolled back.
      */
     private EnemyState admit(Mob mob, GridPos cell, Vec3 position, BattleSide side) {
+        // A child a native split is still separating belongs to exactly one controlled hand-over: no other path
+        // may claim it or sample the temporary flags it is being held with. The birth removes that separation
+        // immediately before it calls this method, so its own admission is never refused here.
+        if (SlimeSplitLifecycle.isSeparated(mob)) return null;
         if (!BattleManager.claimActor(this, mob.getUUID())) return null;
         boolean originalNoAi = mob.isNoAi();
         boolean originalPersistenceRequired = mob.isPersistenceRequired();
@@ -1335,6 +1413,9 @@ public final class ServerBattle {
             // The same single commit point for a spider's surface: the node it was really admitted on, plus
             // the pose seam its own tick answers. From here until release, this encounter owns that surface.
             installSpiderState(state);
+            // The same single commit point for this family: the node the body was really admitted on, plus the
+            // pose seam its own tick answers. From here until release, this encounter owns that body.
+            installSlimeState(state);
             if (DeveloperTrace.enabled()) {
                 // Development trace: which exact unit joined which encounter. Needed because a client
                 // mirror cannot tell two same-typed mobs apart.
@@ -1412,6 +1493,7 @@ public final class ServerBattle {
         ai.remove(state.mob);
         releaseEndermanState(state);
         releaseSpiderState(state);
+        releaseSlimeState(state);
         restoreUnit(state.mob, state.originalNoAi, state.originalPersistenceRequired,
                 state.originalPosition, state.originalTarget, state.originalFallDistance,
                 state.originalBlazeCharged);
@@ -1469,6 +1551,33 @@ public final class ServerBattle {
         return isolation.size();
     }
 
+    /** The split lifecycle this encounter owns; the native hooks find it through this. */
+    SlimeSplitLifecycle splits() {
+        return splits;
+    }
+
+    /** The roster entry that really holds this exact body, or null. Never a same-UUID stranger. */
+    EnemyState stateOf(Mob mob) {
+        if (mob == null) return null;
+        EnemyState state = enemies.get(mob.getUUID());
+        return state != null && state.mob == mob ? state : null;
+    }
+
+    /** True when this encounter already holds this exact body as a participant. */
+    boolean ownsChild(Mob mob) {
+        return stateOf(mob) != null;
+    }
+
+    /** True while a native split this encounter is owed has not been settled yet. */
+    boolean splitPending() {
+        return splits.pending();
+    }
+
+    /** True while this encounter is closing; no admission, no split hand-over and no wait may start. */
+    boolean ending() {
+        return ending;
+    }
+
     /**
      * True when this encounter must keep {@code mob} off its members by physical contact.
      *
@@ -1477,10 +1586,15 @@ public final class ServerBattle {
      * so the collision rule covers every unowned mob while the roster is full. Callers
      * ({@link BattleContactGuard#isolationFor}) already exclude participants, players and any unit
      * another encounter owns.</p>
+     *
+     * <p>A split child this encounter refused is the one other case: there the roster may well have room and
+     * still no legal place for that body, so the exclusion itself - not the fullness - is what keeps it away
+     * from the members until it can be taken.</p>
      */
     boolean protectsFromContact(Mob mob) {
         if (finished || ending || mob == null) return false;
-        // Fullness is the only switch. A stale exclusion entry must never outlive the fullness
+        if (isolation.holdsSplitChild(mob)) return true;
+        // Fullness is the only other switch. A stale exclusion entry must never outlive the fullness
         // that created it: the instant a slot frees, ordinary contact and recruitment resume.
         return IsolationPolicy.holdsWhileFull(hostileCount(), participantCap);
     }
@@ -1505,7 +1619,8 @@ public final class ServerBattle {
     }
 
     public boolean isBusy() {
-        return anyPlayerMoving() || enemyMoving || rangedBusy() || witchDrinking() || terrainFall.busy();
+        return anyPlayerMoving() || enemyMoving || rangedBusy() || witchDrinking() || terrainFall.busy()
+                || splits.pending();
     }
 
     /**
@@ -1715,20 +1830,103 @@ public final class ServerBattle {
      * add it to the turn queue. Only hostile mobs can be absorbed.
      */
     public boolean tryAbsorb(Mob mob) {
+        return absorbHostile(mob, true);
+    }
+
+    /**
+     * Take one native split child into this encounter as a reinforcement.
+     *
+     * <p>Nothing about the admission rules changes - the body is proved on a legal deployment, the battlefield
+     * grows over its whole body and never over another encounter, the transaction rolls back cleanly and the
+     * queue gets exactly one entry. Only two things are different from an outside attacker: the faction comes
+     * from the parent (a friendly parent's child is never turned into an enemy), and the child does not have to
+     * be hunting a member, because it was born into this fight rather than walking into it.</p>
+     *
+     * <p>{@code false} is a refusal, not a failure: the caller keeps the child in the world and hands it to the
+     * exclusion, which is where the existing "no legal place" answer already lives. Nothing here inherits the
+     * parent's AP, initiative, skill, equipment or controller - a newborn unit is a new unit.</p>
+     */
+    boolean tryAdmitSplitChild(Mob child, BattleSide side) {
+        if (child == null || finished || ending || members.isEmpty()) return false;
+        if (child.level() != level || !child.isAlive() || child.isRemoved()) return false;
+        if (enemies.containsKey(child.getUUID()) || BattleManager.ownerOf(child.getUUID()) != null) return false;
+        if (side == BattleSide.PLAYER) return addFriendly(child, false);
+        if (!isHostile(child)) return false;
+        return absorbHostile(child, false);
+    }
+
+    /**
+     * Keep a split child this encounter cannot take out of its members' way.
+     *
+     * <p>The child itself is never deleted, never moved to an illegal cell, never re-timed and never left with
+     * a borrowed flag: the exclusion only clears the relationship with this encounter's members and, when the
+     * terrain allows it, places the body outside every battlefield. A free roster slot with no legal foot
+     * surface is exactly the case the old cap-only hand-off could not express, which is why the child is
+     * handed over with its own reason instead of pretending the roster is full.</p>
+     */
+    void handOffSplitChild(Mob child, BattleSide side) {
+        if (child == null || finished || ending) return;
+        isolation.holdSplitChild(this, child, side);
+    }
+
+    /**
+     * Retry an excluded split child once it legally fits the battlefield it was born into.
+     *
+     * <p>Deliberately the same transaction without a growing battlefield: a child the exclusion had to place
+     * outside is not allowed to pull the players' battlefield after it. If it cannot fit where the encounter
+     * already is, it stays held and is released when the encounter ends.</p>
+     */
+    boolean retrySplitChild(Mob child, BattleSide side) {
+        if (child == null || finished || ending || members.isEmpty()) return false;
+        if (child.level() != level || !child.isAlive() || child.isRemoved()) return false;
+        if (enemies.containsKey(child.getUUID()) || BattleManager.ownerOf(child.getUUID()) != null) return false;
+        boolean taken = side == BattleSide.PLAYER ? addFriendly(child, false)
+                : admitHostile(child, false, false);
+        if (taken) splits.noteRetake(child);
+        return taken;
+    }
+
+    private boolean absorbHostile(Mob mob, boolean requireHostile) {
+        return admitHostile(mob, requireHostile, true);
+    }
+
+    /**
+     * The one hostile admission transaction, with or without a battlefield that grows to cover the body.
+     *
+     * <p>An outside attacker is judged against the battlefield it would really get: the zone grows over its own
+     * whole body and never over another live encounter's space. A split child's second attempt is the same
+     * transaction without that growth, because a body the exclusion had to place outside the battlefield must
+     * not drag the battlefield thirty blocks after it - it joins when it legally fits the one it was born into,
+     * and otherwise stays held until this encounter ends.</p>
+     */
+    private boolean admitHostile(Mob mob, boolean requireHostile, boolean growZone) {
         if (mob == null || finished || ending || members.isEmpty() || !hasUnprotectedMember()
                 || mob.level()!=level
                 || !mob.isAlive() || mob.isRemoved() || hostileCount()>=participantCap
-                || enemies.containsKey(mob.getUUID()) || !isHostile(mob)) {
+                || enemies.containsKey(mob.getUUID()) || (requireHostile && !isHostile(mob))) {
             return false;
         }
-        var safe=deploymentPosition(mob,
-                pos->occupied(new GridPos(pos.getX(),pos.getY(),pos.getZ())),pos->true);
+        // The candidate is judged against the battlefield it would really get: a wide body is only taken when
+        // its whole self fits the grown zone, and the zone is never grown beyond the body's own feet cell just
+        // to swallow whatever stands next to it.
+        var safe = growZone
+                ? deploymentPosition(mob,
+                        pos->occupied(new GridPos(pos.getX(),pos.getY(),pos.getZ())),pos->true,
+                        feet->slimeCandidateFits(mob, feet, grownZone(mob, feet)))
+                : deploymentPosition(mob,
+                        pos->occupied(new GridPos(pos.getX(),pos.getY(),pos.getZ())),
+                        pos->zone.contains(new GridPos(pos.getX(),pos.getY(),pos.getZ())),
+                        feet->slimeCandidateFits(mob, feet, zone::contains));
         if(safe.isEmpty()) return false;
         Vec3 position=safe.get();
         GridPos cell=new GridPos(net.minecraft.util.Mth.floor(position.x),net.minecraft.util.Mth.floor(position.y),net.minecraft.util.Mth.floor(position.z));
-        // Growing this battlefield must never swallow another live encounter's space. The check
-        // runs on the would-be zone, before anything changes.
-        BattleZone expanded = zone.including(cell);
+        // Growing this battlefield must cover the whole body it is about to grant - a wide body is not its feet
+        // cell - and it must never swallow another live encounter's space. The whole check runs on the would-be
+        // zone, before anything changes.
+        BattleZone expanded = !growZone ? zone
+                : SlimeGround.supports(mob) ? grownToBody(mob, position, zone.including(cell))
+                : zone.including(cell);
+        if (!slimeCandidateFits(mob, position, expanded::contains)) return false;
         if (BattleManager.zoneConflicts(this, expanded)) return false;
 
         // Admission is the only step that can still refuse (a unit already owned elsewhere, or a
@@ -2902,9 +3100,73 @@ public final class ServerBattle {
     }
 
     private java.util.Optional<Vec3> deploymentPosition(Mob mob,java.util.function.Predicate<BlockPos> occupied,java.util.function.Predicate<BlockPos> allowed) {
+        return deploymentPosition(mob, occupied, allowed, null);
+    }
+
+    /**
+     * The same bounded candidate search, plus the one narrow gate this family needs.
+     *
+     * <p>Only the exact slime family is gated here, and the gate is asked about a candidate feet position
+     * before anything is read or changed: the whole real body has to be in already-loaded columns and inside
+     * the battlefield that would be committed. A caller that knows a different would-be battlefield (an
+     * absorbing expansion) passes its own gate; every other caller gets this encounter's live zone. Nothing
+     * about another family, another encounter or another body's rule changes.</p>
+     */
+    private java.util.Optional<Vec3> deploymentPosition(Mob mob,java.util.function.Predicate<BlockPos> occupied,
+                                                        java.util.function.Predicate<BlockPos> allowed,
+                                                        java.util.function.Predicate<Vec3> ready) {
+        boolean family = SlimeGround.supports(mob);
+        java.util.function.Predicate<Vec3> gate = family
+                ? (ready != null ? ready : feet -> slimeCandidateFits(mob, feet, zone::contains))
+                : ready;
         // A drowned is the one unit that may be placed in water; every other actor keeps the ground/aerial rule.
         if (AmphibiousMovement.supports(mob)) return AmphibiousMovement.findNearestHold(level, mob, occupied, allowed);
-        return AerialMovement.supports(mob)?AerialMovement.findNearestClearAir(level,mob,occupied,allowed):BattleDeployment.findNearestStandable(level,mob,occupied,allowed);
+        if (AerialMovement.supports(mob)) return AerialMovement.findNearestClearAir(level, mob, occupied, allowed);
+        return BattleDeployment.findNearestStandable(level, mob, occupied, allowed, gate);
+    }
+
+    /**
+     * The shared narrow gate of the slime family: does the whole real body fit there, in a world already read?
+     *
+     * <p>Three facts, asked together and before any block is read: every column the real body would occupy is
+     * loaded (nothing is force-loaded to make a candidate work), and the whole body - not its feet cell - is
+     * inside the battlefield that would be committed. Anything else keeps its own rule and answers true here.
+     * </p>
+     */
+    private boolean slimeCandidateFits(LivingEntity mob, Vec3 feet, java.util.function.Predicate<GridPos> wouldBeZone) {
+        if (mob == null) return false;
+        if (!SlimeGround.supports(mob)) return true;
+        if (feet == null) return false;
+        AABB box = BodyGeometry.bodyAt(mob, feet);
+        if (box == null || !BodyGeometry.loaded(level, box)) return false;
+        return BodyGeometry.boxInsideZone(box, wouldBeZone);
+    }
+
+    /** The battlefield that would be committed if a body at those feet were taken: the zone grown to its body. */
+    private java.util.function.Predicate<GridPos> grownZone(LivingEntity mob, Vec3 feet) {
+        return grownToBody(mob, feet, zone)::contains;
+    }
+
+    /**
+     * The same battlefield, folded over every cell the real body of this unit would occupy.
+     *
+     * <p>A unit is not its feet cell: a wide body reaches into the neighbouring cells, so a zone grown only to
+     * where it stands would grant it cells it does not cover. Folding over the body's own cells is what makes
+     * "the whole body is inside the battlefield it was granted" true by construction; the caller still checks
+     * the conflicts of that larger zone with every other encounter before anything is committed.</p>
+     */
+    private BattleZone grownToBody(LivingEntity mob, Vec3 feet, BattleZone baseline) {
+        BattleZone grown = baseline == null ? zone : baseline;
+        AABB box = BodyGeometry.bodyAt(mob, feet);
+        if (box == null) return grown;
+        for (int x = BodyGeometry.floor(box.minX); x <= BodyGeometry.floor(box.maxX); x++) {
+            for (int y = BodyGeometry.floor(box.minY); y <= BodyGeometry.floor(box.maxY); y++) {
+                for (int z = BodyGeometry.floor(box.minZ); z <= BodyGeometry.floor(box.maxZ); z++) {
+                    grown = grown.including(new GridPos(x, y, z));
+                }
+            }
+        }
+        return grown;
     }
 
     private void stepEnemy() {
@@ -2912,6 +3174,12 @@ public final class ServerBattle {
         if (enemy == null) {
             enemyMoving = false;
             advanceTurn();
+            return;
+        }
+        // A hop edge in flight owns the turn its own arc, exactly like a walked edge owns its segment. It is
+        // asked first because a hop is ordinary movement while a leap is one main action.
+        if (enemy.hop != null) {
+            stepSlimeHop(enemy);
             return;
         }
         // A leap in flight owns the turn its own arc, exactly like a walked edge owns its segment.
@@ -3810,6 +4078,40 @@ public final class ServerBattle {
      * keep a body in place - a node the world no longer carries is reported as such, and the outcome is the
      * same one every other unsupported unit gets.</p>
      */
+    /**
+     * Start the real descent for any controlled body of this family that is really in the air.
+     *
+     * <p>This is the sub-block case: a body interrupted part-way through an edge has a solid block under its
+     * own cell and is still not standing. Nothing else would notice it, because the ordinary support check only
+     * asks what is under the cell.</p>
+     */
+    private void maintainSlimeHold() {
+        if (finished || ending) return;
+        for (EnemyState state : List.copyOf(enemies.values())) {
+            if (state.slime == null || state.hop != null) continue;
+            if (!(state.mob instanceof Slime slime)) continue;
+            if (!slime.isAlive() || slime.isRemoved() || slime.level() != level) continue;
+            if (terrainFall.unit(slime.getUUID()) != null) continue;
+            // A held node is only true while the whole real body still stands on it. A height above it, a
+            // different X/Z, or one lost support column under the real footprint are all the same answer: this
+            // node is no longer where the body is, and continuing to hold it would keep an illegal foot
+            // surface - a body standing over a hole it never swept through.
+            if (SlimeGround.holds(level, slime, state.slime)) continue;
+            // The real feet are the truth: a legal real stand is adopted exactly where the body is, with no
+            // cell-centre rebuild and no lateral move, and the pose seam keeps pinning that real sample.
+            SlimeGround.Node real = SlimeGround.heldNode(level, slime).orElse(null);
+            if (real != null) {
+                state.slime = real;
+                state.cell = real.cell();
+                slime.setOnGround(true);
+                continue;
+            }
+            // Anything else is not standing: the descent owns the body, and it is established here, on the
+            // encounter's own tick, before the seam can pin a position nothing supports.
+            startSlimeFall(state);
+        }
+    }
+
     private void maintainSpiderSurfaces() {
         for (EnemyState state : List.copyOf(enemies.values())) {
             SpiderTraversal walk = state.spider;
@@ -5633,6 +5935,556 @@ public final class ServerBattle {
         }
     }
 
+    // ------------------------------------------------------------------
+    // slimes and magma cubes: real body, one hop per edge, native contact
+    // ------------------------------------------------------------------
+
+    /**
+     * Install this family's movement seam on admission, from where the body really stands.
+     *
+     * <p>Exact types, not riding anything and carrying no rider: those individuals keep vanilla behaviour, and
+     * this encounter neither detaches a rider nor shares another owner's mount to make its own turn easier. A
+     * body whose own cell does not hold a legal node is not taken at all, so a mis-placed unit simply keeps the
+     * plain rules instead of being animated onto a position it could never stand on.</p>
+     */
+    private void installSlimeState(EnemyState state) {
+        if (state == null || state.mob == null) return;
+        if (!SlimeGround.controllable(state.mob)) return;
+        if (!(state.mob instanceof Slime slime)) return;
+        // The position admission really gave this body, not the centre of its cell: a wide body may only fit
+        // off centre, and adopting the centre would be an unswept move no frame of this encounter proved.
+        SlimeGround.Node start = SlimeGround.heldNode(level, slime).orElse(null);
+        if (start == null) return;
+        state.slime = start;
+        state.cell = start.cell();
+        // A body this encounter installs on a real, legal ground node is standing on the ground at that very
+        // moment: the adoption does not move it, so the native contact flag has to say so instead of waiting for
+        // the next hop to correct it. Only the flag is written here - size, health, position, AP and the native
+        // tick are untouched, no AI is opened and no frame is invented.
+        slime.setOnGround(true);
+        ((TacticalSlimeAccess) slime).tactical$setPoseHandler(new SlimeHandler(state));
+    }
+
+    /**
+     * Give a slime back to its own vanilla tick and drop every transient of this family.
+     *
+     * <p>Idempotent, and it never moves, heals or re-positions the unit: a normal exit keeps the real final
+     * position and only the borrowed pose seam is given back. A unit this encounter never took has nothing to
+     * give back, so another encounter's seam is never cleared by this path.</p>
+     */
+    private void releaseSlimeState(EnemyState state) {
+        if (state == null) return;
+        SlimeGround.Node node = state.slime;
+        state.slime = null;
+        state.hop = null;
+        state.slimeRoute = null;
+        state.slimeRouteDone = false;
+        if (node == null) return;
+        if (state.mob instanceof Slime slime) ((TacticalSlimeAccess) slime).tactical$setPoseHandler(null);
+    }
+
+    /**
+     * The mixin-facing view of one controlled slime.
+     *
+     * <p>Everything it answers is read from this encounter's live state: the exact entity, the roster entry, a
+     * live encounter and a node it can still prove. A stale handler can therefore neither pin a released unit
+     * nor hold a body the fall rule has taken.</p>
+     */
+    private final class SlimeHandler implements SlimePoseHandler {
+        private final EnemyState state;
+
+        private SlimeHandler(EnemyState state) {
+            this.state = state;
+        }
+
+        /**
+         * Whether this encounter really owns that exact body's displacement right now.
+         *
+         * <p>Owning the body and holding a proven ground node are two different facts. A body this encounter
+         * holds stays owned while it stands on a node, while one of its edges animates, and while a forced
+         * descent carries it - the node is what the controller can prove about it, not a condition for keeping
+         * control. Only a real hand-back ends ownership: the unit left this encounter, died, was removed, or
+         * moved to another dimension.</p>
+         */
+        private boolean owns(Slime slime) {
+            if (slime == null || finished || state.mob != slime) return false;
+            if (enemies.get(slime.getUUID()) != state) return false;
+            if (slime.isRemoved() || !slime.isAlive() || slime.level() != level) return false;
+            return true;
+        }
+
+        @Override
+        public boolean tactical$controls(Slime slime) {
+            return owns(slime);
+        }
+
+        @Override
+        public Vec3 tactical$pinFeet(Slime slime) {
+            if (!owns(slime)) return null;
+            // An edge in flight and a forced descent both own the position themselves: the pin is the real
+            // sample the controller last applied, never the node it took off from, and never a cell centre.
+            // Letting native gravity integrate beside either of them would be a second motion on one tick.
+            if (state.hop != null) return slime.position();
+            if (terrainFall.unit(slime.getUUID()) != null) return slime.position();
+            SlimeGround.Node node = state.slime;
+            if (node == null) return slime.position();
+            // The held node is the pin only while the body really is on it. A different X/Z, or any real height
+            // above it, is not that node: pinning the stale point would be an unswept move in front of native
+            // travel, so the real sample is pinned and the fall rule takes the body from there.
+            if (slime.position().distanceToSqr(node.feet()) > 1.0E-8D) return slime.position();
+            return node.feet();
+        }
+    }
+
+    /** Quoted price of one native contact this own turn; zero for a body that cannot damage anything. */
+    private int slimeContactCost(EnemyState state) {
+        if (state == null || !SlimeGround.supports(state.mob) || !SlimeContact.sizeCanHurt(state.mob)) return 0;
+        return quote(intConfig(TacticalConfig.INSTANCE.meleeApCost, ApCalculator.MELEE_COST), state.paidActions);
+    }
+
+    /**
+     * How many hop edges this body can still pay for while keeping one native contact affordable.
+     *
+     * <p>A size-1 slime reserves nothing because it can never hurt anything; a magma cube of any size reserves
+     * one contact, because that is exactly what vanilla lets it do.</p>
+     */
+    private int slimeEdgeBudget(EnemyState state) {
+        if (state == null || state.slime == null) return 0;
+        int move = Math.max(1, state.moveCost);
+        int reserve = slimeContactCost(state);
+        return Math.max(0, Math.min(SlimeGround.MAX_SEARCH_NODES, (state.ap - reserve) / move));
+    }
+
+    /**
+     * Whether this body's native attack box at that node really reaches the locked opponent.
+     *
+     * <p>Three separate facts, asked together because a paid contact needs all of them: the exact type and size
+     * may damage at all, the native box (the body widened by vanilla's own reach) intersects the target's
+     * hitbox, and the line of sight from this body's real eye is clear. None of them is grid adjacency.</p>
+     */
+    private boolean slimeContactReaches(EnemyState state, SlimeGround.Node node) {
+        if (state == null || node == null) return false;
+        LivingEntity target = actionOpponent(state);
+        if (target == null || !opposed(state.mob, target)) return false;
+        if (target.level() != level || !target.isAlive() || target.isRemoved()) return false;
+        if (!SlimeContact.sizeCanHurt(state.mob)) return false;
+        if (!SlimeContact.attackBoxReaches(state.mob, node.feet(), target)) return false;
+        return SlimeContact.eyeLineOfSight(level, state.mob, node.feet(), target);
+    }
+
+    /**
+     * Every gate a hop route has to pass, asked once against the live world.
+     *
+     * <p>A real stand for every node, a real provable arc for every edge, the whole body inside the battlefield
+     * and no cell another participant holds. A refused route charges nothing and is never walked halfway.</p>
+     */
+    private boolean slimeRouteHolds(EnemyState state, List<SlimeGround.Node> route) {
+        if (state == null || state.slime == null || route == null || route.isEmpty()) return false;
+        if (route.size() > SlimeGround.MAX_SEARCH_NODES) return false;
+        if (!SlimeGround.legal(level, state.mob, state.slime)) return false;
+        SlimeGround.Node previous = state.slime;
+        for (SlimeGround.Node node : route) {
+            if (occupiedByOthers(state, node.cell()) || !zone.contains(node.cell())) return false;
+            if (!SlimeGround.legal(level, state.mob, node)) return false;
+            if (!SlimeGround.bodyInsideZone(state.mob, node, zone::contains)) return false;
+            if (!SlimeGround.adjacent(previous.cell(), node.cell())) return false;
+            if (SlimeGround.leg(level, state.mob, previous, node, zone::contains).isEmpty()) return false;
+            previous = node;
+        }
+        return true;
+    }
+
+    /**
+     * The one bounded approach proposal of this own turn, resolved once and then only re-checked.
+     *
+     * <p>The bounded search is the expensive part, so planning, validation and the commit all read the same
+     * immutable answer; a new own turn - or a new turn generation - resolves a fresh one.</p>
+     */
+    private List<SlimeGround.Node> slimeApproach(EnemyState state) {
+        if (state == null || state.slime == null || finished || ending) return List.of();
+        if (!isActorTurn(state.mob) || isBusy()) return List.of();
+        long epoch = turnEpoch();
+        if (state.slimeRouteDone && state.slimeRouteEpoch == epoch
+                && state.slimeRouteTurn == state.ownTurns) {
+            return state.slimeRoute == null ? List.of() : state.slimeRoute;
+        }
+        state.slimeRouteDone = true;
+        state.slimeRouteEpoch = epoch;
+        state.slimeRouteTurn = state.ownTurns;
+        LivingEntity target = actionOpponent(state);
+        GridPos targetCell = participantCell(target);
+        int budget = slimeEdgeBudget(state);
+        SlimeGround.Route route = targetCell == null || budget <= 0 ? null
+                : SlimeGround.approach(level, state.mob, state.slime, targetCell, budget,
+                        cell -> occupiedByOthers(state, cell), zone::contains,
+                        node -> slimeContactReaches(state, node)).orElse(null);
+        state.slimeRoute = route == null ? null : route.nodes();
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace slime approach session={} tick={} uuid={} here={} "
+                            + "budget={} route={}", session.sessionId(), ticks, state.mob.getUUID(),
+                    state.slime.cell(), budget, state.slimeRoute);
+        }
+        return state.slimeRoute == null ? List.of() : state.slimeRoute;
+    }
+
+    /**
+     * One native contact, at the frozen price, with the real result of vanilla's own {@code hurt}.
+     *
+     * <p>Nothing is charged unless that exact call reported a hit: an absorbed hit whose health does not drop is
+     * still a hit, and a cancelled one is still not. The damage number, the difficulty scaling of the damage
+     * type, armour, the enchantment post-effects and the sound are all vanilla's, because the entry that runs
+     * them is vanilla's. {@code NoAI} stays exactly as it is: the gate vanilla's own {@code isDealsDamage} uses
+     * is never asked here, which is the whole reason a controlled body can still touch anything.</p>
+     */
+    private boolean slimeContact(EnemyState state) {
+        int cost = slimeContactCost(state);
+        LivingEntity target = actionOpponent(state);
+        SlimeGround.Node here = state.slime;
+        if (DeveloperTrace.enabled()) {
+            // Development trace: which gate refused a native contact. Needed because a silent refusal and a
+            // silent "no plan at all" look identical from the journal.
+            boolean legal = here != null && SlimeGround.legal(level, state.mob, here);
+            boolean standable = here != null && BattleDeployment.isStandable(level, state.mob, here.feet());
+            Tactical.LOGGER.info("[Tactical] dev-trace slime contact gates session={} tick={} uuid={} cost={} ap={} "
+                            + "target={} here={} legal={} standable={} loaded={} bodies={} reaches={} actorTurn={}",
+                    session.sessionId(), ticks, state.mob.getUUID(), cost, state.ap,
+                    target == null ? "none" : target.getUUID(), here == null ? "none" : here.cell(), legal,
+                    standable,
+                    here != null && BodyGeometry.loaded(level, BodyGeometry.bodyAt(state.mob, here.feet())),
+                    here == null ? "-" : level.getEntities(state.mob, BodyGeometry.bodyAt(state.mob, here.feet()),
+                            o -> !o.isSpectator() && o.isAlive()
+                                    && (o instanceof LivingEntity || o.canBeCollidedWith())).toString(),
+                    here != null && slimeContactReaches(state, here), isActorTurn(state.mob));
+        }
+        if (cost <= 0 || state.ap < cost || target == null || here == null) return false;
+        if (!isActorTurn(state.mob)) return false;
+        // The standing half only: a wide body that really stands next to the opponent it touches would fail a
+        // placement rule ("nobody else in the box") that has nothing to say about a native contact.
+        if (!SlimeGround.holds(level, state.mob, here)) return false;
+        if (!slimeContactReaches(state, here)) return false;
+        GridPos targetCell = participantCell(target);
+        if (targetCell != null) faceDirection(state.mob, targetCell);
+        journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_ENEMY_MELEE,
+                BattleText.name(state.mob), BattleText.name(target)));
+        state.mob.setTarget(target);
+        boolean hurt = SlimeContact.strike((Slime) state.mob, target);
+        if (!hurt) {
+            if (DeveloperTrace.enabled()) {
+                Tactical.LOGGER.info("[Tactical] dev-trace slime contact refused session={} tick={} uuid={} "
+                                + "target={} at={}", session.sessionId(), ticks, state.mob.getUUID(),
+                        target.getUUID(), here.cell());
+            }
+            return false;
+        }
+        state.ap -= cost;
+        state.paidActions++;
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace slime contact paid session={} tick={} uuid={} target={} "
+                            + "cost={} ap={} paid={}", session.sessionId(), ticks, state.mob.getUUID(),
+                    target.getUUID(), cost, state.ap, state.paidActions);
+        }
+        sendState();
+        return true;
+    }
+
+    /**
+     * One frame of a hop: the same bounded, re-proved animation every other movement here uses.
+     *
+     * <p>Before the body is displaced at all, the frame it is about to fly is re-proved as a full body sweep -
+     * a block placed in the arc, a pool, another body, an unloaded column or a shrunken battlefield stops it -
+     * and so is the landing. If the edge has not started, the whole remaining route is refused and its unwalked
+     * edges are given back; once the body really moved, the edge stays paid and the body stops exactly where it
+     * is. The body is never pulled back to a cell centre or to its take-off point, and a body left in the air is
+     * handed to the existing fall rule - establishing that fall <em>before</em> the turn is handed on.</p>
+     */
+    private void stepSlimeHop(EnemyState enemy) {
+        HopRun run = enemy.hop;
+        if (run == null) {
+            enemyMoving = false;
+            advanceTurn();
+            return;
+        }
+        if (finished || ending) {
+            // The encounter is over: no turn is advanced and no fall is started from here.
+            enemy.hop = null;
+            enemyMoving = false;
+            enemyStepping = false;
+            return;
+        }
+        if (enemy.slime == null || run.epoch != turnEpoch() || !isActorTurn(enemy.mob)) {
+            abandonSlimeHop(enemy);
+            return;
+        }
+        if (run.edge == null) {
+            if (run.index >= run.route.size()) {
+                finishSlimeHop(enemy);
+                return;
+            }
+            SlimeGround.Node from = enemy.slime;
+            SlimeGround.Node to = run.route.get(run.index);
+            java.util.Optional<SlimeMotion.Leg> leg = SlimeGround.legal(level, enemy.mob, from)
+                    && SlimeGround.legal(level, enemy.mob, to)
+                    && !occupiedByOthers(enemy, to.cell())
+                    ? SlimeGround.leg(level, enemy.mob, from, to, zone::contains)
+                    : java.util.Optional.empty();
+            if (leg.isEmpty() || !SlimeGround.bodyInsideZone(enemy.mob, to, zone::contains)) {
+                abandonSlimeHop(enemy);
+                return;
+            }
+            // The body has to really be standing on the node this edge starts from. Adopting that node's feet
+            // here would be an unswept jump no frame of this route ever proved; a body that is not on its node
+            // belongs to the same interruption every other lost support uses.
+            if (!SlimeGround.holds(level, enemy.mob, from)) {
+                abandonSlimeHop(enemy);
+                return;
+            }
+            run.edge = leg.get();
+            run.to = to;
+            run.frames = 0;
+            run.edgeStarted = false;
+            // The body really leaves the floor on this edge; saying so keeps the native landing presentation
+            // (squish, particles, sound) reading the truth while the movement step stays cancelled.
+            enemy.mob.setOnGround(false);
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            faceDirection(enemy.mob, to.cell());
+        }
+        int next = run.frames + 1;
+        // Before the body is displaced at all, the frame it is about to fly and the landing it is flying to are
+        // re-proved against the live world. A sweep that only gets emptier - a floor dug out of the landing cell
+        // mid-edge - would otherwise be flown into an empty box and called a landing on the last frame.
+        if (!SlimeMotion.nextFrameHolds(level, enemy.mob, run.edge, next, zone::contains)
+                || !BodyGeometry.bodyInsideZone(enemy.mob, run.edge.point(next), zone::contains)
+                || run.to == null
+                || !SlimeGround.legal(level, enemy.mob, run.to)
+                || occupiedByOthers(enemy, run.to.cell())
+                || !SlimeGround.bodyInsideZone(enemy.mob, run.to, zone::contains)) {
+            abandonSlimeHop(enemy);
+            return;
+        }
+        Vec3 point = run.edge.point(next);
+        enemy.mob.setPos(point);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        run.frames = next;
+        run.edgeStarted = true;
+        if (next >= run.edge.frames()) {
+            // The edge landed on its own node, with the exact feet that node holds.
+            enemy.slime = run.to;
+            enemy.cell = run.to.cell();
+            enemy.mob.setPos(run.to.feet());
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            enemy.mob.setOnGround(true);
+            run.edge = null;
+            run.to = null;
+            run.frames = 0;
+            run.edgeStarted = false;
+            run.index++;
+            if (run.index >= run.route.size()) finishSlimeHop(enemy);
+        }
+    }
+
+    /** The route really arrived: the same hand-back every other movement uses. */
+    private void finishSlimeHop(EnemyState enemy) {
+        enemy.hop = null;
+        enemyMoving = false;
+        enemyStepping = false;
+        enemyPath = List.of();
+        enemyPathIndex = 0;
+        if (enemy.companionAdapter != null) {
+            sendState();
+            return;
+        }
+        if (!targetLost(enemy)) resolveAiAction(enemy, ai.afterMovement(aiContext(enemy)));
+        else if (!replanAfterLostTarget(enemy)) advanceTurn();
+    }
+
+    /**
+     * Stop a hop that can no longer be flown and give the body back cleanly.
+     *
+     * <p>Every normal interruption settles at the per-edge quote frozen when the route was committed: the edges
+     * the body really completed and the one it really began moving on stay paid, and every edge it never began
+     * is given back exactly once. A route refused on its first frame therefore costs nothing at all. The quote
+     * is never re-read from a {@code moveCost} that changed after the commit, and the same run can never refund
+     * twice because the run is dropped before anything is returned. The body keeps the position it really
+     * reached: a real, legal stand at its own feet is re-adopted where it stands, and anything else starts a
+     * real fall - established first, so the encounter is already busy when the turn is handed on.</p>
+     */
+    private void abandonSlimeHop(EnemyState enemy) {
+        HopRun run = enemy.hop;
+        enemy.hop = null;
+        enemyMoving = false;
+        enemyStepping = false;
+        enemyPath = List.of();
+        enemyPathIndex = 0;
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        if (run != null && !run.route.isEmpty()) {
+            // The frozen route was quoted as one price per edge, so its own per-edge share is exact and does not
+            // depend on anything that may have changed since.
+            int perEdge = run.cost / run.route.size();
+            int charged = run.index + (run.edgeStarted ? 1 : 0);
+            int unused = Math.max(0, run.route.size() - charged);
+            int refund = unused * perEdge;
+            if (refund > 0) enemy.ap = Math.min(enemy.maxAp, enemy.ap + refund);
+        }
+        Vec3 real = enemy.mob.position();
+        GridPos cell = new GridPos(Mth.floor(real.x), Mth.floor(real.y), Mth.floor(real.z));
+        // The held point is the real sample, and the cell it really occupies is derived from it: rebuilding a
+        // node on the cell centre and moving the body there would be a lateral snap nothing swept.
+        SlimeGround.Node held = new SlimeGround.Node(cell, real);
+        if (SlimeGround.legal(level, enemy.mob, held)) {
+            // The body really stands where it is: adopt that exact point, with the feet it really has.
+            enemy.slime = held;
+            enemy.cell = cell;
+            enemy.mob.setPos(real);
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            enemy.mob.fallDistance = 0.0F;
+            enemy.mob.setOnGround(true);
+            sendState();
+            advanceTurn();
+            return;
+        }
+        // Anything else - a fractional height, a lost support, a body inside a cell whose floor is refused -
+        // is a fall, and it is established before the turn is handed on.
+        startSlimeFall(enemy);
+        advanceTurn();
+    }
+
+    /**
+     * Start the real descent for a body this encounter had to let go of.
+     *
+     * <p>The existing fall owns the cells, the landing, the deadline and the damage; this only establishes it and
+     * remembers the real feet, exactly like the spider slot. It is deliberately unconditional about the support
+     * below: a body interrupted half a block above its own floor has a floor under it and still is not standing.
+     * </p>
+     */
+    private void startSlimeFall(EnemyState enemy) {
+        if (enemy == null || enemy.mob == null || finished || ending) return;
+        if (!enemy.mob.isAlive() || enemy.mob.isRemoved() || enemy.mob.level() != level) return;
+        if (terrainFall.unit(enemy.mob.getUUID()) != null) return;
+        // The fall starts from the cell the body really occupies, not from the node it took off from: an
+        // interrupted hop can be several tenths of a block past its own cell boundary.
+        GridPos cell = new GridPos(Mth.floor(enemy.mob.getX()), Mth.floor(enemy.mob.getY()),
+                Mth.floor(enemy.mob.getZ()));
+        enemy.cell = cell;
+        TerrainFall.Unit unit = terrainFall.begin(enemy.mob.getUUID(), false, cell);
+        slimeFallFeet.put(enemy.mob.getUUID(), enemy.mob.position());
+        // The descent really starts in the air, and the body says so from this moment.
+        enemy.mob.setOnGround(false);
+        refreshFallLanding(unit);
+        journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL_BEGIN,
+                BattleText.name(enemy.mob), BattleText.literal(cell.toString())));
+        try {
+            sendState();
+        } catch (RuntimeException ignored) {
+            // The fall is authoritative even when one broadcast fails.
+        }
+    }
+
+    /**
+     * One tick of this family's descent: the real fractional height first, then the ordinary cells.
+     *
+     * <p>The sub-block part is the whole point. A body interrupted in the air above its own floor already has a
+     * solid block under its cell, so the ordinary rule would call that a landing and snap it down a fraction of
+     * a block - a move nothing swept and nothing proved. Here the real Y is descended in bounded slices, sweeping
+     * the whole body between the two positions it really occupies, and only when it reaches the real foot surface
+     * does the ordinary column rule get to decide.</p>
+     */
+    private void stepFallingSlime(TerrainFall.Unit unit, EnemyState enemy, Vec3 held) {
+        if (enemy == null || !enemy.mob.isAlive() || enemy.mob.isRemoved()) {
+            terrainFall.end(unit.id());
+            slimeFallFeet.remove(unit.id());
+            return;
+        }
+        double x = held.x;
+        double z = held.z;
+        double surfaceY = unit.cell().y();
+        double realY = enemy.mob.getY();
+        if (realY > surfaceY + 1.0E-4D) {
+            double target = Math.max(surfaceY, realY - subCellDescent());
+            if (!slimeFallSliceClear(enemy.mob, x, realY, target, z)) {
+                // Something is in the way of the fraction it is about to fall through: keep the real position
+                // and re-plan next tick, exactly as every other falling unit does.
+                return;
+            }
+            enemy.mob.setPos(x, target, z);
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            enemy.mob.fallDistance = 0.0F;
+            if (target > surfaceY + 1.0E-4D) return;
+        }
+        if (unit.stepTo() == null) {
+            refreshFallLanding(unit);
+            com.tactical.neoforge.battle.terrain.FallPlanner.Step step =
+                    com.tactical.neoforge.battle.terrain.FallPlanner.next(unit.cell(), this::hasSupportBelow,
+                            cell -> enterableForFall(cell, unit.id()));
+            if (step == com.tactical.neoforge.battle.terrain.FallPlanner.Step.LAND) {
+                settleSlimeFall(unit, enemy, x, z);
+                return;
+            }
+            if (step == com.tactical.neoforge.battle.terrain.FallPlanner.Step.STUCK) return;
+            GridPos next = below(unit.cell());
+            if (!zone.contains(next)) { abandonTerrainFall(unit); return; }
+            unit.beginStep(unit.cell(), next, fallStepTicks());
+        }
+        double from = enemy.mob.getY();
+        double target = unit.stepFrom().y() + (unit.stepTo().y() - unit.stepFrom().y())
+                * fallFraction(unit, unit.progress() + 1);
+        if (!slimeFallSliceClear(enemy.mob, x, from, target, z)) {
+            unit.endStep();
+            return;
+        }
+        unit.progress(unit.progress() + 1);
+        enemy.mob.setPos(x, target, z);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        if (unit.fraction() >= 1.0D) {
+            GridPos arrived = unit.stepTo();
+            unit.stepLanded(arrived);
+            enemy.cell = arrived;
+        }
+    }
+
+    /** One bounded slice of the sub-block descent, at the same speed the cell ladder uses. */
+    private double subCellDescent() {
+        return 1.0D / Math.max(1, fallStepTicks());
+    }
+
+    /** The whole body between the two real heights it occupies, cleared as one box. */
+    private boolean slimeFallSliceClear(LivingEntity body, double x, double fromY, double toY, double z) {
+        AABB swept = BodyGeometry.swept(body, new Vec3(x, fromY, z), new Vec3(x, toY, z));
+        if (swept == null) return false;
+        if (!BodyGeometry.loaded(level, swept)) return false;
+        if (!level.noCollision(body, swept)) return false;
+        return !AmphibiousMovement.overlapsBody(level, body, swept);
+    }
+
+    /**
+     * Land this body where it really is.
+     *
+     * <p>The ordinary landing snaps the body onto the centre of its cell; only the real, legal feet can settle
+     * this family's fall. An invalid stand keeps the deadline running instead of being repaired by an unswept
+     * snap.</p>
+     */
+    private void settleSlimeFall(TerrainFall.Unit unit, EnemyState enemy, double x, double z) {
+        GridPos landing = unit.cell();
+        Vec3 feet = new Vec3(x, landing.y(), z);
+        SlimeGround.Node node = new SlimeGround.Node(landing, feet);
+        if (!SlimeGround.legal(level, enemy.mob, node)) return;
+        terrainFall.end(unit.id());
+        slimeFallFeet.remove(unit.id());
+        enemy.cell = landing;
+        enemy.slime = node;
+        enemy.mob.setPos(feet);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        enemy.mob.setOnGround(true);
+        settleFallDamage(enemy.mob, landing, unit.cells());
+        journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL,
+                BattleText.name(enemy.mob), BattleText.literal(unit.origin().toString()),
+                BattleText.literal(landing.toString()), unit.cells()));
+        if (!finished) sendState();
+    }
+
     /**
      * The mixin-facing view of one controlled enderman.
      *
@@ -5885,6 +6737,24 @@ public final class ServerBattle {
                 return state.spider != null && spiderRouteHolds(state, state.spider.node(), route);
             }
             public int surfaceEdgeBudget() { return spiderEdgeBudget(state); }
+            // ---- slime family: real body, real hop edges, native contact ----
+            public boolean slimeContext() { return SlimeGround.supports(state.mob) && state.slime != null; }
+            public SlimeGround.Node slimeHere() { return state.slime; }
+            public List<SlimeGround.Node> slimeNeighbours(SlimeGround.Node from) {
+                if (state.slime == null || from == null) return List.of();
+                return SlimeGround.neighbours(level, state.mob, from, opponentCell == null ? state.cell : opponentCell,
+                        this::occupied, zone::contains);
+            }
+            public boolean slimeRouteHolds(List<SlimeGround.Node> route) {
+                return state.slime != null && ServerBattle.this.slimeRouteHolds(state, route);
+            }
+            public int slimeEdgeBudget() { return ServerBattle.this.slimeEdgeBudget(state); }
+            public List<SlimeGround.Node> slimeApproach() { return ServerBattle.this.slimeApproach(state); }
+            public boolean slimeContactReaches(SlimeGround.Node node) {
+                return ServerBattle.this.slimeContactReaches(state, node);
+            }
+            public int slimeContactCost() { return ServerBattle.this.slimeContactCost(state); }
+            public boolean slimeContact() { return ServerBattle.this.slimeContact(state); }
             public boolean canLeap() { return spiderCanLeap(state); }
             public int leapCost() { return spiderLeapCost(state); }
             public int meleeCost() { return mobMeleeCost(state); }
@@ -5969,6 +6839,49 @@ public final class ServerBattle {
             journal.record("move",BattleText.translatable(BattleText.KEY_ENEMY_MOVE,
                     BattleText.name(enemy.mob), BattleText.literal(nodes.get(nodes.size()-1).cell().toString())));
             sendState();return;
+        }
+        if (action.kind() == AiAction.Kind.SLIME_HOP) {
+            /* One hop route for this family. The plan is re-proved edge by edge against the live world before the
+               body leaves its node, and the price is charged once, per edge, exactly like an ordinary move: the
+               edges it will not walk are given back, and movement never touches the success counter. */
+            List<SlimeGround.Node> nodes = action.hop();
+            if (enemy.slime == null || nodes.isEmpty() || enemy.hop != null
+                    || nodes.size() > slimeEdgeBudget(enemy) || !slimeRouteHolds(enemy, nodes)) {
+                advanceTurn();
+                return;
+            }
+            long total = (long) nodes.size() * enemy.moveCost;
+            if (total > enemy.ap) { advanceTurn(); return; }
+            enemy.ap -= (int) total;
+            enemy.hop = new HopRun(nodes, (int) total, turnEpoch());
+            enemyPath = List.of();
+            enemyPathIndex = 0;
+            enemyStepping = false;
+            enemyMoving = true;
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            enemy.mob.fallDistance = 0.0F;
+            journal.record("move", BattleText.translatable(BattleText.KEY_ENEMY_MOVE,
+                    BattleText.name(enemy.mob), BattleText.literal(nodes.get(nodes.size() - 1).cell().toString())));
+            if (DeveloperTrace.enabled()) {
+                StringBuilder route = new StringBuilder();
+                for (SlimeGround.Node node : nodes) route.append(' ').append(node.cell());
+                Tactical.LOGGER.info("[Tactical] dev-trace slime hop commit session={} tick={} uuid={} from={} "
+                                + "budget={} cost={} route={}", session.sessionId(), ticks, enemy.mob.getUUID(),
+                        enemy.slime.cell(), slimeEdgeBudget(enemy), total, route);
+            }
+            sendState();
+            return;
+        }
+        if (action.kind() == AiAction.Kind.SLIME_CONTACT) {
+            /* One native contact: the server re-proves the locked opponent, the real attack box at those feet, the
+               real eye line, the size's own damage ability and the frozen price, and charges only when the hurt
+               call inside vanilla's dealDamage really reported a hit. Nothing here writes a damage number. */
+            // One contact per own turn, whether it landed or not: this turn's main action is spent either way,
+            // exactly like a refused melee. Without this a body whose box no longer reaches would retry the
+            // same call on every tick of its own turn.
+            slimeContact(enemy);
+            advanceTurn();
+            return;
         }
         if (action.kind() == AiAction.Kind.SPIDER_LEAP) {
             /* One short leap. The one proposal of this own turn is the only thing it may fly, and it is re-proved
@@ -6623,16 +7536,18 @@ public final class ServerBattle {
     }
 
     /**
-     * Advance the turn queue, unless units are still in the air.
+     * Advance the turn queue, unless units are still in the air or a native split is still owed.
      *
      * <p>A forced fall is a barrier for turn flow, not only for commands: nobody may start a new turn and
      * collect its recovery while a combatant is mid-fall. A death or an exit that happens during the fall
      * still takes effect immediately - the member is removed - but the new turn waits until the last fall
-     * has settled, which is what keeps the queue and the resources in one order.</p>
+     * has settled, which is what keeps the queue and the resources in one order. A split this encounter is
+     * owed children by is the same kind of wait, and the two coexist: the next turn only begins once both
+     * are closed, and then exactly once.</p>
      */
     private void advanceTurn() {
         if (finished) return;
-        if (terrainFall.busy()) {
+        if (terrainFall.busy() || splits.pending()) {
             pendingTurnAdvance = true;
             return;
         }
@@ -6640,6 +7555,49 @@ public final class ServerBattle {
         refreshTacticalAttributes();
         String next = queue.advance();
         beginTurn(next);
+    }
+
+    /**
+     * Settle the wait once no native split is outstanding.
+     *
+     * <p>Victory is only declared when nothing can still be born: a dead size-4 parent whose children are
+     * being produced is not "all enemies defeated". A turn the barrier deferred is advanced exactly once, so a
+     * member that killed a parent keeps its own turn and its own resources instead of being handed a fresh
+     * one. An unconfirmed split ends the encounter with its own reason rather than a victory nobody proved.</p>
+     */
+    private void settleSplitBarrier() {
+        if (finished || ending) return;
+        if (splits.pending()) return;
+        if (hostileCount() == 0) {
+            // A fall still owns the encounter: victory waits for it, exactly like a new turn does. The outcome is
+            // remembered, never dropped, so a split released unconfirmed cannot later be reported as a victory.
+            if (terrainFall.busy()) { victoryDeferred = true; return; }
+            finishWith(splits.hasUnreleasedAnomaly()
+                    ? BattleText.End.SPLIT_UNRESOLVED : BattleText.End.ENEMIES_DEFEATED);
+            return;
+        }
+        if (pendingTurnAdvance) advanceTurn();
+        else sendState();
+    }
+
+    /**
+     * Settle a victory both barriers had to wait for.
+     *
+     * <p>Called from the encounter's tick once the forced fall is over: with no hostile left, no owed split and no
+     * fall running, the encounter ends on its own recorded reason.</p>
+     */
+    private void settleDeferredVictory() {
+        if (!victoryDeferred || finished || ending) return;
+        if (splits.pending() || terrainFall.busy() || hostileCount() > 0) return;
+        victoryDeferred = false;
+        finishWith(splits.hasUnreleasedAnomaly()
+                ? BattleText.End.SPLIT_UNRESOLVED : BattleText.End.ENEMIES_DEFEATED);
+    }
+
+    /** End this encounter through one enumerated reason, keeping the code available to diagnostics. */
+    private void finishWith(BattleText.End end) {
+        endCode = end;
+        finish(BattleText.endReason(end));
     }
 
     // ------------------------------------------------------------------
@@ -6690,6 +7648,10 @@ public final class ServerBattle {
             if (entry.getValue().mob.isDeadOrDying() || !entry.getValue().mob.isAlive() || entry.getValue().mob.isRemoved() || entry.getValue().mob.level() != level) {
                 if (current != null && current.equals(entry.getKey().toString())) removedCurrent = true;
                 EnemyState departed = entry.getValue();
+                // A dead parent still owes vanilla's own split to this encounter. It is remembered before the
+                // roster entry goes away - together with the flags this encounter borrowed - so the coming
+                // native removal can neither happen unseen nor hand the borrowed flags to the whole family.
+                captureSplitParent(departed);
                 iterator.remove();
                 dropBlazeVolleyFor(entry.getKey(), departed);
                 if (departed.companionAdapter != null) {
@@ -6705,11 +7667,14 @@ public final class ServerBattle {
                     releaseTridentPose(entry.getKey());
                     releaseEndermanState(departed);
                     releaseSpiderState(departed);
+                    releaseSlimeState(departed);
                     ai.remove(departed.mob);
                     // A departed unit gives up its ownership claim, but only this encounter's: another
                     // encounter's identical UUID or a same-UUID respawn must keep its own routing.
                     BattleManager.releaseActor(this, entry.getKey());
                     departed.mob.setNoAi(departed.originalNoAi);
+                    ((com.tactical.neoforge.mixin.BattleMobPersistenceAccess) departed.mob)
+                            .tactical$persistenceRequired(departed.originalPersistenceRequired);
                     departed.mob.setTarget(null);
                     // Death and removal only drop this mod's transient potion state; a dead unit is given no
                     // potion back, so leaving a battle never invents an item that vanilla would not drop.
@@ -6721,8 +7686,13 @@ public final class ServerBattle {
         // Reuse newly freed capacity before victory/turn selection, even when the old
         // roster was emptied in this tick. Do not force a player into a second battle.
         if(changed)recruitNearbyAggro();
-        if (hostileCount() == 0) {
-            finish(BattleText.endReason(BattleText.End.ENEMIES_DEFEATED));
+        // An emptied roster is not a victory while this encounter is still owed a native split: vanilla
+        // produces those children about twenty death ticks later, and the wait is settled on its own tick. A
+        // forced fall is the other barrier: while one runs, the end is only remembered.
+        if (hostileCount() == 0 && !splits.pending()) {
+            if (terrainFall.busy()) victoryDeferred = true;
+            else finishWith(splits.hasUnreleasedAnomaly()
+                    ? BattleText.End.SPLIT_UNRESOLVED : BattleText.End.ENEMIES_DEFEATED);
         } else if (removedCurrent && !finished
                 && (phase == BattlePhase.ENEMY_TURN || phase == BattlePhase.COMPANION_TURN)) {
             advanceTurn();
@@ -6731,6 +7701,39 @@ public final class ServerBattle {
             // snapshot, even if death came from a projectile or outside command.
             sendState();
         }
+    }
+
+    /**
+     * Remember a dead parent before its roster entry is dropped, so vanilla's own split cannot happen unseen.
+     *
+     * <p>Only this encounter's exact supported bodies with {@code size > 1} in its own level: a size-1 body has
+     * no split, a body that left the dimension is not this encounter's removal any more, and every other mob
+     * family keeps its own vanilla behaviour.</p>
+     */
+    private void captureSplitParent(EnemyState departed) {
+        if (departed == null || departed.mob == null) return;
+        Mob body = departed.mob;
+        if (!body.isDeadOrDying() || body.level() != level) return;
+        if (!SlimeGround.supports(body)) return;
+        if (!(body instanceof net.minecraft.world.entity.monster.Slime slime) || slime.getSize() <= 1) return;
+        splits.captureFromDeath(body, departed.side, departed.originalNoAi,
+                departed.originalPersistenceRequired);
+    }
+
+    /**
+     * Capture a dead parent straight from this encounter's roster entry.
+     *
+     * <p>The native removal can arrive before the death scan; asking the roster is what keeps the borrowed
+     * originals exact in that window instead of sampling flags this encounter itself changed.</p>
+     */
+    SlimeSplitLifecycle.Pending captureSplitFromRoster(Mob parent) {
+        EnemyState state = stateOf(parent);
+        if (state == null) return null;
+        // A death event arrives before vanilla marks the body dead; the roster scan sees it after. Both are
+        // the same death, so neither the dead flag nor the health alone may be the gate.
+        if (!parent.isDeadOrDying() && parent.getHealth() > 0.0F) return null;
+        return splits.captureFromDeath(parent, state.side, state.originalNoAi,
+                state.originalPersistenceRequired);
     }
 
     private boolean healthChanged() {
@@ -7188,6 +8191,9 @@ public final class ServerBattle {
         // only half of that fact. Remembering the real feet here is what lets the descent keep them instead of
         // sliding the whole body onto the centre of every cell, which would put it back inside the wall.
         if (!player && SpiderSurface.supports(unit)) spiderFallFeet.put(id, unit.position());
+        // This family keeps its real X/Z and its real fractional Y the same way; only the bridge that steps it
+        // differs, because a body can be interrupted less than a whole block above its own floor.
+        if (!player && SlimeGround.supports(unit)) slimeFallFeet.put(id, unit.position());
         // The landing is a reservation that keeps two falling units apart, and it is recomputed from the
         // live world for as long as the descent lasts.
         refreshFallLanding(falling);
@@ -7429,6 +8435,11 @@ public final class ServerBattle {
             spiderFallFeet.remove(unit.id());
             return;
         }
+        Vec3 slimeHeld = slimeFallFeet.get(unit.id());
+        if (slimeHeld != null) {
+            stepFallingSlime(unit, enemy, slimeHeld);
+            return;
+        }
         Vec3 held = spiderFallFeet.get(unit.id());
         if (held != null) {
             stepFallingSpider(unit, enemy, held.x, held.z);
@@ -7618,6 +8629,7 @@ public final class ServerBattle {
     private void abandonTerrainFall(TerrainFall.Unit unit) {
         terrainFall.end(unit.id());
         spiderFallFeet.remove(unit.id());
+        slimeFallFeet.remove(unit.id());
         Tactical.LOGGER.error("[Tactical] forced fall did not settle within {} ticks: {} {} from {} at {} ({} cells); "
                         + "releasing it to vanilla physics", TerrainFall.TIMEOUT_TICKS,
                 unit.player() ? "player" : "mob", unit.id(), unit.origin(), unit.cell(), unit.cells());
@@ -7644,8 +8656,13 @@ public final class ServerBattle {
                 // surface state: nothing of this encounter may still be pinning the body it gave back.
                 releaseEndermanState(enemy);
                 releaseSpiderState(enemy);
+                releaseSlimeState(enemy);
                 releaseWitchState(enemy);
                 enemy.mob.setNoAi(enemy.originalNoAi);
+                // A unit released this way is given back to vanilla physics with the same flags it arrived with:
+                // the borrowed persistence is not left on a body this encounter no longer owns.
+                ((com.tactical.neoforge.mixin.BattleMobPersistenceAccess) enemy.mob)
+                        .tactical$persistenceRequired(enemy.originalPersistenceRequired);
                 enemy.mob.setTarget(null);
                 enemy.mob.setDeltaMovement(Vec3.ZERO);
                 if (acting && !finished) advanceTurn();
@@ -7761,29 +8778,177 @@ public final class ServerBattle {
     record EnemyView(GridPos cell, int ap, int maxAp, int moveCost, int paidActions,
                      SpiderSurface.Node node, boolean moving, boolean alive, Vec3 feet,
                      boolean leaping, int leapFrames, boolean leapPaid, int leapsUsed,
-                     GridPos leapLanding) { }
+                     GridPos leapLanding, SlimeGround.Node slime, boolean hopping,
+                     int hopEdges, int hopIndex, boolean hopEdgeStarted, int hopPrice) { }
 
     /**
      * Fixture-only: set one enemy's own AP, so a deterministic case can prove a transaction whose pool changes
-     * between the commit and the first real displacement. Like the other fixture hooks it changes nothing
-     * unless a fixture asks for it.
+     * between the commit and the first real displacement, or hand a unit exactly the pool a case needs.
+     *
+     * <p>This is a setter, not a readback: it writes the authoritative pool of that unit (clamped into its own
+     * cap) and changes nothing unless a fixture calls it. The readback of the same value is
+     * {@link EnemyView#ap()}; {@link #fixtureEnemyPool(UUID, int)} is the same write with a "was that unit there"
+     * answer, kept because two fixtures ask by different names.</p>
      */
     void fixtureEnemyAp(UUID id, int ap) {
+        fixtureEnemyPool(id, ap);
+    }
+
+    /**
+     * Fixture-only: change one enemy's frozen per-edge move price after its route was committed.
+     *
+     * <p>Needed to prove that a refund settles at the price frozen at the commit instead of a price that changed
+     * afterwards; it writes the same field a property refresh would, and nothing happens unless a fixture asks.
+     * </p>
+     */
+    boolean fixtureEnemyMoveCost(UUID id, int moveCost) {
         EnemyState state = id == null ? null : enemies.get(id);
-        if (state == null) return;
+        if (state == null) return false;
+        state.moveCost = Math.max(1, moveCost);
+        return true;
+    }
+
+    /** Fixture-only readback: the bounded descent one tick of this family's fall may take. */
+    double fixtureSubCellDescent() {
+        return subCellDescent();
+    }
+
+    /** Fixture-only: set one enemy's pool and report whether that exact unit was there to set it. */
+    boolean fixtureEnemyPool(UUID id, int ap) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        if (state == null) return false;
         state.ap = Math.max(0, Math.min(state.maxAp, ap));
+        return true;
+    }
+
+    /**
+     * Fixture-only: open a native-split wait for this body without a native removal.
+     *
+     * <p>The one thing a server fixture cannot produce is a split that is never confirmed (an unloaded chunk or
+     * a third-party caller holding a dead body back). This opens the same wait the death scan opens, so the
+     * abnormal cutoff can be observed over real ticks; the release, the barrier and the end reason are the
+     * production ones.</p>
+     */
+    boolean fixtureSplitWait(Mob parent, BattleSide side) {
+        if (parent == null) return false;
+        return splits.capture(parent, side, parent.isNoAi(), parent.isPersistenceRequired()) != null;
+    }
+
+    /** Fixture-only: how many native splits this encounter is still owed. */
+    int fixtureSplitPending() {
+        return splits.pendingCount();
+    }
+
+    /** Fixture-only: how many children a native split really produced for this encounter. */
+    int fixtureSplitBorn() {
+        return splits.bornTotal();
+    }
+
+    /** Fixture-only: how many of those were admitted by this encounter exactly once. */
+    int fixtureSplitAdmitted() {
+        return splits.admittedTotal();
+    }
+
+    /** Fixture-only: how many split waits ended at the abnormal cutoff. */
+    int fixtureSplitAnomalies() {
+        return splits.anomalies();
+    }
+
+    /** Fixture-only: the exact parents this encounter is waiting on. */
+    List<UUID> fixtureSplitWaiting() {
+        return splits.waitingParents();
+    }
+
+    /** Fixture-only: whether this child is held out because its split could not be taken. */
+    boolean fixtureHoldsSplitChild(Mob mob) {
+        return isolation.holdsSplitChild(mob);
+    }
+
+    /** Fixture-only: the faction of one roster entry, so a child's inherited side can be read. */
+    BattleSide fixtureSide(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        return state == null ? null : state.side;
+    }
+
+    /** Fixture-only: the coded reason this encounter ended with, or null. */
+    BattleText.End fixtureEndCode() {
+        return endCode;
+    }
+
+    /** Fixture-only: whether a victory is waiting for the fall and split barriers to clear. */
+    boolean fixtureVictoryDeferred() {
+        return victoryDeferred;
+    }
+
+    /** Fixture-only: the forced-fall barrier on its own, so the two barriers can be told apart. */
+    boolean fixtureFallBusy() {
+        return terrainFall.busy();
+    }
+
+    /** Fixture-only: the owed-split barrier on its own. */
+    boolean fixtureSplitBusy() {
+        return splits.pending();
+    }
+
+    /** Fixture-only: the live session id, so a fixture can build a real intent stamp. */
+    UUID fixtureSessionId() {
+        return session.sessionId();
+    }
+
+    /** Fixture-only: the AI flag this roster entry captured before the encounter borrowed one. */
+    Boolean fixtureOriginalNoAi(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        return state == null ? null : state.originalNoAi;
+    }
+
+    /** Fixture-only: the persistence flag this roster entry captured, which no borrowed value may become. */
+    Boolean fixtureOriginalPersistence(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        return state == null ? null : state.originalPersistenceRequired;
+    }
+
+    /** Fixture-only: how many paid actions this member has made this turn. */
+    int fixtureMemberPaid(ServerPlayer player) {
+        PlayerParticipant state = memberState(player);
+        return state == null ? -1 : state.paidActions();
     }
 
     EnemyView fixtureEnemy(UUID id) {
         EnemyState state = id == null ? null : enemies.get(id);
         if (state == null || state.mob == null) return null;
         SpiderLeap.Proposal proposal = state.leap != null ? state.leap.proposal : state.leapProposal;
+        HopRun hop = state.hop;
         return new EnemyView(state.cell, state.ap, state.maxAp, state.moveCost, state.paidActions,
                 state.spider == null ? null : state.spider.node(), enemyMoving,
                 state.mob.isAlive() && !state.mob.isRemoved(), state.mob.position(),
                 state.leap != null, state.leap == null ? 0 : state.leap.frames,
                 state.leap != null && state.leap.paid, state.spiderLeapsUsed,
-                proposal == null ? null : proposal.landing().cell());
+                proposal == null ? null : proposal.landing().cell(), state.slime, hop != null,
+                hop == null ? 0 : hop.route.size(), hop == null ? 0 : hop.index,
+                hop != null && hop.edgeStarted, hop == null ? 0 : hop.cost);
+    }
+
+    /**
+     * One hop route in flight: the nodes it may still walk, the edge it is animating and what it already spent.
+     *
+     * <p>The price of the whole route was frozen and paid when it was committed, so a stop only has to give back
+     * the edges the body never started - never a price re-read from a changed {@code moveCost}.</p>
+     */
+    private static final class HopRun {
+        final List<SlimeGround.Node> route;
+        final int cost;
+        final long epoch;
+        int index;
+        SlimeMotion.Leg edge;
+        SlimeGround.Node to;
+        int frames;
+        boolean edgeStarted;
+
+        HopRun(List<SlimeGround.Node> route, int cost, long epoch) {
+            this.route = route;
+            this.cost = cost;
+            this.epoch = epoch;
+        }
     }
 
     /**
@@ -8193,6 +9358,24 @@ public final class ServerBattle {
          * on a wall" is exactly what would leave it hovering after the wall is gone.</p>
          */
         SpiderTraversal spider;
+        /**
+         * The real ground node this exact body holds, for the two vanilla slime types only.
+         *
+         * <p>A node carries the feet the body really has, because a body 2.08 blocks wide and tall cannot be
+         * described by a cell alone - and a cell-only view would walk it through a hole its body cannot pass.</p>
+         */
+        SlimeGround.Node slime;
+        /** The hop route this own turn is really flying, or null; it owns the turn until it lands or stops. */
+        HopRun hop;
+        /**
+         * The one bounded route proposal of this own turn, cached with the turn and epoch it was resolved in.
+         * A getter re-asks the live world about this same proposal instead of scanning again, so planning,
+         * validation and the commit all name one immutable answer.
+         */
+        List<SlimeGround.Node> slimeRoute;
+        boolean slimeRouteDone;
+        long slimeRouteEpoch;
+        int slimeRouteTurn;
         /**
          * The one bounded short-leap proposal of this own turn, cached with the turn and epoch it was resolved
          * in. A getter re-asks the live world about this same proposal instead of scanning for another one, so

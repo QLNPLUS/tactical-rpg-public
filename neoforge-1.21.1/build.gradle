@@ -172,6 +172,16 @@ neoForge {
             systemProperty 'tactical.selftest', 'spider'
             systemProperty 'tactical.dev.trace', 'true'
         }
+        // Slime/magma-cube fixture: own throwaway world and ephemeral port. A real 2.08 wide body, a real
+        // native dealDamage under NoAI, a real hop arc and a real sub-block fall are only decidable on a booted
+        // server; it starts no client and touches no other fixture's world.
+        serverSlimeTest {
+            server()
+            gameDirectory = file('run-server-slime-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'slime'
+            systemProperty 'tactical.dev.trace', 'true'
+        }
         serverVindicatorTest {            server()
             gameDirectory = file('run-server-vindicator-test')
             systemProperty 'tactical.selftest', 'vindicator'

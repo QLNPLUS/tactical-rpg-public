@@ -250,6 +250,73 @@ public interface AiContext {
     default boolean breakDoor(DoorRoutePlanner.Door door) { return false; }
 
     /**
+     * Whether this context carries the slime family's own movement and contact policy at all.
+     *
+     * <p>Asked before any of the answers below, because "no node right now" and "this context knows nothing
+     * about slimes" are different facts. A context that does not carry the policy - a third-party adapter, an
+     * older fixture - answers false, and the adapter then falls back to its complete legacy behaviour instead
+     * of pretending a body has no position.</p>
+     */
+    default boolean slimeContext() { return false; }
+
+    /** The real ground node this body holds right now, or null when the encounter cannot prove one. */
+    default com.tactical.neoforge.battle.SlimeGround.Node slimeHere() { return null; }
+
+    /**
+     * Every real ground node this body may hop to in one bounded pass, with the same occupancy, body and zone
+     * gates the encounter's own movement uses.
+     */
+    default List<com.tactical.neoforge.battle.SlimeGround.Node> slimeNeighbours(
+            com.tactical.neoforge.battle.SlimeGround.Node from) {
+        return List.of();
+    }
+
+    /**
+     * Whether that whole route still holds in the live world: every node a real stand, every edge a real
+     * provable arc, the whole body inside the battlefield and no cell another unit holds.
+     */
+    default boolean slimeRouteHolds(List<com.tactical.neoforge.battle.SlimeGround.Node> route) { return false; }
+
+    /**
+     * How many hop edges this actor may still pay for this own turn while keeping one native contact
+     * affordable; zero for an actor that can never reach the opponent.
+     */
+    default int slimeEdgeBudget() { return 0; }
+
+    /**
+     * Whether this actor's native attack box at that node really reaches the locked opponent, with a clear
+     * line of sight from its real eye.
+     *
+     * <p>Asked separately from {@link #inMeleeRange} on purpose: grid adjacency is a movement rule, and a
+     * large body's box really spans about two cells while a tiny body's spans less than one.</p>
+     */
+    default boolean slimeContactReaches(com.tactical.neoforge.battle.SlimeGround.Node node) { return false; }
+
+    /**
+     * This turn's one bounded hop route, or an empty list when no legal progress exists.
+     *
+     * <p>Resolved from the live world with the same gates the commit re-checks, and cached for this own turn,
+     * so asking twice never re-scans. The answer may be a prefix that closes in without arriving - a legal step
+     * forward is better than standing still - and it never contains the opponent's own cell.</p>
+     */
+    default List<com.tactical.neoforge.battle.SlimeGround.Node> slimeApproach() { return List.of(); }
+
+    /** Quoted price of one native contact this own turn, or 0 for a body that cannot damage anything. */
+    default int slimeContactCost() { return 0; }
+
+    /**
+     * One native contact as this own turn's main action.
+     *
+     * <p>The server owns the one commit point: it re-proves the locked opponent, the real attack box, the real
+     * line of sight and the frozen price, drives vanilla's own {@code dealDamage}, and charges only when the
+     * very {@code hurt} call inside it reported a real hit. A refused, cancelled or tiny-body contact charges
+     * nothing.</p>
+     *
+     * @return true when the native call really hurt the target and the action was paid for
+     */
+    default boolean slimeContact() { return false; }
+
+    /**
      * The legacy text outlet: this mod keeps it as literal text, never as a translation key.
      *
      * <p>A third-party adapter that only knows how to write a finished sentence keeps working, and its

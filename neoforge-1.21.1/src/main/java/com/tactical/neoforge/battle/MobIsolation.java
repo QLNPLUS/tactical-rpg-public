@@ -61,14 +61,38 @@ final class MobIsolation {
 
     private static final class Entry {
         final Mob mob;
+        /** Why this unit is being held out; the two reasons are released by different questions. */
+        final Hold hold;
+        /** The faction a split child would join, so a retry never turns a friendly child into an enemy. */
+        final BattleSide side;
+        /** Placement retries: the existing bounded outside-placement policy, shared with cap refusals. */
         int retryAt;
         int attempts;
         boolean placed;
+        /** Taking-in retries for a split child, kept separate so neither budget can exhaust the other. */
+        int takeRetryAt;
+        int takeAttempts;
 
-        Entry(Mob mob, int retryAt) {
+        Entry(Mob mob, int retryAt, Hold hold, BattleSide side) {
             this.mob = mob;
             this.retryAt = retryAt;
+            this.hold = hold;
+            this.side = side;
         }
+    }
+
+    /**
+     * The two reasons a unit can be held out.
+     *
+     * <p>{@link #CAP_REFUSED} is the original rule and is released the instant the roster has room again.
+     * {@link #SPLIT_BORN} is the one this family needed: the roster may well have a free slot while the
+     * terrain has no legal place for that particular body, and the child must stay off the members until a
+     * legal admission really succeeds - releasing it on a free slot alone would let it walk straight back
+     * in and hit somebody this encounter had just refused to take.</p>
+     */
+    enum Hold {
+        CAP_REFUSED,
+        SPLIT_BORN
     }
 
     private final Map<UUID, Entry> entries = new LinkedHashMap<>();
@@ -79,6 +103,13 @@ final class MobIsolation {
         if (mob == null || mob.isRemoved()) return false;
         Entry entry = entries.get(mob.getUUID());
         return entry != null && entry.mob == mob && entry.mob.isAlive();
+    }
+
+    /** True only for a unit held out because a native split could not be taken; used by the contact rule. */
+    boolean holdsSplitChild(Mob mob) {
+        if (mob == null || mob.isRemoved()) return false;
+        Entry entry = entries.get(mob.getUUID());
+        return entry != null && entry.mob == mob && entry.mob.isAlive() && entry.hold == Hold.SPLIT_BORN;
     }
 
     /** Live suppressed count; used only for diagnostics and tests. */
@@ -102,16 +133,77 @@ final class MobIsolation {
         }
         // Release has to be immediate: a freed slot must restore ordinary recruitment, not wait
         // for a timer. Also release when there is nobody left to protect.
-        if (!IsolationPolicy.holdsWhileFull(battle.hostileCount(), battle.hostileCapacity())
-                || battle.memberPlayers().isEmpty()) {
-            if (!entries.isEmpty()) entries.clear();
+        if (battle.memberPlayers().isEmpty()) {
+            entries.clear();
             return;
         }
+        // A cap refusal lasts exactly as long as the fullness that created it. A split-born hold is not
+        // about fullness at all: it lasts until the encounter can legally take that body, and it is released
+        // by the retry below or by the end of the encounter - never by a free slot alone.
+        boolean full = IsolationPolicy.holdsWhileFull(battle.hostileCount(), battle.hostileCapacity());
+        entries.values().removeIf(entry -> entry.hold == Hold.CAP_REFUSED && !full);
         prune(battle);
         maintainRegistered(battle);
+        retrySplitChildren(battle);
+        if (!full) return;
         if (--scanCooldown > 0) return;
         scanCooldown = SCAN_TICKS;
         scan(battle);
+    }
+
+    /**
+     * Hand one split child to this encounter's exclusion.
+     *
+     * <p>Same rules as any other exclusion - identity-checked, unowned only, relationship cleared, placed by
+     * the existing legal-outside search with the same bounded retries - but it does not require the roster to
+     * be full, because a slot with no legal foot surface is exactly what a newborn wide body can hit. The
+     * child's own flags are never touched here.</p>
+     */
+    void holdSplitChild(ServerBattle battle, Mob mob, BattleSide side) {
+        if (battle == null || mob == null || battle.finished()) return;
+        if (!eligible(battle, mob)) return;
+        Entry existing = entries.get(mob.getUUID());
+        if (existing != null && existing.mob == mob) return;
+        Entry entry = new Entry(mob, battle.tickCount(), Hold.SPLIT_BORN, side);
+        entry.takeRetryAt = battle.tickCount();
+        entries.put(mob.getUUID(), entry);
+        int room = Math.max(0, battle.hostileCapacity() - battle.hostileCount());
+        isolate(battle, mob, battle.memberPlayers(), battle.tickCount());
+        // The two reasons are different problems and are named as such: a full roster, or room with no legal
+        // foot surface for that body. Neither is a deletion and neither is a silent pass.
+        Tactical.LOGGER.info("[Tactical] split child {} ({}) kept out of encounter {}: {} (room left={})",
+                mob.getUUID(), BattleDeployment.stanceOf(mob), battle.sessionId(),
+                room <= 0 ? "the roster is full" : "no legal foot surface for its body", room);
+    }
+
+    /**
+     * Retry one held split child: place it if that failed, then try to take it back in.
+     *
+     * <p>The two budgets are separate. A body that could not be placed outside still gets its five bounded
+     * placement attempts, and a body that was placed still gets five bounded attempts to be taken back in through
+     * the ordinary admission - one budget can never exhaust the other, and neither becomes an unbounded scan. When
+     * both are spent the child simply stays suppressed until the encounter ends.</p>
+     */
+    private void retrySplitChildren(ServerBattle battle) {
+        for (Entry entry : List.copyOf(entries.values())) {
+            if (entry.hold != Hold.SPLIT_BORN) continue;
+            Mob mob = entry.mob;
+            if (mob == null || mob.isRemoved() || !mob.isAlive() || mob.level() != battle.level()) continue;
+            int now = battle.tickCount();
+            if (!entry.placed && IsolationPolicy.retryDue(entry.attempts, entry.retryAt, now, MAX_ATTEMPTS)) {
+                // Placement is best effort: a body with no exit anywhere stays suppressed where it is, and that
+                // must not stop the encounter from trying to take it back in later.
+                isolate(battle, mob, battle.memberPlayers(), now);
+            }
+            if (!battle.splits().takeDue(entry.takeAttempts, entry.takeRetryAt, now)) continue;
+            if (battle.retrySplitChild(mob, entry.side)) {
+                // Admitted: the roster owns it now, so the exclusion has nothing left to do.
+                entries.remove(mob.getUUID());
+                continue;
+            }
+            entry.takeAttempts++;
+            entry.takeRetryAt = now + battle.splits().takeRetryDelay();
+        }
     }
 
     /**
@@ -217,14 +309,18 @@ final class MobIsolation {
     private void isolate(ServerBattle battle, Mob mob, List<ServerPlayer> members, int now) {
         Entry entry = entries.get(mob.getUUID());
         if (entry == null || entry.mob != mob) {
-            entry = new Entry(mob, now);
+            entry = new Entry(mob, now, Hold.CAP_REFUSED, null);
             entries.put(mob.getUUID(), entry);
         }
         // Clear the relationship first, so even a failed placement is already unreachable.
         clearRelationship(mob, members);
         Optional<Vec3> destination = BattleDeployment.findOutsideStandable(
                 battle.level(), mob, battle.zone().center(), battle.zone().radius(),
-                box -> insideAnyZone(battle, box));
+                // A family body's candidate is proved loaded before anything is read there: the same
+                // "whole body, every touched column, loaded first" rule its own deployment gate uses, added
+                // narrowly by exact type and leaving every other mob's rule exactly as it was.
+                box -> insideAnyZone(battle, box)
+                        || (SlimeGround.supports(mob) && !BodyGeometry.loaded(battle.level(), box)));
         if (destination.isEmpty()) {
             entry.retryAt = now + RETRY_TICKS;
             entry.attempts++;

@@ -602,6 +602,69 @@ public final class MultiBattleSelfTest {
                 "the other encounter is untouched by the post-admission rollback");
         lateFault.discard();
 
+        enter("two-encounter-body-growth-conflict");
+        // R3: a reinforcement of this family whose whole body would need a battlefield that reaches into the
+        // other encounter is refused, before anything about either encounter changes. The feet cell alone would
+        // not have reached far enough, which is exactly what the whole-body growth rule is there to catch.
+        BlockPos gap = new BlockPos(origin.x() + 47, origin.y(), origin.z());
+        buildPlatform(level, gap, 3);
+        net.minecraft.world.entity.monster.Slime bridge = EntityType.SLIME.create(level);
+        check(bridge != null, "the body-growth candidate is created");
+        bridge.setSize(4, true);
+        bridge.setPos(gap.getX() + 0.5D, gap.getY(), gap.getZ() + 0.5D);
+        level.addFreshEntity(bridge);
+        GridPos bridgeCell = new GridPos(gap.getX(), gap.getY(), gap.getZ());
+        check(!first.zone().contains(bridgeCell),
+                "the candidate really starts outside the growing encounter's battlefield: " + bridgeCell);
+        com.tactical.core.zone.BattleZone feetOnly = first.zone().including(bridgeCell);
+        com.tactical.core.zone.BattleZone folded = feetOnly;
+        net.minecraft.world.phys.AABB bridgeBox = com.tactical.neoforge.battle.BodyGeometry.bodyAt(
+                bridge, bridge.position());
+        for (int bx = com.tactical.neoforge.battle.BodyGeometry.floor(bridgeBox.minX);
+                bx <= com.tactical.neoforge.battle.BodyGeometry.floor(bridgeBox.maxX); bx++) {
+            for (int by = com.tactical.neoforge.battle.BodyGeometry.floor(bridgeBox.minY);
+                    by <= com.tactical.neoforge.battle.BodyGeometry.floor(bridgeBox.maxY); by++) {
+                for (int bz = com.tactical.neoforge.battle.BodyGeometry.floor(bridgeBox.minZ);
+                        bz <= com.tactical.neoforge.battle.BodyGeometry.floor(bridgeBox.maxZ); bz++) {
+                    folded = folded.including(new GridPos(bx, by, bz));
+                }
+            }
+        }
+        check(!com.tactical.core.zone.ZoneSeparation.overlap(second.zone().bounds(), feetOnly.bounds()),
+                "the growth a feet cell alone would ask for does not reach the other encounter: "
+                        + feetOnly.bounds() + " vs " + second.zone().bounds());
+        check(com.tactical.core.zone.ZoneSeparation.overlap(second.zone().bounds(), folded.bounds()),
+                "while the growth this 2.08 body really needs does: " + folded.bounds() + " vs "
+                        + second.zone().bounds());
+        check(BattleDeployment.isStandable(level, bridge, bridge.position()),
+                "and that very position is a real stand, so the refusal is not \"nowhere to put it\"");
+        check(com.tactical.neoforge.battle.BodyGeometry.loaded(level, bridgeBox),
+                "and its whole body is in loaded columns, so the refusal is not an unloaded candidate");
+        int firstEnemies = first.enemyCount();
+        int firstQueue = first.turnQueueSize();
+        int firstRadius = first.zone().radius();
+        int firstPool = first.currentAp(owner);
+        boolean bridgeNoAi = bridge.isNoAi();
+        boolean bridgePersistent = bridge.isPersistenceRequired();
+        Vec3 bridgeHome = bridge.position();
+        check(!first.tryAbsorb(bridge),
+                "a reinforcement whose whole-body battlefield would reach the other encounter is refused");
+        check(first.enemyCount() == firstEnemies && first.turnQueueSize() == firstQueue,
+                "and it adds no roster or queue entry to the growing encounter");
+        check(first.zone().radius() == firstRadius, "and that battlefield is not grown at all");
+        check(first.currentAp(owner) == firstPool, "and its member spends nothing");
+        check(bridge.isNoAi() == bridgeNoAi && bridge.isPersistenceRequired() == bridgePersistent,
+                "and the refused candidate keeps its own flags");
+        check(bridge.position().distanceToSqr(bridgeHome) < 1.0E-9D, "and it is not moved");
+        check(BattleManager.findFor(bridge.getUUID()) == null, "and it claims nothing");
+        check(second.enemyCount() == secondEnemiesDuringFault
+                        && BattleManager.findFor(distant.getUUID()) == second,
+                "and the other encounter's roster and routing are untouched");
+        Tactical.LOGGER.info("[Tactical] MULTI body-growth cross-encounter refusal proved: feetOnly={} "
+                + "folded={} other={} bridge={}", feetOnly.bounds(), folded.bounds(), second.zone().bounds(),
+                bridge.position());
+        bridge.discard();
+
         enter("two-encounter-join-fault-rollback");
         // A failure after the member was added and moved must give back the member, the queue entry,
         // the reach, the ownership claim, the consumed invitation and the player's position, while

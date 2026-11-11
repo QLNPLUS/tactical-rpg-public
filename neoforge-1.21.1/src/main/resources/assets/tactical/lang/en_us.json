@@ -180,6 +180,7 @@
   "tactical.end.path_blocked": "the move path was blocked",
   "tactical.end.empty_queue": "the turn queue is empty",
   "tactical.end.enemies_defeated": "all enemies were defeated",
+  "tactical.end.split_unresolved": "a split could not be confirmed",
   "tactical.end.reset": "reset",
   "tactical.chat.not_in_battle": "You are not in a battle",
   "tactical.chat.already_in_battle": "You are already in a battle",

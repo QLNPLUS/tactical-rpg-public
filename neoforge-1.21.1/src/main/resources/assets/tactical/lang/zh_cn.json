@@ -180,6 +180,7 @@
   "tactical.end.path_blocked": "移动路径被动态障碍阻挡",
   "tactical.end.empty_queue": "回合队列已空",
   "tactical.end.enemies_defeated": "敌人已被全部击败",
+  "tactical.end.split_unresolved": "一次分裂未能确认",
   "tactical.end.reset": "重置",
   "tactical.chat.not_in_battle": "你不在战斗中",
   "tactical.chat.already_in_battle": "你已在战斗中",

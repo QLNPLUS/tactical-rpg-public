@@ -11,7 +11,8 @@ import java.util.Objects;
 /** An intent, not a callback: roster mutation and skill cost/effects resolve on the server. */
 public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
                        ResourceLocation skill, SkillTarget skillTarget, WitchBrew brew,
-                       DoorRoutePlanner.Door door, List<SpiderSurface.Node> surface) {
+                       DoorRoutePlanner.Door door, List<SpiderSurface.Node> surface,
+                       List<com.tactical.neoforge.battle.SlimeGround.Node> hop) {
     public enum Kind {
         MOVE, DIVE, MELEE, RANGED, SKILL, PREPARE_EXPLOSION, DETONATE, END_TURN,
         /** Drink one self-brew; ends the own turn and starts the shared drink cooldown. */
@@ -64,32 +65,53 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
          * name a landing the live world has already refused. The server re-resolves the same cached proposal,
          * re-proves every frame of the arc and charges only when the body really left the ground.</p>
          */
-        SPIDER_LEAP
+        SPIDER_LEAP,
+        /**
+         * One hop route for the slime family: real ground nodes, one horizontal cell per edge.
+         *
+         * <p>Deliberately its own kind and never a {@code MOVE} with a plain path: a hop is an arc, and a body
+         * that is 2.08 blocks wide and tall is not a point walking between cells. The nodes carry the feet the
+         * body really holds, the server re-proves every edge and every frame against the live world, and the
+         * price is the ordinary per-edge move price - the animation costs nothing extra.</p>
+         */
+        SLIME_HOP,
+        /**
+         * The one native contact this family really has: {@code dealDamage}, not a melee swing.
+         *
+         * <p>Deliberately its own kind: routing it through {@code MELEE} would price and validate it as a
+         * generic swing, let a size-1 slime hit at one point of damage, and lose the native attack box that
+         * really reaches across two cells for a large body.</p>
+         */
+        SLIME_CONTACT
     }
 
     /** Preserve existing adapters' constructors. */
-    public AiAction(Kind kind, List<GridPos> path) { this(kind, path, -1, null, null, null, null, null); }
-    public AiAction(Kind kind, List<GridPos> path, int attackIndex) { this(kind, path, attackIndex, null, null, null, null, null); }
+    public AiAction(Kind kind, List<GridPos> path) { this(kind, path, -1, null, null, null, null, null, null); }
+    public AiAction(Kind kind, List<GridPos> path, int attackIndex) { this(kind, path, attackIndex, null, null, null, null, null, null); }
     public AiAction(Kind kind, List<GridPos> path, int attackIndex, ResourceLocation skill, SkillTarget skillTarget) {
-        this(kind, path, attackIndex, skill, skillTarget, null, null, null);
+        this(kind, path, attackIndex, skill, skillTarget, null, null, null, null);
     }
     public AiAction(Kind kind, List<GridPos> path, int attackIndex, ResourceLocation skill, SkillTarget skillTarget,
                     WitchBrew brew) {
-        this(kind, path, attackIndex, skill, skillTarget, brew, null, null);
+        this(kind, path, attackIndex, skill, skillTarget, brew, null, null, null);
     }
     public AiAction(Kind kind, List<GridPos> path, int attackIndex, ResourceLocation skill, SkillTarget skillTarget,
                     WitchBrew brew, DoorRoutePlanner.Door door) {
-        this(kind, path, attackIndex, skill, skillTarget, brew, door, null);
+        this(kind, path, attackIndex, skill, skillTarget, brew, door, null, null);
     }
 
     public AiAction {
         Objects.requireNonNull(kind, "kind");
         path = List.copyOf(path);
         surface = surface == null ? List.of() : List.copyOf(surface);
+        hop = hop == null ? List.of() : List.copyOf(hop);
         boolean moving = kind == Kind.MOVE || kind == Kind.DIVE;
         if (moving == path.isEmpty()) throw new IllegalArgumentException("Only MOVE/DIVE have a non-empty path");
         if (kind == Kind.SURFACE_MOVE ? surface.isEmpty() || !path.isEmpty() : !surface.isEmpty()) {
             throw new IllegalArgumentException("Only SURFACE_MOVE carries a non-empty surface route, and it has no plain path");
+        }
+        if (kind == Kind.SLIME_HOP ? hop.isEmpty() || !path.isEmpty() : !hop.isEmpty()) {
+            throw new IllegalArgumentException("Only SLIME_HOP carries a non-empty hop route, and it has no plain path");
         }
         if (kind == Kind.DIVE ? attackIndex < 0 || attackIndex >= path.size() - 1 : attackIndex != -1) {
             throw new IllegalArgumentException("DIVE requires a zero-based attack index followed by a return path");
@@ -144,7 +166,7 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
     public static AiAction endTurn() { return of(Kind.END_TURN); }
     /** One surface route (a spider's floor/wall nodes); the server owns every gate and every edge price. */
     public static AiAction surfaceMove(List<SpiderSurface.Node> route) {
-        return new AiAction(Kind.SURFACE_MOVE, List.of(), -1, null, null, null, null, route);
+        return new AiAction(Kind.SURFACE_MOVE, List.of(), -1, null, null, null, null, route, null);
     }
     /** One salvo at the opponent this own turn locked; the server owns charge, count and price. */
     public static AiAction fireballVolley() { return of(Kind.FIREBALL_VOLLEY); }
@@ -154,4 +176,10 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
     public static AiAction teleport() { return of(Kind.TELEPORT); }
     /** One short leap; the server owns the proposal, the arc, the price and every safety gate. */
     public static AiAction spiderLeap() { return of(Kind.SPIDER_LEAP); }
+    /** One hop route for this family; the server owns the edges, the arcs, the price and every safety gate. */
+    public static AiAction slimeHop(List<com.tactical.neoforge.battle.SlimeGround.Node> route) {
+        return new AiAction(Kind.SLIME_HOP, List.of(), -1, null, null, null, null, null, route);
+    }
+    /** One native contact at the opponent this turn locked; the server owns every gate and the real hurt result. */
+    public static AiAction slimeContact() { return of(Kind.SLIME_CONTACT); }
 }

@@ -123,6 +123,7 @@ public final class BattleAiSession {
         switch (action.kind()) {
             case MOVE, DIVE -> throw new IllegalArgumentException("Battle owner must animate MOVE/DIVE; never resolve DIVE as an instant attack");
             case SPIDER_LEAP -> throw new IllegalArgumentException("Battle owner must animate SPIDER_LEAP; never resolve a leap as an instant attack");
+            case SLIME_HOP -> throw new IllegalArgumentException("Battle owner must animate SLIME_HOP; a hop is ordinary movement, never an instant attack");
             case MELEE -> context.attackPlayer();
             case RANGED -> context.rangedAttackPlayer();
             case DRINK_POTION -> {
@@ -145,6 +146,13 @@ public final class BattleAiSession {
                 if (context.throwTrident()) {
                     participant.adapter.onActionResolved(action.kind());
                 }
+                return AiResolution.END_TURN;
+            }
+            case SLIME_CONTACT -> {
+                // One commit point: the server re-proves the locked opponent, the native attack box at those
+                // real feet, the real line of sight and the frozen price, drives vanilla's own dealDamage and
+                // charges only when the hurt call inside it really landed. A tiny slime has no contact at all.
+                if (context.slimeContact()) participant.adapter.onActionResolved(action.kind());
                 return AiResolution.END_TURN;
             }
             case FIREBALL_VOLLEY -> {
@@ -289,6 +297,27 @@ public final class BattleAiSession {
                         + "route the live world no longer holds", context.actor().getUUID());
                 return AiAction.endTurn();
             }
+        }
+        if (action.kind() == AiAction.Kind.SLIME_HOP) {
+            // Only an actor with the family's own ground policy may hop this way, the route has to hold in the
+            // live world edge by edge, and it may not cost more edges than the actor can still pay for while
+            // keeping one native contact affordable. A refused route charges nothing and is never walked.
+            int budget = context.slimeEdgeBudget();
+            if (!context.slimeContext() || context.slimeHere() == null || budget <= 0
+                    || action.hop().size() > budget || !context.slimeRouteHolds(action.hop())) {
+                Tactical.LOGGER.debug("[Tactical] AI hop route rejected for {}: no ground node, no budget or a "
+                        + "route the live world no longer holds", context.actor().getUUID());
+                return AiAction.endTurn();
+            }
+        }
+        if (action.kind() == AiAction.Kind.SLIME_CONTACT
+                && (!context.slimeContext() || context.slimeContactCost() <= 0
+                || context.ap() < context.slimeContactCost()
+                || context.slimeHere() == null
+                || !context.slimeContactReaches(context.slimeHere()))) {
+            // No price, no affordable price, no proven node or no real native reach: refused before anything is
+            // charged and before any native call is made.
+            return AiAction.endTurn();
         }
         if (action.kind() == AiAction.Kind.SPIDER_LEAP
                 && (context.leapCost() <= 0 || context.ap() < context.leapCost() || !context.canLeap())) {
