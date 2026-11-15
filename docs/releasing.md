@@ -88,7 +88,7 @@ python tools/release_pipeline.py package
 
 ## 发布说明、描述、美术与许可
 
-- **两家服务的发布说明只取当前版本章节**：`tools/release_pipeline.py` 的同一 `release_changelog` 提供 CurseForge metadata 和 GitHub 临时 notes；可用 `python tools/release_pipeline.py release-notes --version <版本> --output <路径>` 预览，不上传整本历史。当前版本为 **0.32.0**（NeoForge 1.21.1）：A/B 已签收，C 阶段的标准完整构建（926 项单测、51 项发布脚本、打包门）、六套冻结定向专服与真实客户端 G1–G4 已完成，8 张选定主图已由主控亲看；本轮完成情况以本版本 CHANGELOG 与交付记录中的实际读数为准，不预填通过，也不等于成品 JAR 独立运行或测试机运行验收。本轮没有 CF/GitHub 上传授权，0.31 的渠道授权不延用；实际接收、文件 ID、审核/公开状态分别以服务回执为准，不以本段冒充发布成功。当前章节须全文英文且小于 8000 字符，缺章直接失败；历史章节不随本次上传。
+- **两家服务的发布说明只取当前版本章节**：`tools/release_pipeline.py` 的同一 `release_changelog` 提供 CurseForge metadata 和 GitHub 临时 notes；可用 `python tools/release_pipeline.py release-notes --version <版本> --output <路径>` 预览，不上传整本历史。当前版本为 **0.32.0**（NeoForge 1.21.1）：A/B 已签收，C 阶段的标准完整构建（926 项单测、51 项发布脚本、打包门）、六套冻结定向专服与真实客户端 G1–G4 已完成，8 张选定主图已由主控亲看；本轮完成情况以本版本 CHANGELOG 与交付记录中的实际读数为准，不预填通过，也不等于成品 JAR 独立运行或测试机运行验收。2026-11-15 已另获本轮明确发布授权，按既有 Beta 流程将同一份校验包发布到 CurseForge 与 GitHub 预发布，不沿用 0.31 的授权；实际接收、文件 ID、审核/公开状态分别以服务回执为准，不以本段冒充发布成功。当前章节须全文英文且小于 8000 字符，缺章直接失败；历史章节不随本次上传。
 - 临时 notes 文件只放在 runner 临时目录，**不进** `build/release` 这个只含二进制的制品包。
 - 英文 CF 正文：[curseforge.md](curseforge.md)，上传到 CF 项目描述栏；工作流只上传文件，不改写 CF 项目描述或项目头像。GitHub Release 也不会用该文件作 notes。
 - 模组 logo 位于 `neoforge-1.21.1/src/main/resources/logo.png`，`neoforge.mods.toml` 的 `logoFile` 指向 `logo.png`；发布包检查要求该 PNG 实际存在。
