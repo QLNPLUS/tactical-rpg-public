@@ -52,6 +52,14 @@ public final class BattleRules {
     public static final int SPIDER_LEAP_COST = 10;
     /** The fixed animation length of one short leap, in server ticks. */
     public static final int SPIDER_LEAP_TICKS = 12;
+    /**
+     * Base price of one guardian beam: this ruleset's value, not a vanilla fact.
+     *
+     * <p>The swim budget reserves the quoted price of this main action. The beam freezes that quote with the
+     * shared successful-action surcharge and charges it exactly once when a native hit succeeds; two refused
+     * native parts leave both the AP pool and the paid-action count untouched.</p>
+     */
+    public static final int GUARDIAN_BEAM_COST = 20;
     public static final int FLEE_COST = 50;
 
     public static final int FLEE_IMMUNITY_TICKS = 200;

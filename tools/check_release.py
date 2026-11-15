@@ -60,7 +60,8 @@ with ZipFile(jar) as archive:
     for path in required:
         assert path in names, f'missing {path}'
     configs = ('tactical.camera.mixins.json', 'tactical.effects.mixins.json', 'tactical.creeper.mixins.json',
-               'tactical.dungeons_input.mixins.json', 'tactical.server.mixins.json')
+               'tactical.dungeons_input.mixins.json', 'tactical.server.mixins.json',
+               'tactical.guardian.mixins.json')
     pack = json.loads(archive.read('pack.mcmeta'))
     assert pack['pack']['pack_format'] == 34
     # The bundled UI framework and its page sources are gone: no page, no font, no engine asset.

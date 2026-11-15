@@ -121,6 +121,11 @@ public final class ServerBattle {
     public static final int PARTICIPANT_CAP = BattleRules.PARTICIPANT_CAP;
 
     private static final int PLAYER_STEP_TICKS = 3;
+    /**
+     * Vanilla's own near gate for the ordinary guardian, in blocks: {@code GuardianAttackGoal} keeps firing only
+     * while the target is strictly further than three blocks away, which is the squared distance 9.
+     */
+    private static final double MIN_FIRE_DISTANCE = Math.sqrt(GuardianMovement.NATIVE_NEAR_GATE_SQR);
     private static final int ENEMY_STEP_TICKS = 3;
     private static final int AI_TURN_DELAY = 6;
     /** The shared no-shield guard price, in AP. One constant for every defending actor. */
@@ -166,6 +171,34 @@ public final class ServerBattle {
      * gone, deadline, encounter end) clears it here.</p>
      */
     private BlazeVolley blazeVolley;
+    /**
+     * The one guardian beam this encounter is currently driving, or null.
+     *
+     * <p>Only the actor whose own turn is running can own it, so a single field is the whole state: the frozen price,
+     * the native charge length and the hard deadline live in {@link GuardianBeam}, the real charge itself lives in
+     * that body's own {@code GuardianAttackGoal}, and every exit path (actor or target gone, water or sight lost,
+     * deadline, encounter end, release, death scan) clears it here.</p>
+     */
+    private GuardianBeam guardianBeam;
+    /** Fixture-only diagnostic: how many beams really reached a settlement, so a double hand-back is visible. */
+    private int guardianBeamSettlements;
+    /**
+     * The exact body, goal object and opponent this running beam was launched for.
+     *
+     * <p>Held as objects, not as ids: every driven tick has to prove the same three things are still true, and a
+     * look-alike goal, a replaced one or a retargeted body must stop the beam instead of being driven further.</p>
+     */
+    private BeamBinding beamBinding;
+
+    private record BeamBinding(net.minecraft.world.entity.monster.Guardian actor,
+                                net.minecraft.world.entity.ai.goal.Goal goal,
+                                LivingEntity target) { }
+    /** Fixture-only diagnostic: how often a native beam stop really threw after its charge was committed. */
+    private int guardianBeamStopFailures;
+
+    /** Fixture-only diagnostics: how often the spike decision was asked, and how often it let the reaction run. */
+    private int thornsAsked;
+    private int thornsAllowed;
 
     private final TurnScheduler queue = new TurnScheduler();
     // Includes both hostile and friendly mobs; side-sensitive rules must use hostileCount().
@@ -239,6 +272,14 @@ public final class ServerBattle {
      * </p>
      */
     private final java.util.Map<UUID, Vec3> slimeFallFeet = new java.util.LinkedHashMap<>();
+    /**
+     * The real feet of a guardian this encounter had to let go of.
+     *
+     * <p>Kept separately from the slime slot on purpose: the two descents share the deadline, the damage and the
+     * release, but a guardian is not a slime and its own bridge never snaps a fractional body onto a cell centre.
+     * </p>
+     */
+    private final java.util.Map<UUID, Vec3> guardianFallFeet = new java.util.LinkedHashMap<>();
 
     private List<GridPos> enemyPath = List.of();
     private int enemyPathIndex;
@@ -344,7 +385,7 @@ public final class ServerBattle {
             var safe=deploymentPosition(mob,
                     pos->occupied(new GridPos(pos.getX(),pos.getY(),pos.getZ())),
                     pos->zone.contains(new GridPos(pos.getX(),pos.getY(),pos.getZ())),
-                    feet->slimeCandidateFits(mob, feet, zone::contains));
+                    feet->familyCandidateFits(mob, feet, zone::contains));
             if(safe.isEmpty()) continue;
             Vec3 position=safe.get();
             GridPos cell=new GridPos(net.minecraft.util.Mth.floor(position.x),net.minecraft.util.Mth.floor(position.y),net.minecraft.util.Mth.floor(position.z));
@@ -507,9 +548,20 @@ public final class ServerBattle {
         // and it is established here - on the encounter's own tick - instead of being pinned down by the pose
         // seam on the next entity tick.
         maintainSlimeHold();
+        // The same question for the water family: a held guardian whose water is gone is not held any more, and
+        // nothing else would ever move it because its native travel is switched off.
+        maintainGuardianHold();
         // The blaze salvo owns the turn while it runs: charge first, then its three shots, then hand back.
         tickBlazeVolley();
         if (finished) return;
+        // A guardian's own beam owns the turn the same way: one real native goal tick, then either it settled and
+        // handed the turn back or it is still charging and nothing else may be planned this tick.
+        tickGuardianBeam();
+        if (finished) return;
+        if (guardianBeamBusy()) {
+            if (projectileChanged || attributesChanged || healthChanged || weaponChanged) sendState();
+            return;
+        }
         ai.tick();
         // Vanilla gravity still runs with NoAI. Only airborne-policy actors are pinned,
         // and never while their authoritative own-turn trajectory is advancing.
@@ -633,6 +685,9 @@ public final class ServerBattle {
         BlazeVolley endingVolley = blazeVolley;
         blazeVolley = null;
         if (endingVolley != null) setBlazeCharged(enemies.get(endingVolley.actorId()), false);
+        // No native beam may outlive the encounter either: the goal is stopped and its synched attack target cleared
+        // while the roster entry is still here.
+        dropGuardianBeamOnExit();
         BlazeFireballs.clearBattle(this);
         // No marked trident and no SPEAR pose may outlive the encounter that owns them.
         DrownedTridents.clearBattle(this);
@@ -650,6 +705,7 @@ public final class ServerBattle {
         // each member is cancelled by releaseMemberVisuals below, on the same exit snapshot.
         terrainFall.clear();
         spiderFallFeet.clear();
+        guardianFallFeet.clear();
         pendingTurnAdvance = false;
         // Dead/disconnected players still own a connection and must receive the exit snapshot.
         for (PlayerMember member : List.copyOf(members.values())) {
@@ -679,6 +735,7 @@ public final class ServerBattle {
             releaseEndermanState(state);
             releaseSpiderState(state);
             releaseSlimeState(state);
+            releaseGuardianState(state);
         }
         enemies.clear();
         for (Mob bystander : bystanders) {
@@ -1317,7 +1374,7 @@ public final class ServerBattle {
         var safe = deploymentPosition(mob,
                 pos -> occupied(new GridPos(pos.getX(), pos.getY(), pos.getZ())),
                 pos -> zone.contains(new GridPos(pos.getX(), pos.getY(), pos.getZ())),
-                feet -> slimeCandidateFits(mob, feet, zone::contains));
+                feet -> familyCandidateFits(mob, feet, zone::contains));
         if (safe.isEmpty()) return false;
         Vec3 position = safe.get();
         GridPos cell = new GridPos(net.minecraft.util.Mth.floor(position.x), net.minecraft.util.Mth.floor(position.y), net.minecraft.util.Mth.floor(position.z));
@@ -1367,6 +1424,11 @@ public final class ServerBattle {
         Vec3 originalPosition = mob.position();
         LivingEntity originalTarget = mob.getTarget();
         float originalFallDistance = mob.fallDistance;
+        // This family borrows three native facts and has to be able to give each of them back exactly: the swimming
+        // bit, the raw synched attack-target id and the goal's own charge counter. Taking the snapshot here, before
+        // any mutation, is what makes a rolled-back admission the same creature it was.
+        GuardianNativePose.Snapshot originalGuardianPose = mob instanceof net.minecraft.world.entity.monster.Guardian g
+                ? GuardianNativePose.snapshot(g) : null;
         // Declared outside the transaction so a failed admission can still give the blaze its own charge back.
         boolean originalBlazeCharged = false;
         TacticalWitchAccess.WitchDrink witchDrink = null;
@@ -1401,6 +1463,7 @@ public final class ServerBattle {
             EnemyState state = new EnemyState(mob, cell, initialAp(maxAp), maxAp, moveCost, initiative, side,
                     originalNoAi, originalPersistenceRequired, originalPosition, originalTarget, originalFallDistance,
                     originalBlazeCharged);
+            state.originalGuardianPose = originalGuardianPose;
             state.witchDrink = witchDrink;
             state.pendingDrink = pendingDrink;
             // One cooldown object per unit, so two witches can never advance each other's drink.
@@ -1416,6 +1479,9 @@ public final class ServerBattle {
             // The same single commit point for this family: the node the body was really admitted on, plus the
             // pose seam its own tick answers. From here until release, this encounter owns that body.
             installSlimeState(state);
+            // The same single commit point for the water family: the real water position the body was admitted on,
+            // plus the motion seam its own tick answers.
+            installGuardianState(state);
             if (DeveloperTrace.enabled()) {
                 // Development trace: which exact unit joined which encounter. Needed because a client
                 // mirror cannot tell two same-typed mobs apart.
@@ -1431,8 +1497,15 @@ public final class ServerBattle {
             if (partial != null) restoreAdmission(partial);
             else {
                 ai.remove(mob);
-                restoreUnit(mob, originalNoAi, originalPersistenceRequired, originalPosition, originalTarget,
-                        originalFallDistance, originalBlazeCharged);
+                try {
+                    restoreUnit(mob, originalNoAi, originalPersistenceRequired, originalPosition, originalTarget,
+                            originalFallDistance, originalBlazeCharged);
+                } finally {
+                    // The native pose comes back even if a target listener threw during the restore above.
+                    if (originalGuardianPose != null && mob instanceof net.minecraft.world.entity.monster.Guardian g) {
+                        GuardianNativePose.restore(g, originalGuardianPose);
+                    }
+                }
                 if (witchDrink != null && mob instanceof Witch witch) {
                     witchAccess(witch).tactical$restoreDrink(witchDrink);
                 }
@@ -1494,9 +1567,19 @@ public final class ServerBattle {
         releaseEndermanState(state);
         releaseSpiderState(state);
         releaseSlimeState(state);
-        restoreUnit(state.mob, state.originalNoAi, state.originalPersistenceRequired,
-                state.originalPosition, state.originalTarget, state.originalFallDistance,
-                state.originalBlazeCharged);
+        releaseGuardianState(state);
+        try {
+            restoreUnit(state.mob, state.originalNoAi, state.originalPersistenceRequired,
+                    state.originalPosition, state.originalTarget, state.originalFallDistance,
+                    state.originalBlazeCharged);
+        } finally {
+            // Exactly the saved values: a moving bit that was true stays true, and the raw attack-target id is written
+            // from the accessor instead of being guessed from the mob's target.
+            if (state.originalGuardianPose != null
+                    && state.mob instanceof net.minecraft.world.entity.monster.Guardian guardian) {
+                GuardianNativePose.restore(guardian, state.originalGuardianPose);
+            }
+        }
         // A rolled-back admission never charged for the drink it froze, so the unit gets it back untouched.
         if (state.witchDrink != null && state.mob instanceof Witch witch) {
             witchAccess(witch).tactical$restoreDrink(state.witchDrink);
@@ -1620,7 +1703,7 @@ public final class ServerBattle {
 
     public boolean isBusy() {
         return anyPlayerMoving() || enemyMoving || rangedBusy() || witchDrinking() || terrainFall.busy()
-                || splits.pending();
+                || splits.pending() || guardianBeamBusy();
     }
 
     /**
@@ -1912,11 +1995,11 @@ public final class ServerBattle {
         var safe = growZone
                 ? deploymentPosition(mob,
                         pos->occupied(new GridPos(pos.getX(),pos.getY(),pos.getZ())),pos->true,
-                        feet->slimeCandidateFits(mob, feet, grownZone(mob, feet)))
+                        feet->familyCandidateFits(mob, feet, grownZone(mob, feet)))
                 : deploymentPosition(mob,
                         pos->occupied(new GridPos(pos.getX(),pos.getY(),pos.getZ())),
                         pos->zone.contains(new GridPos(pos.getX(),pos.getY(),pos.getZ())),
-                        feet->slimeCandidateFits(mob, feet, zone::contains));
+                        feet->familyCandidateFits(mob, feet, zone::contains));
         if(safe.isEmpty()) return false;
         Vec3 position=safe.get();
         GridPos cell=new GridPos(net.minecraft.util.Mth.floor(position.x),net.minecraft.util.Mth.floor(position.y),net.minecraft.util.Mth.floor(position.z));
@@ -1924,9 +2007,12 @@ public final class ServerBattle {
         // cell - and it must never swallow another live encounter's space. The whole check runs on the would-be
         // zone, before anything changes.
         BattleZone expanded = !growZone ? zone
-                : SlimeGround.supports(mob) ? grownToBody(mob, position, zone.including(cell))
-                : zone.including(cell);
-        if (!slimeCandidateFits(mob, position, expanded::contains)) return false;
+                : SlimeGround.supports(mob) || GuardianMovement.supports(mob)
+                        ? grownToBody(mob, position, zone.including(cell))
+                        : zone.including(cell);
+        // The feet cell is never proof that a wide body is inside the battlefield it was granted; the whole body
+        // is asked against the battlefield that would be committed.
+        if (!familyCandidateFits(mob, position, expanded::contains)) return false;
         if (BattleManager.zoneConflicts(this, expanded)) return false;
 
         // Admission is the only step that can still refuse (a unit already owned elsewhere, or a
@@ -3115,14 +3201,54 @@ public final class ServerBattle {
     private java.util.Optional<Vec3> deploymentPosition(Mob mob,java.util.function.Predicate<BlockPos> occupied,
                                                         java.util.function.Predicate<BlockPos> allowed,
                                                         java.util.function.Predicate<Vec3> ready) {
-        boolean family = SlimeGround.supports(mob);
+        boolean family = SlimeGround.supports(mob) || GuardianMovement.supports(mob);
         java.util.function.Predicate<Vec3> gate = family
-                ? (ready != null ? ready : feet -> slimeCandidateFits(mob, feet, zone::contains))
+                ? (ready != null ? ready : feet -> familyCandidateFits(mob, feet, zone::contains))
                 : ready;
-        // A drowned is the one unit that may be placed in water; every other actor keeps the ground/aerial rule.
+        // A drowned is the one unit that may be placed in water or on a shore; the guardian family is water only,
+        // and every other actor keeps the ground/aerial rule.
         if (AmphibiousMovement.supports(mob)) return AmphibiousMovement.findNearestHold(level, mob, occupied, allowed);
+        if (GuardianMovement.supports(mob)) {
+            return GuardianMovement.findNearestHold(level, mob, occupied,
+                    grid -> allowed.test(new BlockPos(grid.x(), grid.y(), grid.z())), gate);
+        }
         if (AerialMovement.supports(mob)) return AerialMovement.findNearestClearAir(level, mob, occupied, allowed);
         return BattleDeployment.findNearestStandable(level, mob, occupied, allowed, gate);
+    }
+
+    /**
+     * The one narrow gate the two wide-body families share: does the whole real body fit there, in a world already
+     * read?
+     *
+     * <p>Dispatched here instead of being duplicated at each call site, so a body whose footprint is not one cell
+     * is always judged as a body. Every other type keeps its own rule and answers true.</p>
+     */
+    private boolean familyCandidateFits(LivingEntity mob, Vec3 feet, java.util.function.Predicate<GridPos> wouldBeZone) {
+        if (mob == null) return false;
+        if (SlimeGround.supports(mob)) return slimeCandidateFits(mob, feet, wouldBeZone);
+        if (GuardianMovement.supports(mob)) return guardianCandidateFits(mob, feet, wouldBeZone);
+        return true;
+    }
+
+    /**
+     * The water family's half of that gate.
+     *
+     * <p>Three facts, asked before any block is read: every column the real body and its real eye would occupy is
+     * already loaded (nothing is force-loaded to make a candidate work), the whole body - not its feet cell - is
+     * inside the battlefield that would be committed, and the candidate really is a legal water position. A
+     * guardian is never deployed onto land, so a candidate with no water is refused here rather than admitted and
+     * found not to fit.</p>
+     */
+    private boolean guardianCandidateFits(LivingEntity mob, Vec3 feet,
+                                          java.util.function.Predicate<GridPos> wouldBeZone) {
+        if (mob == null) return false;
+        if (!GuardianMovement.supports(mob)) return true;
+        if (feet == null) return false;
+        if (!GuardianMovement.bodyLoaded(level, mob, feet)) return false;
+        AABB box = BodyGeometry.bodyAt(mob, feet);
+        if (box == null) return false;
+        if (!BodyGeometry.boxInsideZone(box, wouldBeZone)) return false;
+        return GuardianMovement.legal(level, mob, new GuardianMovement.Node(GuardianMovement.cellOf(feet), feet));
     }
 
     /**
@@ -3174,6 +3300,12 @@ public final class ServerBattle {
         if (enemy == null) {
             enemyMoving = false;
             advanceTurn();
+            return;
+        }
+        // A water edge in flight owns the turn its own segment: the guardian family has no walk and no hop, so
+        // its own bounded control is the only thing that moves that body.
+        if (enemy.swim != null) {
+            stepGuardianSwim(enemy);
             return;
         }
         // A hop edge in flight owns the turn its own arc, exactly like a walked edge owns its segment. It is
@@ -6036,9 +6168,567 @@ public final class ServerBattle {
         }
     }
 
+    /**
+     * The one commit point for this family: the real water position the body was admitted on, plus the motion
+     * seam its own tick answers. From here until release, this encounter owns that body's displacement.
+     *
+     * <p>Nothing is moved, healed or resized here: admission already put the body on the position it proved, so
+     * the node this takes is the position the body really has, fractional feet included. A body whose admitted
+     * position is not a legal water position has no node at all - it is then the fall rule's unit, not a body this
+     * encounter pretends to hold.</p>
+     */
+    private void installGuardianState(EnemyState state) {
+        if (state == null || !GuardianMovement.supports(state.mob)) return;
+        if (!(state.mob instanceof net.minecraft.world.entity.monster.Guardian guardian)) return;
+        ((TacticalGuardianAccess) guardian).tactical$setMotionHandler(new GuardianHandler(state));
+        // A body that vanilla was already mid-charge with is taken out of that old attack here: the goal is ended
+        // through its own native stop and the synched attack target is cleared, so nothing from before this encounter
+        // keeps drawing a beam on somebody else's turn. Nothing is charged for the old charge.
+        GuardianNativePose.clearOldAttack(guardian);
+        GuardianMotion.moving(guardian, false);
+        GuardianMovement.Node node = GuardianMovement.heldNode(level, guardian).orElse(null);
+        state.guardian = node;
+        if (node != null) state.cell = node.cell();
+    }
+
+    /**
+     * Give a guardian back to its own vanilla tick and drop every transient of this family.
+     *
+     * <p>Idempotent, and it never moves, heals or re-positions the unit: a normal exit keeps the real final
+     * position and only the borrowed motion seam is given back, with the native swimming bit cleared so a
+     * released body is not left animating a swim it is not doing. A unit this encounter never took has nothing to
+     * give back, so another encounter's seam is never cleared by this path.</p>
+     */
+    private void releaseGuardianState(EnemyState state) {
+        if (state == null) return;
+        // A beam belongs to this encounter's control: releasing the unit ends it first, while the roster entry still
+        // exists, so the native goal is stopped and its synched attack target cleared before the seam goes away.
+        dropGuardianBeamFor(state.mob);
+        state.guardian = null;
+        state.swim = null;
+        state.guardianRoute = null;
+        state.guardianRouteDone = false;
+        if (!(state.mob instanceof net.minecraft.world.entity.monster.Guardian guardian)) return;
+        GuardianMotion.moving(guardian, false);
+        ((TacticalGuardianAccess) guardian).tactical$setMotionHandler(null);
+    }
+
+    /**
+     * The mixin-facing view of one controlled guardian.
+     *
+     * <p>Everything it answers is read from this encounter's live state: the exact entity, the roster entry, a
+     * live encounter and a body it can still prove. A stale handler can therefore neither hold a released unit nor
+     * keep the native water travel switched off for a body the fall rule has taken.</p>
+     */
+    private final class GuardianHandler implements GuardianMotionHandler {
+        private final EnemyState state;
+
+        private GuardianHandler(EnemyState state) {
+            this.state = state;
+        }
+
+        @Override
+        public boolean tactical$controls(net.minecraft.world.entity.monster.Guardian guardian) {
+            if (guardian == null || finished || state.mob != guardian) return false;
+            if (enemies.get(guardian.getUUID()) != state) return false;
+            if (guardian.isRemoved() || !guardian.isAlive() || guardian.level() != level) return false;
+            return true;
+        }
+
+        /**
+         * Vanilla's spikes stay vanilla's, but only for somebody who may really touch this body.
+         *
+         * <p>A real opposed participant of this same encounter gets the native reaction unchanged - same gate, same
+         * tags, same 2.0, same order before the main hit. A same-side unit, a bystander that never joined, a unit of
+         * another encounter or anything outside this encounter gets nothing, so no such attacker can use the spikes
+         * to deal damage, absorb it or move any of this encounter's resources.</p>
+         */
+        @Override
+        public boolean tactical$allowsThorns(net.minecraft.world.entity.monster.Guardian guardian,
+                                             LivingEntity attacker) {
+            thornsAsked++;
+            if (!tactical$controls(guardian)) return false;
+            if (attacker == null || attacker == guardian) return false;
+            if (!isParticipant(attacker)) return false;
+            boolean allowed = opposed(guardian, attacker);
+            if (allowed) thornsAllowed++;
+            return allowed;
+        }
+    }
+
+    /**
+     * How many water edges this body can still pay for while keeping one beam affordable.
+     *
+     * <p>The reserved price is one base beam, because that is the main action a guardian's own turn is for: a
+     * route that ate the whole pool would arrive with nothing to fire. Movement itself never touches the paid
+     * counter, exactly like every other route in this encounter.</p>
+     */
+    private int guardianEdgeBudget(EnemyState state) {
+        if (state == null || state.guardian == null) return 0;
+        int move = Math.max(1, state.moveCost);
+        // The reserve is the real quote this actor would be charged now, surcharge included, so a route can never
+        // eat the pool its own beam needs.
+        int reserve = guardianBeamCost(state);
+        return Math.max(0, Math.min(GuardianMovement.MAX_SEARCH_NODES, (state.ap - reserve) / move));
+    }
+
+    /**
+     * Whether this body could really fire its own native beam from that node.
+     *
+     * <p>Three separate facts, asked together because the movement exists only to make this true: the locked
+     * opponent is a real, opposed, live participant of this encounter; the real eye at those feet has vanilla's own
+     * line of sight to it, inside the current follow range and inside this battlefield; and the distance gate the
+     * two exact types really have is satisfied - an ordinary guardian keeps vanilla's "strictly further than three
+     * blocks" rule, while the elder guardian has no near gate at all. None of them is grid adjacency.</p>
+     */
+    private boolean guardianFiresFrom(EnemyState state, GuardianMovement.Node node) {
+        if (state == null || node == null || !GuardianMovement.supports(state.mob)) return false;
+        LivingEntity target = actionOpponent(state);
+        if (target == null || !opposed(state.mob, target)) return false;
+        if (target.level() != level || !target.isAlive() || target.isRemoved()) return false;
+        if (!GuardianMovement.legal(level, state.mob, node)) return false;
+        if (!zone.contains(node.cell())) return false;
+        if (!GuardianMovement.lineOfSight(level, state.mob, node.feet(), target)) return false;
+        double reach = attribute(state.mob, Attributes.FOLLOW_RANGE);
+        if (reach <= 0.0D) return false;
+        if (node.feet().distanceToSqr(target.position()) > reach * reach) return false;
+        // Vanilla's own gate, and only for the ordinary guardian: an elder guardian fires from any distance.
+        if (!GuardianMovement.elder(state.mob)
+                && node.feet().distanceToSqr(target.position()) <= GuardianMovement.NATIVE_NEAR_GATE_SQR) return false;
+        return true;
+    }
+
+    /**
+     * How badly that node misses this type's own firing band; zero means the beam could really be fired from it.
+     *
+     * <p>The score is the band's own violation in whole blocks, not a distance to the target: an ordinary guardian
+     * may only fire from strictly more than three blocks and within its follow range, and the elder guardian has no
+     * near gate at all. Inside the band, a blocked native line of sight is one step worse than a clear one. The
+     * bounded search uses exactly this number both for its goal and for deciding whether a prefix is progress, so a
+     * body that is too close can never be "improved" by swimming closer.</p>
+     */
+    private int guardianFireScore(EnemyState state, GuardianMovement.Node node) {
+        if (state == null || node == null || !GuardianMovement.supports(state.mob)) return Integer.MAX_VALUE;
+        if (guardianFiresFrom(state, node)) return 0;
+        LivingEntity target = actionOpponent(state);
+        if (target == null || target.level() != level) return Integer.MAX_VALUE - 1;
+        double distance = Math.sqrt(node.feet().distanceToSqr(target.position()));
+        double reach = attribute(state.mob, Attributes.FOLLOW_RANGE);
+        int outOfBand = 0;
+        if (!GuardianMovement.elder(state.mob) && distance <= MIN_FIRE_DISTANCE) {
+            outOfBand = Math.max(1, (int) Math.ceil(MIN_FIRE_DISTANCE - distance));
+        } else if (reach > 0.0D && distance > reach) {
+            outOfBand = Math.max(1, (int) Math.ceil(distance - reach));
+        }
+        boolean sight = GuardianMovement.lineOfSight(level, state.mob, node.feet(), target);
+        return outOfBand * 2 + (sight ? 0 : 1);
+    }
+
+    /**
+     * Every gate a water route has to pass, asked once against the live world.
+     *
+     * <p>A real water body for every node, a real provable sweep for every edge, the whole body inside the
+     * battlefield and no cell another participant holds. A refused route charges nothing and is never swum
+     * halfway.</p>
+     */
+    private boolean guardianRouteHolds(EnemyState state, List<GuardianMovement.Node> route) {
+        if (state == null || state.guardian == null || route == null || route.isEmpty()) return false;
+        if (route.size() > GuardianMovement.MAX_SEARCH_NODES) return false;
+        if (!GuardianMovement.legal(level, state.mob, state.guardian)) return false;
+        GuardianMovement.Node previous = state.guardian;
+        for (GuardianMovement.Node node : route) {
+            if (occupiedByOthers(state, node.cell()) || !zone.contains(node.cell())) return false;
+            if (!GuardianMovement.legal(level, state.mob, node)) return false;
+            if (!GuardianMovement.bodyInsideZone(state.mob, node, zone::contains)) return false;
+            if (!GuardianMovement.adjacent(previous.cell(), node.cell())) return false;
+            if (!GuardianMovement.canStep(level, state.mob, previous, node, zone::contains)) return false;
+            previous = node;
+        }
+        return true;
+    }
+
+    /**
+     * The one bounded water proposal of this own turn, resolved once and then only re-checked.
+     *
+     * <p>The bounded search is the expensive part, so planning, validation and the commit all read the same
+     * immutable answer; a new own turn - or a new turn generation - resolves a fresh one. The goal is the firing
+     * position itself, which is what makes the same search both close in and back away: a guardian that stands too
+     * close is not closer to a legal firing cell, so its own distance gate pushes the answer out.</p>
+     */
+    private List<GuardianMovement.Node> guardianApproach(EnemyState state) {
+        if (state == null || state.guardian == null || finished || ending) return List.of();
+        if (!isActorTurn(state.mob) || isBusy()) {
+            if (DeveloperTrace.enabled()) {
+                // Development trace: why a water plan was not even searched for.
+                Tactical.LOGGER.info("[Tactical] dev-trace guardian approach waiting session={} tick={} uuid={} "
+                                + "actorTurn={} busy={} finished={} ending={}", session.sessionId(), ticks,
+                        state.mob.getUUID(), isActorTurn(state.mob), isBusy(), finished, ending);
+            }
+            return List.of();
+        }
+        long epoch = turnEpoch();
+        if (state.guardianRouteDone && state.guardianRouteEpoch == epoch
+                && state.guardianRouteTurn == state.ownTurns) {
+            return state.guardianRoute == null ? List.of() : state.guardianRoute;
+        }
+        state.guardianRouteDone = true;
+        state.guardianRouteEpoch = epoch;
+        state.guardianRouteTurn = state.ownTurns;
+        LivingEntity target = actionOpponent(state);
+        GridPos targetCell = participantCell(target);
+        int budget = guardianEdgeBudget(state);
+        GuardianMovement.Route route = targetCell == null || budget <= 0 ? null
+                : GuardianMovement.swimTo(level, state.mob, state.guardian, targetCell, state.airOffset, budget,
+                        cell -> occupiedByOthers(state, cell), zone::contains,
+                        node -> guardianFiresFrom(state, node),
+                        node -> guardianFireScore(state, node)).orElse(null);
+        state.guardianRoute = route == null ? null : route.nodes();
+        if (DeveloperTrace.enabled() && route == null) {
+            // Development trace: a plan that found no legal firing position, and the budget it had to do it with.
+            Tactical.LOGGER.info("[Tactical] dev-trace guardian no route session={} tick={} uuid={} here={} "
+                            + "target={} budget={} fires={}", session.sessionId(), ticks, state.mob.getUUID(),
+                    state.guardian.cell(), targetCell, budget, guardianFiresFrom(state, state.guardian));
+        }
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace guardian approach session={} tick={} uuid={} here={} "
+                            + "budget={} route={}", session.sessionId(), ticks, state.mob.getUUID(),
+                    state.guardian.cell(), budget, state.guardianRoute);
+        }
+        return state.guardianRoute == null ? List.of() : state.guardianRoute;
+    }
+
+    // ------------------------------------------------------------------
+    // guardian native beam: one real attack goal per own turn
+    // ------------------------------------------------------------------
+
+    /** Whether this encounter is currently driving a guardian's own native beam for the acting unit. */
+    private boolean guardianBeamBusy() {
+        return guardianBeam != null;
+    }
+
+    /**
+     * Quoted price of one native beam this own turn, or 0 for a body whose real attack goal cannot be reached.
+     *
+     * <p>The base price is configuration; the surcharge is this actor's own count of successful paid actions, exactly
+     * like every other main action. The same number is reserved by the water budget, validated by the session and
+     * frozen into the running beam, so planning, admission and settlement can never disagree.</p>
+     */
+    private int guardianBeamCost(EnemyState state) {
+        if (state == null || !GuardianMovement.supports(state.mob)) return 0;
+        if (!(state.mob instanceof net.minecraft.world.entity.monster.Guardian guardian)) return 0;
+        if (NativeBeamBridge.installedGoal(guardian) == null) return 0;
+        return quote(intConfig(TacticalConfig.INSTANCE.guardianBeamApCost,
+                com.tactical.core.combat.BattleRules.GUARDIAN_BEAM_COST), state.paidActions);
+    }
+
+    /**
+     * Whether this body may really launch its one native beam right now.
+     *
+     * <p>Every gate at one moment: this exact family and a captured native goal, a held water node, the acting turn
+     * with nothing in flight, no beam already running, an affordable frozen quote, a locked opposed opponent and
+     * vanilla's own firing geometry from where the body stands. A refusal leaves the world exactly as it was.</p>
+     */
+    private boolean guardianBeamReady(EnemyState state) {
+        if (state == null || state.guardian == null || guardianBeam != null || finished || ending) return false;
+        if (!(state.mob instanceof net.minecraft.world.entity.monster.Guardian guardian)) return false;
+        if (NativeBeamBridge.installedGoal(guardian) == null) return false;
+        if (!isActorTurn(state.mob) || isBusy()) return false;
+        int cost = guardianBeamCost(state);
+        if (cost <= 0 || state.ap < cost) return false;
+        if (actionOpponent(state) == null) return false;
+        return guardianFiresFrom(state, state.guardian);
+    }
+
+    /**
+     * Launch that body's own native beam: point it at the locked opponent, start the goal vanilla installed, charge
+     * nothing yet.
+     *
+     * <p>Nothing is invented here. The target is set through the native setter and re-read afterwards, because a
+     * target change is an event and a listener may cancel it; the goal is the exact object captured from that body's
+     * own constructor; the charge, the synched attack target, event {@code 21}, the two native hits and their order
+     * are all vanilla's. A launch that could not keep its target gives back exactly the transients it borrowed - the
+     * original target, the original synched attack target when there was one - and never writes a true flag false.</p>
+     *
+     * @return true when this own turn now owns a running native beam
+     */
+    private boolean startGuardianBeam(EnemyState state) {
+        if (!guardianBeamReady(state)) return false;
+        net.minecraft.world.entity.monster.Guardian guardian =
+                (net.minecraft.world.entity.monster.Guardian) state.mob;
+        LivingEntity target = actionOpponent(state);
+        if (target == null) return false;
+        int cost = guardianBeamCost(state);
+        if (cost <= 0 || state.ap < cost) return false;
+        // Bound now and for the whole action: the goal object this launch drives is the one vanilla installed, and
+        // every later tick proves it is still that same object in that same body.
+        net.minecraft.world.entity.ai.goal.Goal goal = NativeBeamBridge.installedGoal(guardian);
+        if (goal == null) return false;
+        GuardianNativePose.Snapshot launchPose = GuardianNativePose.snapshot(guardian);
+        boolean started;
+        try {
+            started = NativeBeamBridge.start(guardian, goal, target);
+        } catch (RuntimeException failure) {
+            Tactical.LOGGER.error("[Tactical] native guardian beam could not start for {}", guardian.getUUID(), failure);
+            started = false;
+        }
+        if (!started) {
+            // A refused launch gives back exactly the pose it touched: the saved raw attack-target id, the saved
+            // moving bit and the goal's own charge counter. Nothing is guessed from the mob's target.
+            GuardianNativePose.restore(guardian, launchPose);
+            journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_NO_BEAM,
+                    BattleText.name(state.mob)));
+            sendState();
+            return false;
+        }
+        guardianBeam = new GuardianBeam(state.mob.getUUID(), target.getUUID(), turnEpoch(), cost, ticks,
+                guardian.getAttackDuration());
+        beamBinding = new BeamBinding(guardian, goal, target);
+        // A charging beam is a stationary body: the native swimming bit must not say otherwise, or the client
+        // animates a swimmer while the server holds a charge, and the passive spikes would be suppressed by a gate
+        // that is only about real displacement.
+        GuardianMotion.moving(guardian, false);
+        state.mob.getNavigation().stop();
+        state.mob.setDeltaMovement(Vec3.ZERO);
+        state.mob.fallDistance = 0.0F;
+        journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_BEAM_CHARGE,
+                BattleText.name(state.mob), guardianBeam.chargeTicks()));
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace guardian beam start session={} tick={} uuid={} target={} "
+                            + "cost={} ap={} charge={} settle={} deadline={}", session.sessionId(), ticks,
+                    state.mob.getUUID(), target.getUUID(), cost, state.ap, guardianBeam.chargeTicks(),
+                    guardianBeam.settleTick(), guardianBeam.deadlineTick());
+        }
+        sendState();
+        return true;
+    }
+
+    /**
+     * Advance the running beam by exactly one server tick: one real {@code tick()} of that body's own goal.
+     *
+     * <p>The beam holds the turn ({@link #isBusy()} reports it), so no other unit is planned, no queue entry advances
+     * and nothing else may act while it charges. Every tick re-proves the same facts the launch proved - the session
+     * and turn generation, the exact bound opponent, the water node, vanilla's own line of sight and distance band,
+     * and that the very goal object this action launched is still the one installed in that body - and settles at
+     * most once. A goal that was removed or replaced, a target that leaves, dies or hides, a drained body, an actor
+     * that dies or an expired deadline all end the beam with no charge and no leftover goal state; no substitute goal
+     * is ever driven in its place.</p>
+     */
+    private void tickGuardianBeam() {
+        GuardianBeam beam = guardianBeam;
+        if (beam == null) return;
+        BeamBinding binding = beamBinding;
+        EnemyState state = enemies.get(beam.actorId());
+        if (state == null || binding == null || state.mob != binding.actor()
+                || !(state.mob instanceof net.minecraft.world.entity.monster.Guardian guardian)) {
+            stopGuardianBeam(beam);
+            if (!finished && !ending) advanceTurn();
+            return;
+        }
+        boolean sameTurn = !ending && !finished && state.mob.isAlive() && !state.mob.isRemoved()
+                && state.mob.level() == level && beam.actorId().toString().equals(queue.current())
+                && beam.epoch() == turnEpoch();
+        LivingEntity target = binding.target();
+        boolean targetHolds = target.isAlive() && !target.isRemoved() && target.level() == level
+                && target.getUUID().equals(beam.targetId()) && opposed(state.mob, target);
+        if (!sameTurn || !targetHolds || guardian.getTarget() != target
+                || !NativeBeamBridge.stillInstalled(guardian, binding.goal())) {
+            // The turn the beam was launched in is over, the opponent is gone, the native goal no longer reads this
+            // turn's target, or the goal this action launched is no longer the one installed: stop at once, charge
+            // nothing and hand the turn on. A beam is never re-aimed at somebody else, and never continues on a
+            // replacement goal object.
+            stopGuardianBeam(beam);
+            if (!finished && !ending) advanceTurn();
+            return;
+        }
+        if (beam.expired(ticks)) {
+            // The abnormal ceiling: a goal that stopped advancing must not hold the turn forever. It is above every
+            // ordinary flow (pre-heat + 80 or 60 + slack), so it can never shorten a real charge.
+            Tactical.LOGGER.warn("[Tactical] guardian beam did not settle within {} ticks; ending it for {}",
+                    GuardianBeam.DEADLINE_TICKS, state.mob.getUUID());
+            stopGuardianBeam(beam);
+            advanceTurn();
+            return;
+        }
+        if (state.ap < beam.price()) {
+            // The frozen quote is re-checked before the settlement tick: a body that can no longer pay does not land
+            // the hit, and nothing is charged. The goal is stopped before its damage branch runs.
+            Tactical.LOGGER.warn("[Tactical] guardian beam became unaffordable for {}; stopping it before settlement",
+                    state.mob.getUUID());
+            stopGuardianBeam(beam);
+            advanceTurn();
+            return;
+        }
+        if (!guardianFiresFrom(state, state.guardian)) {
+            // The water, the zone geometry, the native line of sight or the distance band changed under the charge.
+            stopGuardianBeam(beam);
+            advanceTurn();
+            return;
+        }
+        NativeBeamBridge.Receipt receipt = NativeBeamBridge.tick(guardian, binding.goal(), target);
+        if (receipt.attempted()) {
+            settleGuardianBeam(state, binding, beam, receipt.hurt());
+        }
+    }
+
+    /**
+     * Settle the beam exactly once: the frozen price is committed for a real hit, then every borrowed transient is
+     * given back, and finally the turn is handed on.
+     *
+     * <p>The two native calls are vanilla's, in vanilla's order, with their own difficulty scaling, armour, immunity
+     * window and listeners. This method never writes a damage number and never infers success from health: the
+     * receipt's two booleans are the very returns of those calls. One hit charges the frozen price once and advances
+     * the paid counter once; two refusals charge nothing. The commit happens <em>before</em> any cleanup, so a
+     * listener throwing from the native {@code stop()} can neither refund a real hit nor lose its price, and the
+     * mod's borrowed transients are returned in a {@code finally} either way.</p>
+     */
+    private void settleGuardianBeam(EnemyState state, BeamBinding binding, GuardianBeam beam, boolean reallyHurt) {
+        boolean owes = beam.settle(reallyHurt);
+        guardianBeam = null;
+        beamBinding = null;
+        guardianBeamSettlements++;
+        // One resource commit, first and unconditionally: a native stop listener may throw later, and a real hit is
+        // never refunded because of it.
+        if (owes) {
+            int cost = beam.price();
+            if (state.ap >= cost) {
+                state.ap -= cost;
+                state.paidActions++;
+                journal.record("attack", BattleText.translatable(BattleText.KEY_ATTACK_ENEMY_BEAM,
+                        BattleText.name(state.mob), BattleText.name(binding.target())));
+            } else {
+                // The only way here is a pool changed by something outside this held turn; the damage already
+                // happened, so it is reported and the balance is never pushed below zero.
+                Tactical.LOGGER.error("[Tactical] guardian beam settled for {} with only {} of {} AP; charging nothing "
+                                + "and never a negative balance", state.mob.getUUID(), state.ap, cost);
+            }
+        } else {
+            journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_NO_BEAM,
+                    BattleText.name(state.mob)));
+        }
+        releaseBeamNative(binding, true);
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace guardian beam settled session={} tick={} uuid={} target={} "
+                            + "hurt={} owed={} cost={} ap={} paid={}", session.sessionId(), ticks,
+                    state.mob.getUUID(), binding.target().getUUID(), reallyHurt, owes, beam.price(), state.ap,
+                    state.paidActions);
+        }
+        sendState();
+        if (!finished && !ending) advanceTurn();
+    }
+
+    /** End the running beam and give the native goal back; the caller decides whether the turn is handed on. */
+    private void stopGuardianBeam(GuardianBeam beam) {
+        if (beam == null) return;
+        if (guardianBeam == beam) guardianBeam = null;
+        BeamBinding binding = beamBinding;
+        beamBinding = null;
+        if (binding != null) releaseBeamNative(binding, false);
+    }
+
+    /**
+     * Hand the borrowed native attack state back, and never let a listener decide whether that happens.
+     *
+     * <p>The native {@code stop()} is still the one that ends the charge, as vanilla's selector would, but a target
+     * listener is allowed to throw - and when it does, this mod's own borrowed transients (the swimming bit) are
+     * still returned, and the encounter is still not left holding the body's pose. A thrown failure is logged, never
+     * reported as success.</p>
+     *
+     * @param deliver whether the synched attack target must also be cleared, for a beam that ended itself
+     */
+    private void releaseBeamNative(BeamBinding binding, boolean deliver) {
+        if (binding == null) return;
+        net.minecraft.world.entity.monster.Guardian actor = binding.actor();
+        try {
+            NativeBeamBridge.stop(actor, binding.goal());
+        } catch (RuntimeException failure) {
+            guardianBeamStopFailures++;
+            Tactical.LOGGER.error("[Tactical] the native goal of {} failed to stop after its beam; the charge already "
+                    + "committed and the borrowed state is still returned", actor.getUUID(), failure);
+        } finally {
+            try {
+                GuardianMotion.moving(actor, false);
+            } catch (RuntimeException failure) {
+                Tactical.LOGGER.error("[Tactical] could not clear the swimming bit of {} after its beam",
+                        actor.getUUID(), failure);
+            }
+            if (deliver) {
+                try {
+                    if (actor.hasActiveAttackTarget()) {
+                        ((com.tactical.neoforge.mixin.GuardianNativeInvoker) actor).tactical$setActiveAttackTarget(0);
+                    }
+                } catch (RuntimeException failure) {
+                    Tactical.LOGGER.error("[Tactical] could not clear the synched attack target of {} after its beam",
+                            actor.getUUID(), failure);
+                }
+            }
+        }
+    }
+
+    /**
+     * End this encounter's beam for that exact body, wherever the exit came from.
+     *
+     * <p>Takes the body itself, not its id: the death scan and the roster exit both release a unit <em>after</em>
+     * removing its roster entry, so a lookup by id would find nothing and quietly skip the native stop. A unit that
+     * leaves keeps its real position, damage and remaining effects; only the borrowed native attack state is given
+     * back.</p>
+     */
+    private void dropGuardianBeamFor(Mob actor) {
+        GuardianBeam beam = guardianBeam;
+        if (beam == null || actor == null || !beam.actorId().equals(actor.getUUID())) return;
+        guardianBeam = null;
+        BeamBinding binding = beamBinding;
+        beamBinding = null;
+        if (binding != null) {
+            releaseBeamNative(binding, true);
+            return;
+        }
+        if (actor instanceof net.minecraft.world.entity.monster.Guardian guardian) {
+            try {
+                GuardianNativePose.clearOldAttack(guardian);
+            } catch (RuntimeException failure) {
+                Tactical.LOGGER.error("[Tactical] could not clear the old attack of {}", actor.getUUID(), failure);
+            }
+        }
+    }
+
+    /** End the running beam using whatever object this encounter still holds. */
+    private void dropGuardianBeamOnExit() {
+        GuardianBeam beam = guardianBeam;
+        if (beam == null) return;
+        Mob actor = beamBinding != null ? beamBinding.actor() : null;
+        if (actor == null) {
+            EnemyState state = enemies.get(beam.actorId());
+            actor = state == null ? null : state.mob;
+        }
+        dropGuardianBeamFor(actor);
+    }
+
+    /**
+     * One elder guardian's own fatigue pulse, on its own turn start only.
+     *
+     * <p>The interval is expressed in that unit's own complete cycles - the 1st, 7th, 13th own turn - so another
+     * unit's turn, a real-time wait or another elder's counter can never advance it. The pulse itself is vanilla's:
+     * the same predicate, the same effect, the same {@code addEffect} chain and the same client event, narrowed to
+     * this encounter's opposed living members. A pulse nobody really took logs nothing.</p>
+     */
+    private void pulseElderFatigue(EnemyState state) {
+        if (state == null || !(state.mob instanceof net.minecraft.world.entity.monster.ElderGuardian elder)) return;
+        if (!GuardianFatigue.dueOnOwnTurn(state.ownTurns)) return;
+        GuardianFatigue.Pulse pulse = GuardianFatigue.pulse(level, elder, player ->
+                isParticipant(player) && opposed(elder, player) && player.isAlive() && !player.isRemoved());
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace elder fatigue pulse session={} tick={} uuid={} ownTurns={} "
+                            + "candidates={} applied={}", session.sessionId(), ticks, elder.getUUID(),
+                    state.ownTurns, pulse.candidates(), pulse.appliedCount());
+        }
+        if (!pulse.tookEffect()) return;
+        journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_ELDER_FATIGUE,
+                BattleText.name(elder), BattleText.literal(Integer.toString(pulse.appliedCount()))));
+        sendState();
+    }
+
     /** Quoted price of one native contact this own turn; zero for a body that cannot damage anything. */
-    private int slimeContactCost(EnemyState state) {
-        if (state == null || !SlimeGround.supports(state.mob) || !SlimeContact.sizeCanHurt(state.mob)) return 0;
+    private int slimeContactCost(EnemyState state) {        if (state == null || !SlimeGround.supports(state.mob) || !SlimeContact.sizeCanHurt(state.mob)) return 0;
         return quote(intConfig(TacticalConfig.INSTANCE.meleeApCost, ApCalculator.MELEE_COST), state.paidActions);
     }
 
@@ -6486,6 +7176,343 @@ public final class ServerBattle {
     }
 
     /**
+     * One frame of a swim: the same bounded, re-proved animation every other movement here uses.
+     *
+     * <p>Before the body is displaced at all, the frame it is about to travel and the landing it is travelling to
+     * are re-proved against the live world - a block placed into the swept body, drained water, another body
+     * stepping in, an unloaded column or a shrunken battlefield stops it - and so is the water medium of both
+     * ends. If the edge has not started, the whole remaining route is refused and its unwalked edges are given
+     * back; once the body really moved, the edge stays paid and the body stops exactly where it is. The body is
+     * never pulled back to a cell centre or to its take-off point, and a body left without legal water is handed
+     * to the existing fall rule <em>before</em> the turn is handed on.</p>
+     */
+    private void stepGuardianSwim(EnemyState enemy) {
+        SwimRun run = enemy.swim;
+        if (run == null) {
+            enemyMoving = false;
+            advanceTurn();
+            return;
+        }
+        if (finished || ending) {
+            // The encounter is over: no turn is advanced and no fall is started from here.
+            enemy.swim = null;
+            enemyMoving = false;
+            enemyStepping = false;
+            GuardianMotion.moving(enemy.mob, false);
+            return;
+        }
+        if (enemy.guardian == null || run.epoch != turnEpoch() || !isActorTurn(enemy.mob)) {
+            abandonGuardianSwim(enemy);
+            return;
+        }
+        if (run.index >= run.route.size()) {
+            finishGuardianSwim(enemy);
+            return;
+        }
+        GuardianMovement.Node from = enemy.guardian;
+        if (run.to == null) {
+            GuardianMovement.Node next = run.route.get(run.index);
+            // The body has to really hold the node this edge starts from. Adopting that node here would be an
+            // unswept jump no frame of this route ever proved; a body that is not on its node belongs to the same
+            // interruption every other lost hold uses.
+            boolean step = GuardianMovement.holds(level, enemy.mob, from)
+                    && GuardianMovement.legal(level, enemy.mob, next)
+                    && !occupiedByOthers(enemy, next.cell())
+                    && GuardianMovement.bodyInsideZone(enemy.mob, next, zone::contains)
+                    && GuardianMovement.canStep(level, enemy.mob, from, next, zone::contains);
+            if (!step) {
+                abandonGuardianSwim(enemy);
+                return;
+            }
+            run.to = next;
+            run.frames = 0;
+            run.edgeStarted = false;
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            enemy.mob.fallDistance = 0.0F;
+            faceDirection(enemy.mob, next.cell());
+            // The native swimming bit says what really happens: the tail sweeps and the spikes retract only while
+            // this body is on its way somewhere.
+            GuardianMotion.moving(enemy.mob, true);
+        }
+        int steps = Math.max(1, stepTicks);
+        int next = run.frames + 1;
+        double progress = Math.min(1.0D, next / (double) steps);
+        Vec3 current = enemy.mob.position();
+        Vec3 point = from.feet().lerp(run.to.feet(), progress);
+        // The medium is asked of the frame itself, not only of the two ends: the water under the body may have been
+        // taken away while it was already moving, and the leg it is about to fly may cross a corner of air.
+        if (!GuardianMovement.waterThroughout(level, enemy.mob, current, point)
+                || !GuardianMovement.sweepClear(level, enemy.mob, current, point, zone::contains)
+                || !BodyGeometry.bodyInsideZone(enemy.mob, point, zone::contains)
+                || !GuardianMovement.legal(level, enemy.mob, run.to)
+                || occupiedByOthers(enemy, run.to.cell())
+                || !GuardianMovement.bodyInsideZone(enemy.mob, run.to, zone::contains)) {
+            abandonGuardianSwim(enemy);
+            return;
+        }
+        enemy.mob.setPos(point);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        run.frames = next;
+        run.edgeStarted = true;
+        if (next >= steps) {
+            // The edge arrived on its own node, with the exact real feet that node holds.
+            enemy.guardian = run.to;
+            enemy.cell = run.to.cell();
+            enemy.mob.setPos(run.to.feet());
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            enemy.mob.fallDistance = 0.0F;
+            run.to = null;
+            run.frames = 0;
+            run.edgeStarted = false;
+            run.index++;
+            if (run.index >= run.route.size()) finishGuardianSwim(enemy);
+        }
+    }
+
+    /** The route really arrived: the same hand-back every other movement uses. */
+    private void finishGuardianSwim(EnemyState enemy) {
+        enemy.swim = null;
+        enemyMoving = false;
+        enemyStepping = false;
+        enemyPath = List.of();
+        enemyPathIndex = 0;
+        GuardianMotion.moving(enemy.mob, false);
+        if (enemy.companionAdapter != null) {
+            sendState();
+            return;
+        }
+        if (!targetLost(enemy)) resolveAiAction(enemy, ai.afterMovement(aiContext(enemy)));
+        else if (!replanAfterLostTarget(enemy)) advanceTurn();
+    }
+
+    /**
+     * Stop a swim that can no longer be made and give the body back cleanly.
+     *
+     * <p>Every normal interruption settles at the per-edge quote frozen when the route was committed: the edges
+     * the body really completed and the one it really began moving on stay paid, and every edge it never began is
+     * given back exactly once. A route refused on its first frame therefore costs nothing at all. The quote is
+     * never re-read from a {@code moveCost} that changed after the commit, and the same run can never refund twice
+     * because the run is dropped before anything is returned. The body keeps the position it really reached: a
+     * legal water point is re-adopted exactly where it stands, and anything else starts the real fall - established
+     * first, so the encounter is already busy when the turn is handed on.</p>
+     */
+    private void abandonGuardianSwim(EnemyState enemy) {
+        SwimRun run = enemy.swim;
+        enemy.swim = null;
+        enemyMoving = false;
+        enemyStepping = false;
+        enemyPath = List.of();
+        enemyPathIndex = 0;
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        GuardianMotion.moving(enemy.mob, false);
+        if (run != null && !run.route.isEmpty()) {
+            int perEdge = run.cost / run.route.size();
+            int charged = run.index + (run.edgeStarted ? 1 : 0);
+            int unused = Math.max(0, run.route.size() - charged);
+            int refund = unused * perEdge;
+            if (refund > 0) enemy.ap = Math.min(enemy.maxAp, enemy.ap + refund);
+        }
+        GuardianMovement.Node real = GuardianMovement.heldNode(level, enemy.mob).orElse(null);
+        if (real != null) {
+            // The body really holds that water point: adopt it with the exact feet it has, not the cell centre.
+            enemy.guardian = real;
+            enemy.cell = real.cell();
+            enemy.mob.setPos(real.feet());
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            enemy.mob.fallDistance = 0.0F;
+            sendState();
+            advanceTurn();
+            return;
+        }
+        // Anything else - drained water, a body inside a cell the water no longer covers - is the fall rule's
+        // unit, and it is established before the turn is handed on.
+        startGuardianFall(enemy);
+        advanceTurn();
+    }
+
+    /**
+     * Hand a guardian this encounter can no longer hold under water to the existing fall.
+     *
+     * <p>The deadline, the damage, the landing reservation and the abnormal release are the shared ones. What is
+     * this family's own is the descent itself: the body keeps the real horizontal position it reached and its
+     * continuous height, and every slice of the way down is proved as the whole body it really is - the ordinary
+     * cell ladder would move a fractional body onto a cell centre, which is exactly the "pull it back" this batch
+     * forbids. The real feet are remembered here, before the descent starts, the same way the spider and slime
+     * slots work.</p>
+     */
+    private void startGuardianFall(EnemyState enemy) {
+        if (enemy == null || enemy.mob == null || finished || ending) return;
+        if (!enemy.mob.isAlive() || enemy.mob.isRemoved() || enemy.mob.level() != level) return;
+        if (terrainFall.unit(enemy.mob.getUUID()) != null) return;
+        GridPos cell = new GridPos(Mth.floor(enemy.mob.getX()), Mth.floor(enemy.mob.getY()), Mth.floor(enemy.mob.getZ()));
+        enemy.guardian = null;
+        enemy.cell = cell;
+        TerrainFall.Unit unit = terrainFall.begin(enemy.mob.getUUID(), false, cell);
+        // The real feet are the descent's own start sample: a guardian interrupted inside a cell keeps its real X/Z
+        // and its fractional height instead of being rebuilt on the cell centre.
+        guardianFallFeet.put(enemy.mob.getUUID(), enemy.mob.position());
+        refreshFallLanding(unit);
+        enemy.mob.setOnGround(false);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL_BEGIN,
+                BattleText.name(enemy.mob), BattleText.literal(cell.toString())));
+        try {
+            sendState();
+        } catch (RuntimeException ignored) {
+            // The fall is authoritative even when one broadcast fails.
+        }
+    }
+
+    /**
+     * One tick of a guardian's real-feet descent: the fractional height first, then the ordinary cells.
+     *
+     * <p>A body interrupted mid-cell is often less than a whole block above its own floor, and the ordinary ladder
+     * would call that a landing and snap it down - and the ordinary landing snaps it onto the cell centre. Here the
+     * real X/Z are kept for the whole descent, the real Y is descended in bounded slices, and only when it reaches
+     * the real support surface does the shared landing question get asked of the position the body really holds.</p>
+     */
+    private void stepFallingGuardian(TerrainFall.Unit unit, EnemyState enemy, Vec3 held) {
+        if (enemy == null || !enemy.mob.isAlive() || enemy.mob.isRemoved()) {
+            terrainFall.end(unit.id());
+            guardianFallFeet.remove(unit.id());
+            return;
+        }
+        double x = held.x;
+        double z = held.z;
+        double surfaceY = unit.cell().y();
+        double realY = enemy.mob.getY();
+        if (realY > surfaceY + 1.0E-4D) {
+            double target = Math.max(surfaceY, realY - subCellDescent());
+            if (!GuardianMovement.descentSliceClear(level, enemy.mob, new Vec3(x, realY, z),
+                    new Vec3(x, target, z))) {
+                // Something is in the way of the fraction it is about to fall through: keep the real position and
+                // re-plan next tick, exactly as every other falling unit does.
+                return;
+            }
+            enemy.mob.setPos(x, target, z);
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            enemy.mob.fallDistance = 0.0F;
+            if (target > surfaceY + 1.0E-4D) return;
+        }
+        if (unit.stepTo() == null) {
+            refreshFallLanding(unit);
+            com.tactical.neoforge.battle.terrain.FallPlanner.Step step =
+                    com.tactical.neoforge.battle.terrain.FallPlanner.next(unit.cell(), this::hasSupportBelow,
+                            cell -> enterableForFall(cell, unit.id()));
+            if (step == com.tactical.neoforge.battle.terrain.FallPlanner.Step.LAND) {
+                settleGuardianFall(unit, enemy, x, z);
+                return;
+            }
+            if (step == com.tactical.neoforge.battle.terrain.FallPlanner.Step.STUCK) return;
+            GridPos next = below(unit.cell());
+            if (!zone.contains(next)) { abandonTerrainFall(unit); return; }
+            unit.beginStep(unit.cell(), next, fallStepTicks());
+        }
+        double from = enemy.mob.getY();
+        double target = unit.stepFrom().y() + (unit.stepTo().y() - unit.stepFrom().y())
+                * fallFraction(unit, unit.progress() + 1);
+        if (!GuardianMovement.descentSliceClear(level, enemy.mob, new Vec3(x, from, z), new Vec3(x, target, z))) {
+            unit.endStep();
+            return;
+        }
+        unit.progress(unit.progress() + 1);
+        enemy.mob.setPos(x, target, z);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        if (unit.fraction() >= 1.0D) {
+            GridPos arrived = unit.stepTo();
+            unit.stepLanded(arrived);
+            enemy.cell = arrived;
+        }
+    }
+
+    /**
+     * Land this body where it really is, keeping its real horizontal position.
+     *
+     * <p>A real water point is adopted exactly there, fractional feet included. A body that came down where the
+     * water is gone keeps the real position it reached and simply holds no node: it is not snapped onto a cell
+     * centre, not teleported back to the node it left, and not given a land walk this ruleset does not have.</p>
+     */
+    private void settleGuardianFall(TerrainFall.Unit unit, EnemyState enemy, double x, double z) {
+        GridPos landing = unit.cell();
+        Vec3 feet = new Vec3(x, landing.y(), z);
+        if (!GuardianMovement.descentSliceClear(level, enemy.mob, enemy.mob.position(), feet)) return;
+        GuardianMovement.Node node = GuardianMovement.landingNode(level, enemy.mob, feet).orElse(null);
+        terrainFall.end(unit.id());
+        guardianFallFeet.remove(unit.id());
+        enemy.cell = landing;
+        enemy.mob.setPos(feet);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        settleFallDamage(enemy.mob, landing, unit.cells());
+        if (node == null) {
+            // The water it came down into is really gone. Holding a body the encounter can no longer place would
+            // leave it frozen for the rest of the fight - native travel switched off, no legal position, and only
+            // an end-turn every round. This family's named exit returns it to the world instead, with its own
+            // flags, its real position and its own presence in the level, and without waiting out a timeout that
+            // never applied.
+            enemy.guardian = null;
+            journal.record("move", BattleText.translatable(BattleText.KEY_ENEMY_RELEASED_NO_WATER,
+                    BattleText.name(enemy.mob)));
+            boolean acting = leaveRoster(enemy.mob.getUUID());
+            if (acting && !finished) advanceTurn();
+            else if (!finished) sendState();
+            return;
+        }
+        enemy.guardian = node;
+        journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL,
+                BattleText.name(enemy.mob), BattleText.literal(unit.origin().toString()),
+                BattleText.literal(landing.toString()), unit.cells()));
+        removeDeadEnemies();
+        if (!finished) sendState();
+    }
+
+    /**
+     * Re-derive this family's node from where the body really ended up.
+     *
+     * <p>Asked after a landing and on every maintenance tick: a body that really holds a legal water point gets
+     * that point, fractional feet included, and one that does not is left without a node - which is what makes its
+     * own turn end instead of inventing a land walk this ruleset does not have.</p>
+     */
+    private void resyncGuardianHold(EnemyState enemy) {
+        if (enemy == null || !GuardianMovement.supports(enemy.mob)) return;
+        if (!enemy.mob.isAlive() || enemy.mob.isRemoved()) return;
+        GuardianMovement.Node node = GuardianMovement.heldNode(level, enemy.mob).orElse(null);
+        enemy.guardian = node;
+        if (node != null) enemy.cell = node.cell();
+    }
+
+    /**
+     * A held guardian that is no longer under water is not a held guardian.
+     *
+     * <p>The native travel of a controlled body is switched off, so nothing else would ever move it: a drained
+     * pool or a closed tunnel would leave it hanging where it was. This runs on the encounter's own tick, which is
+     * what makes an idle body react to the world as well as one in the middle of a route - an edge in flight is
+     * re-proved by its own executor instead.</p>
+     */
+    private void maintainGuardianHold() {
+        for (EnemyState state : List.copyOf(enemies.values())) {
+            if (state.guardian == null) continue;
+            if (state.mob.isRemoved() || !state.mob.isAlive()) continue;
+            if (state.swim != null) continue;
+            if (terrainFall.unit(state.mob.getUUID()) != null) continue;
+            if (GuardianMovement.holds(level, state.mob, state.guardian)) {
+                GuardianMotion.moving(state.mob, false);
+                continue;
+            }
+            GuardianMovement.Node real = GuardianMovement.heldNode(level, state.mob).orElse(null);
+            if (real != null) {
+                state.guardian = real;
+                state.cell = real.cell();
+                continue;
+            }
+            startGuardianFall(state);
+        }
+    }
+
+    /**
      * The mixin-facing view of one controlled enderman.
      *
      * <p>Everything it answers is read from the encounter's live state and re-validated against the live world,
@@ -6755,6 +7782,28 @@ public final class ServerBattle {
             }
             public int slimeContactCost() { return ServerBattle.this.slimeContactCost(state); }
             public boolean slimeContact() { return ServerBattle.this.slimeContact(state); }
+            // ---- guardian family: real water body, swept 3D edges, native sight ----
+            public boolean guardianContext() { return GuardianMovement.supports(state.mob) && state.guardian != null; }
+            public GuardianMovement.Node guardianHere() { return state.guardian; }
+            public List<GuardianMovement.Node> guardianNeighbours(GuardianMovement.Node from) {
+                if (state.guardian == null || from == null) return List.of();
+                return GuardianMovement.neighbours(level, state.mob, from,
+                        opponentCell == null ? state.cell : opponentCell, state.airOffset,
+                        this::occupied, zone::contains);
+            }
+            public boolean guardianRouteHolds(List<GuardianMovement.Node> route) {
+                return state.guardian != null && ServerBattle.this.guardianRouteHolds(state, route);
+            }
+            public int guardianEdgeBudget() { return ServerBattle.this.guardianEdgeBudget(state); }
+            public List<GuardianMovement.Node> guardianApproach() {
+                return ServerBattle.this.guardianApproach(state);
+            }
+            public boolean guardianFiresFrom(GuardianMovement.Node node) {
+                return ServerBattle.this.guardianFiresFrom(state, node);
+            }
+            public int guardianBeamCost() { return ServerBattle.this.guardianBeamCost(state); }
+            public boolean guardianBeamReady() { return ServerBattle.this.guardianBeamReady(state); }
+            public boolean guardianBeam() { return ServerBattle.this.startGuardianBeam(state); }
             public boolean canLeap() { return spiderCanLeap(state); }
             public int leapCost() { return spiderLeapCost(state); }
             public int meleeCost() { return mobMeleeCost(state); }
@@ -6872,6 +7921,40 @@ public final class ServerBattle {
             sendState();
             return;
         }
+        if (action.kind() == AiAction.Kind.GUARDIAN_SWIM) {
+            /* One water route for this family. The plan is re-proved node by node and edge by edge against the live
+               world before the body leaves its node, and the price is charged once, per edge, exactly like an
+               ordinary move: the edges it will not swim are given back, and movement never touches the success
+               counter. The beam itself is its own action, resolved only after the route really arrived and only when
+               the water it reached can still fire. */
+            List<GuardianMovement.Node> nodes = action.swim();
+            if (enemy.guardian == null || nodes.isEmpty() || enemy.swim != null
+                    || nodes.size() > guardianEdgeBudget(enemy) || !guardianRouteHolds(enemy, nodes)) {
+                advanceTurn();
+                return;
+            }
+            long total = (long) nodes.size() * enemy.moveCost;
+            if (total > enemy.ap) { advanceTurn(); return; }
+            enemy.ap -= (int) total;
+            enemy.swim = new SwimRun(nodes, (int) total, turnEpoch());
+            enemyPath = List.of();
+            enemyPathIndex = 0;
+            enemyStepping = false;
+            enemyMoving = true;
+            enemy.mob.setDeltaMovement(Vec3.ZERO);
+            enemy.mob.fallDistance = 0.0F;
+            journal.record("move", BattleText.translatable(BattleText.KEY_ENEMY_MOVE,
+                    BattleText.name(enemy.mob), BattleText.literal(nodes.get(nodes.size() - 1).cell().toString())));
+            if (DeveloperTrace.enabled()) {
+                StringBuilder route = new StringBuilder();
+                for (GuardianMovement.Node node : nodes) route.append(' ').append(node.cell());
+                Tactical.LOGGER.info("[Tactical] dev-trace guardian swim commit session={} tick={} uuid={} from={} "
+                                + "budget={} cost={} route={}", session.sessionId(), ticks, enemy.mob.getUUID(),
+                        enemy.guardian.cell(), guardianEdgeBudget(enemy), total, route);
+            }
+            sendState();
+            return;
+        }
         if (action.kind() == AiAction.Kind.SLIME_CONTACT) {
             /* One native contact: the server re-proves the locked opponent, the real attack box at those feet, the
                real eye line, the size's own damage ability and the frozen price, and charges only when the hurt
@@ -6910,6 +7993,15 @@ public final class ServerBattle {
                         enemy.mob.getUUID(), proposal.from(), proposal.landing(), cost, enemy.ap);
             }
             sendState();
+            return;
+        }
+        if (action.kind() == AiAction.Kind.GUARDIAN_BEAM) {
+            /* One native charged beam. The server re-proves the locked opponent, the held water node, vanilla's own
+               line of sight and distance band, the captured native goal and the frozen quote, then starts that body's
+               own goal - a target set through the native setter, the native pre-heat, the native charge, the two
+               native hits in vanilla's order. Nothing is charged here: the price is committed once, at settlement,
+               and only for a real hit. The beam owns the turn until it hands it back itself. */
+            if (!startGuardianBeam(enemy)) advanceTurn();
             return;
         }
         if (targetedAction(action.kind()) && targetLost(enemy)) {
@@ -7501,6 +8593,10 @@ public final class ServerBattle {
                 TacticalSkills.onTurnStart(this, enemy.mob);
                 BattleEffects.onTurnStart(enemy.mob);
                 if(!enemy.mob.isAlive()) {removeDeadEnemies();return;}
+                // An elder guardian's fatigue belongs to its own turn clock: the 1st, 7th, 13th own turn and nothing
+                // else. It runs after the effect clock so a freshly applied instance first baselines and is only
+                // charged a complete own cycle later.
+                pulseElderFatigue(enemy);
                 enemy.maxAp=TacticalAttributes.maxAp(enemy.mob);
                 enemy.moveCost=ApCalculator.moveCost(attribute(enemy.mob,Attributes.MOVEMENT_SPEED));
                 enemy.ap=ApCalculator.beginOwnTurnAp(enemy.ap,enemy.maxAp,TacticalAttributes.apRecovery(enemy.mob),!enemy.hasTakenTurn);
@@ -7668,6 +8764,7 @@ public final class ServerBattle {
                     releaseEndermanState(departed);
                     releaseSpiderState(departed);
                     releaseSlimeState(departed);
+                    releaseGuardianState(departed);
                     ai.remove(departed.mob);
                     // A departed unit gives up its ownership claim, but only this encounter's: another
                     // encounter's identical UUID or a same-UUID respawn must keep its own routing.
@@ -8433,6 +9530,12 @@ public final class ServerBattle {
         if (enemy == null || !enemy.mob.isAlive() || enemy.mob.isRemoved()) {
             terrainFall.end(unit.id());
             spiderFallFeet.remove(unit.id());
+            guardianFallFeet.remove(unit.id());
+            return;
+        }
+        Vec3 guardianHeld = guardianFallFeet.get(unit.id());
+        if (guardianHeld != null) {
+            stepFallingGuardian(unit, enemy, guardianHeld);
             return;
         }
         Vec3 slimeHeld = slimeFallFeet.get(unit.id());
@@ -8586,6 +9689,9 @@ public final class ServerBattle {
         moveEntity(enemy.mob, landing);
         // A landed spider holds the floor it really reached, not the wall it left.
         resyncSpiderSurface(enemy, landing);
+        // A landed guardian holds whichever legal water point it really reached, and none at all if the water it
+        // fell out of is gone.
+        resyncGuardianHold(enemy);
         settleFallDamage(enemy.mob, landing, cells);
         journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL,
                 BattleText.name(enemy.mob), BattleText.literal(origin.toString()),
@@ -8630,6 +9736,7 @@ public final class ServerBattle {
         terrainFall.end(unit.id());
         spiderFallFeet.remove(unit.id());
         slimeFallFeet.remove(unit.id());
+        guardianFallFeet.remove(unit.id());
         Tactical.LOGGER.error("[Tactical] forced fall did not settle within {} ticks: {} {} from {} at {} ({} cells); "
                         + "releasing it to vanilla physics", TerrainFall.TIMEOUT_TICKS,
                 unit.player() ? "player" : "mob", unit.id(), unit.origin(), unit.cell(), unit.cells());
@@ -8639,36 +9746,50 @@ public final class ServerBattle {
             PlayerMember member = members.get(unit.id());
             if (member != null) removeMember(member, reason);
         } else {
-            EnemyState enemy = enemies.get(unit.id());
-            if (enemy != null) {
-                String id = unit.id().toString();
-                boolean acting = id.equals(queue.current());
-                dropBlazeVolleyFor(unit.id(), enemy);
-                // A unit that disappears mid-fall also stops owning its trident and its throw pose.
-                DrownedTridents.clearOwner(this, unit.id());
-                releaseTridentPose(unit.id());
-                enemies.remove(unit.id());
-                queue.remove(id);
-                BattleEffects.forget(enemy.mob);
-                ai.remove(enemy.mob);
-                BattleManager.releaseActor(this, unit.id());
-                // A unit that leaves the battle this way must not keep this encounter's own pose seam or
-                // surface state: nothing of this encounter may still be pinning the body it gave back.
-                releaseEndermanState(enemy);
-                releaseSpiderState(enemy);
-                releaseSlimeState(enemy);
-                releaseWitchState(enemy);
-                enemy.mob.setNoAi(enemy.originalNoAi);
-                // A unit released this way is given back to vanilla physics with the same flags it arrived with:
-                // the borrowed persistence is not left on a body this encounter no longer owns.
-                ((com.tactical.neoforge.mixin.BattleMobPersistenceAccess) enemy.mob)
-                        .tactical$persistenceRequired(enemy.originalPersistenceRequired);
-                enemy.mob.setTarget(null);
-                enemy.mob.setDeltaMovement(Vec3.ZERO);
-                if (acting && !finished) advanceTurn();
-            }
+            boolean acting = leaveRoster(unit.id());
+            if (acting && !finished) advanceTurn();
         }
         if (!finished) sendState();
+    }
+
+    /**
+     * The one roster exit for a single unit: its slot, its queue entry, its claim, its borrowed flags and every
+     * family seam this encounter installed.
+     *
+     * <p>Used by the abnormal fall timeout and by this family's named no-water exit, so the two can never drift:
+     * a unit given back this way keeps its real position, its health and its own presence in the world, and gets
+     * exactly the flags it arrived with. Nothing is moved, healed or removed from the level.</p>
+     *
+     * @return true when that unit held the acting slot, so the caller advances the turn once
+     */
+    private boolean leaveRoster(UUID id) {
+        if (id == null) return false;
+        EnemyState enemy = enemies.get(id);
+        if (enemy == null) return false;
+        boolean acting = id.toString().equals(queue.current());
+        dropBlazeVolleyFor(id, enemy);
+        // A unit that leaves mid-fall also stops owning its trident and its throw pose.
+        DrownedTridents.clearOwner(this, id);
+        releaseTridentPose(id);
+        enemies.remove(id);
+        queue.remove(id.toString());
+        BattleEffects.forget(enemy.mob);
+        ai.remove(enemy.mob);
+        BattleManager.releaseActor(this, id);
+        // A unit given back must not keep this encounter's own seams: nothing of this encounter may still be
+        // pinning or moving the body it released.
+        releaseEndermanState(enemy);
+        releaseSpiderState(enemy);
+        releaseSlimeState(enemy);
+        releaseGuardianState(enemy);
+        releaseWitchState(enemy);
+        enemy.mob.setNoAi(enemy.originalNoAi);
+        // The borrowed persistence is not left on a body this encounter no longer owns.
+        ((com.tactical.neoforge.mixin.BattleMobPersistenceAccess) enemy.mob)
+                .tactical$persistenceRequired(enemy.originalPersistenceRequired);
+        enemy.mob.setTarget(null);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        return acting;
     }
 
     /**
@@ -8779,7 +9900,9 @@ public final class ServerBattle {
                      SpiderSurface.Node node, boolean moving, boolean alive, Vec3 feet,
                      boolean leaping, int leapFrames, boolean leapPaid, int leapsUsed,
                      GridPos leapLanding, SlimeGround.Node slime, boolean hopping,
-                     int hopEdges, int hopIndex, boolean hopEdgeStarted, int hopPrice) { }
+                     int hopEdges, int hopIndex, boolean hopEdgeStarted, int hopPrice,
+                     GuardianMovement.Node guardian, boolean swimming, int swimEdges, int swimIndex,
+                     boolean swimEdgeStarted, int swimPrice) { }
 
     /**
      * Fixture-only: set one enemy's own AP, so a deterministic case can prove a transaction whose pool changes
@@ -8808,9 +9931,141 @@ public final class ServerBattle {
         return true;
     }
 
+    /** Fixture-only: whether the shared fall really owns that unit right now. */
+    boolean fixtureFalling(UUID id) {
+        return id != null && terrainFall.unit(id) != null;
+    }
+
     /** Fixture-only readback: the bounded descent one tick of this family's fall may take. */
     double fixtureSubCellDescent() {
         return subCellDescent();
+    }
+
+    /**
+     * Fixture-only: whether this roster guardian could really fire its own native beam from where it holds.
+     *
+     * <p>The answer is the production one - the same real eye, the same native line of sight, the same distance
+     * gate - so a fixture can prove the near-gate difference between the two exact types without inventing a
+     * second geometry.</p>
+     */
+    boolean fixtureGuardianFires(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        if (state == null || state.guardian == null) return false;
+        return guardianFiresFrom(state, state.guardian);
+    }
+
+    /**
+     * Fixture-only: how many own turns this roster entry has really had.
+     *
+     * <p>The shared turn queue is an ATB charge order, so a fixture cannot assume that handing the player's turn
+     * over makes the unit under test act next. This counter is the authoritative answer to "has its own turn
+     * happened yet", and it only ever advances at that unit's own turn start.</p>
+     */
+    int fixtureOwnTurns(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        return state == null ? -1 : state.ownTurns;
+    }
+
+    /** Fixture-only: the cells of the water route this body is really swimming, or an empty list. */
+    List<GridPos> fixtureSwimRoute(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        if (state == null || state.swim == null) return List.of();
+        List<GridPos> cells = new ArrayList<>(state.swim.route.size());
+        for (GuardianMovement.Node node : state.swim.route) cells.add(node.cell());
+        return List.copyOf(cells);
+    }
+
+    /** Fixture-only: the water node this roster guardian really holds, or null. */
+    GuardianMovement.Node fixtureGuardianHere(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        return state == null ? null : state.guardian;
+    }
+
+    /** Fixture-only: whether this roster guardian is really charging its own native beam right now. */
+    boolean fixtureGuardianBeamBusy(UUID id) {
+        return guardianBeam != null && id != null && guardianBeam.actorId().equals(id);
+    }
+
+    /** Fixture-only: the frozen price of that guardian's running beam, or 0 when it is not beaming. */
+    int fixtureGuardianBeamPrice(UUID id) {
+        return guardianBeam != null && id != null && guardianBeam.actorId().equals(id) ? guardianBeam.price() : 0;
+    }
+
+    /** Fixture-only: that body's own native charge length, read from vanilla's {@code getAttackDuration()}. */
+    int fixtureGuardianCharge(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        return state != null && state.mob instanceof net.minecraft.world.entity.monster.Guardian guardian
+                ? guardian.getAttackDuration() : -1;
+    }
+
+    /** Fixture-only: put one enemy on a given paid-action count, so a surcharge can be proved in a real session. */
+    boolean fixtureEnemyPaid(UUID id, int paid) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        if (state == null) return false;
+        state.paidActions = Math.max(0, paid);
+        return true;
+    }
+
+    /** Fixture-only: the quote this actor would be charged for one beam now, surcharge included. */
+    int fixtureGuardianBeamCost(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        return state == null ? 0 : guardianBeamCost(state);
+    }
+
+    /**
+     * Fixture-only: whether this body really has the native attack goal the mod captured, still installed in its own
+     * goal selector.
+     *
+     * <p>Asked of the entity, not of this encounter's field: the object has to be in that body's selector as the very
+     * same instance, which is what makes "we drive the goal vanilla installed" provable instead of asserted.</p>
+     */
+    boolean fixtureGuardianGoalInstalled(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        if (state == null || !(state.mob instanceof net.minecraft.world.entity.monster.Guardian guardian)) return false;
+        return NativeBeamBridge.installedGoal(guardian) != null;
+    }
+
+    /** Fixture-only: vanilla's own synched attack-target bit, as the client's beam drawing reads it. */
+    boolean fixtureGuardianSyncedTarget(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        return state != null && state.mob instanceof net.minecraft.world.entity.monster.Guardian guardian
+                && guardian.hasActiveAttackTarget();
+    }
+
+    /** Fixture-only: the id the native beam presentation would draw to, or 0 when nothing is pointed at. */
+    int fixtureGuardianSyncedTargetId(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        if (state == null || !(state.mob instanceof net.minecraft.world.entity.monster.Guardian guardian)) return -1;
+        if (!guardian.hasActiveAttackTarget()) return 0;
+        LivingEntity target = guardian.getActiveAttackTarget();
+        return target == null ? -1 : target.getId();
+    }
+
+    /** Fixture-only: vanilla's own swimming bit, which the spikes and the tail animation answer to. */
+    boolean fixtureGuardianMoving(UUID id) {
+        EnemyState state = id == null ? null : enemies.get(id);
+        return state != null && state.mob instanceof net.minecraft.world.entity.monster.Guardian guardian
+                && guardian.isMoving();
+    }
+
+    /** Fixture-only: how many native beam stops really threw after a committed charge. */
+    int fixtureGuardianBeamStopFailures() {
+        return guardianBeamStopFailures;
+    }
+
+    /** Fixture-only: how many native beams this encounter has settled, for the once-only check. */
+    int fixtureGuardianBeamSettlements() {
+        return guardianBeamSettlements;
+    }
+
+    /** Fixture-only: how often vanilla's own spike decision was asked for this encounter's body. */
+    int fixtureGuardianThornsAsked() {
+        return thornsAsked;
+    }
+
+    /** Fixture-only: how many of those answers really let the native spike run. */
+    int fixtureGuardianThornsAllowed() {
+        return thornsAllowed;
     }
 
     /** Fixture-only: set one enemy's pool and report whether that exact unit was there to set it. */
@@ -8925,7 +10180,10 @@ public final class ServerBattle {
                 state.leap != null && state.leap.paid, state.spiderLeapsUsed,
                 proposal == null ? null : proposal.landing().cell(), state.slime, hop != null,
                 hop == null ? 0 : hop.route.size(), hop == null ? 0 : hop.index,
-                hop != null && hop.edgeStarted, hop == null ? 0 : hop.cost);
+                hop != null && hop.edgeStarted, hop == null ? 0 : hop.cost,
+                state.guardian, state.swim != null,
+                state.swim == null ? 0 : state.swim.route.size(), state.swim == null ? 0 : state.swim.index,
+                state.swim != null && state.swim.edgeStarted, state.swim == null ? 0 : state.swim.cost);
     }
 
     /**
@@ -8945,6 +10203,29 @@ public final class ServerBattle {
         boolean edgeStarted;
 
         HopRun(List<SlimeGround.Node> route, int cost, long epoch) {
+            this.route = route;
+            this.cost = cost;
+            this.epoch = epoch;
+        }
+    }
+
+    /**
+     * One water route in flight: the nodes it may still swim, the edge it is animating and what it already spent.
+     *
+     * <p>The price of the whole route was frozen and paid when it was committed, so a stop only has to give back
+     * the edges the body never started - never a price re-read from a changed {@code moveCost} - and an edge the
+     * body really began moving on stays paid.</p>
+     */
+    private static final class SwimRun {
+        final List<GuardianMovement.Node> route;
+        final int cost;
+        final long epoch;
+        int index;
+        GuardianMovement.Node to;
+        int frames;
+        boolean edgeStarted;
+
+        SwimRun(List<GuardianMovement.Node> route, int cost, long epoch) {
             this.route = route;
             this.cost = cost;
             this.epoch = epoch;
@@ -9335,6 +10616,8 @@ public final class ServerBattle {
         final float originalFallDistance;
         /** The blaze charge bit vanilla had at admission, kept only so a failed admission can give it back. */
         final boolean originalBlazeCharged;
+        /** This family's native attack pose at admission, kept only so a failed admission can give it back. */
+        GuardianNativePose.Snapshot originalGuardianPose;
         boolean skillUsed;
         GridPos cell;
         int ap;
@@ -9376,6 +10659,25 @@ public final class ServerBattle {
         boolean slimeRouteDone;
         long slimeRouteEpoch;
         int slimeRouteTurn;
+        /**
+         * The real water position this exact body holds, for the two vanilla guardian types only.
+         *
+         * <p>A guardian never stands on a floor: its position is a point under water whose feet are fractional and
+         * whose real eye has to stay submerged, so a cell alone cannot describe it - and a cell-only view would
+         * swim a 1.9975 block elder guardian through a tunnel only a 0.85 block body fits.</p>
+         */
+        GuardianMovement.Node guardian;
+        /** The swim route this own turn is really travelling, or null; it owns the turn until it arrives or stops. */
+        SwimRun swim;
+        /**
+         * The one bounded water route proposal of this own turn, cached with the turn and epoch it was resolved in.
+         * A getter re-asks the live world about this same proposal instead of scanning again, so planning,
+         * validation and the commit all name one immutable answer.
+         */
+        List<GuardianMovement.Node> guardianRoute;
+        boolean guardianRouteDone;
+        long guardianRouteEpoch;
+        int guardianRouteTurn;
         /**
          * The one bounded short-leap proposal of this own turn, cached with the turn and epoch it was resolved
          * in. A getter re-asks the live world about this same proposal instead of scanning for another one, so

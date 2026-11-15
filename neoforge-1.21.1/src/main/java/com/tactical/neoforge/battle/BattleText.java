@@ -70,6 +70,8 @@ public final class BattleText {
     public static final String KEY_ATTACK_ENEMY_FIREBALL = "tactical.journal.attack.enemy_fireball";
     /** One drowned trident throw: the entity's own native ranged attack, not a player throw. */
     public static final String KEY_ATTACK_ENEMY_TRIDENT = "tactical.journal.attack.enemy_trident";
+    /** One guardian beam: a single paid main action, charged once its own native hit really landed. */
+    public static final String KEY_ATTACK_ENEMY_BEAM = "tactical.journal.attack.enemy_beam";
     public static final String KEY_WEAPON_BOW = "tactical.journal.weapon.bow";
     public static final String KEY_WEAPON_CROSSBOW = "tactical.journal.weapon.crossbow";
 
@@ -97,6 +99,12 @@ public final class BattleText {
     public static final String KEY_ENEMY_FIREBALL_READY = "tactical.journal.enemy.fireball_ready";
     /** A salvo refused before any fireball existed: nothing was paid. */
     public static final String KEY_ENEMY_NO_FIREBALL = "tactical.journal.enemy.no_fireball";
+    /** The guardian's own native beam started charging; the number is that body's vanilla charge length. */
+    public static final String KEY_ENEMY_BEAM_CHARGE = "tactical.journal.enemy.beam_charge";
+    /** A beam that reached neither native hit, or that never launched: nothing was paid. */
+    public static final String KEY_ENEMY_NO_BEAM = "tactical.journal.enemy.no_beam";
+    /** One elder guardian's own-turn fatigue pulse really reached that many opposed members. */
+    public static final String KEY_ENEMY_ELDER_FATIGUE = "tactical.journal.enemy.elder_fatigue";
     public static final String KEY_ENEMY_RETARGET = "tactical.journal.enemy.retarget";
     public static final String KEY_ENEMY_ROCKET_UNSUPPORTED = "tactical.journal.enemy.rocket_unsupported";
     public static final String KEY_ENEMY_NO_THROW = "tactical.journal.enemy.no_throw";
@@ -165,6 +173,14 @@ public final class BattleText {
     public static final String KEY_REJECT_BUILD_LIMIT = "tactical.journal.reject.build_limit";
     /** The forced fall could not settle: this is an exception, never a successful landing. */
     public static final String KEY_FALL_ABANDONED = "tactical.journal.reject.fall_abandoned";
+    /**
+     * A held swimmer came down where there is no legal water left.
+     *
+     * <p>This is a named safe exit, not an exception: the encounter gives the unit back to the world with its own
+     * flags instead of freezing a body it can no longer place. It is deliberately a different row from
+     * {@link #KEY_FALL_ABANDONED}, which is the timeout.</p>
+     */
+    public static final String KEY_ENEMY_RELEASED_NO_WATER = "tactical.journal.enemy.released_no_water";
     public static final String KEY_REJECT_NO_ITEM = "tactical.journal.reject.no_item";
     public static final String KEY_REJECT_WEAPON_NOT_ITEM = "tactical.journal.reject.weapon_not_item";
     /** The item command never places: a block in hand belongs to the block command. */

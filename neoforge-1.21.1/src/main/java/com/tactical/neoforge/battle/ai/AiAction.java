@@ -12,7 +12,8 @@ import java.util.Objects;
 public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
                        ResourceLocation skill, SkillTarget skillTarget, WitchBrew brew,
                        DoorRoutePlanner.Door door, List<SpiderSurface.Node> surface,
-                       List<com.tactical.neoforge.battle.SlimeGround.Node> hop) {
+                       List<com.tactical.neoforge.battle.SlimeGround.Node> hop,
+                       List<com.tactical.neoforge.battle.GuardianMovement.Node> swim) {
     public enum Kind {
         MOVE, DIVE, MELEE, RANGED, SKILL, PREPARE_EXPLOSION, DETONATE, END_TURN,
         /** Drink one self-brew; ends the own turn and starts the shared drink cooldown. */
@@ -82,22 +83,44 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
          * generic swing, let a size-1 slime hit at one point of damage, and lose the native attack box that
          * really reaches across two cells for a large body.</p>
          */
-        SLIME_CONTACT
+        SLIME_CONTACT,
+        /**
+         * One swim route for the guardian family: real water nodes, one 3D neighbouring cell per edge.
+         *
+         * <p>Deliberately its own kind and never a plain {@code MOVE}: a {@link GridPos} is a floor cell, and a
+         * guardian holds a point under water with fractional feet, an eye that has to stay submerged and a body
+         * that is {@code 0.85} or {@code 1.9975} blocks wide. Flattening those nodes into cells would let a stale
+         * plan name a position the water no longer covers. The server re-proves every node, every swept edge and
+         * every animated frame against the live world, and charges per edge exactly as an ordinary move does.</p>
+         */
+        GUARDIAN_SWIM,
+        /**
+         * One native charged beam for the guardian family: that body's own attack goal, started and ticked once per
+         * server tick until its two native hits settle.
+         *
+         * <p>Deliberately its own kind and never a {@code RANGED}: a guardian's attack is not a bow, has no
+         * ammunition and no arrow, and its presentation is the native charge with the synched attack target and
+         * event {@code 21}. Routing it through the bow path would price it against a bow and validate it against a
+         * projectile that never exists. The intent carries nothing the server would trust - the opponent, the price
+         * and every geometry gate are re-resolved from the same state that charges the action - so a stale plan can
+         * never fire at a body this turn never locked.</p>
+         */
+        GUARDIAN_BEAM
     }
 
     /** Preserve existing adapters' constructors. */
-    public AiAction(Kind kind, List<GridPos> path) { this(kind, path, -1, null, null, null, null, null, null); }
-    public AiAction(Kind kind, List<GridPos> path, int attackIndex) { this(kind, path, attackIndex, null, null, null, null, null, null); }
+    public AiAction(Kind kind, List<GridPos> path) { this(kind, path, -1, null, null, null, null, null, null, null); }
+    public AiAction(Kind kind, List<GridPos> path, int attackIndex) { this(kind, path, attackIndex, null, null, null, null, null, null, null); }
     public AiAction(Kind kind, List<GridPos> path, int attackIndex, ResourceLocation skill, SkillTarget skillTarget) {
-        this(kind, path, attackIndex, skill, skillTarget, null, null, null, null);
+        this(kind, path, attackIndex, skill, skillTarget, null, null, null, null, null);
     }
     public AiAction(Kind kind, List<GridPos> path, int attackIndex, ResourceLocation skill, SkillTarget skillTarget,
                     WitchBrew brew) {
-        this(kind, path, attackIndex, skill, skillTarget, brew, null, null, null);
+        this(kind, path, attackIndex, skill, skillTarget, brew, null, null, null, null);
     }
     public AiAction(Kind kind, List<GridPos> path, int attackIndex, ResourceLocation skill, SkillTarget skillTarget,
                     WitchBrew brew, DoorRoutePlanner.Door door) {
-        this(kind, path, attackIndex, skill, skillTarget, brew, door, null, null);
+        this(kind, path, attackIndex, skill, skillTarget, brew, door, null, null, null);
     }
 
     public AiAction {
@@ -105,6 +128,7 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
         path = List.copyOf(path);
         surface = surface == null ? List.of() : List.copyOf(surface);
         hop = hop == null ? List.of() : List.copyOf(hop);
+        swim = swim == null ? List.of() : List.copyOf(swim);
         boolean moving = kind == Kind.MOVE || kind == Kind.DIVE;
         if (moving == path.isEmpty()) throw new IllegalArgumentException("Only MOVE/DIVE have a non-empty path");
         if (kind == Kind.SURFACE_MOVE ? surface.isEmpty() || !path.isEmpty() : !surface.isEmpty()) {
@@ -112,6 +136,9 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
         }
         if (kind == Kind.SLIME_HOP ? hop.isEmpty() || !path.isEmpty() : !hop.isEmpty()) {
             throw new IllegalArgumentException("Only SLIME_HOP carries a non-empty hop route, and it has no plain path");
+        }
+        if (kind == Kind.GUARDIAN_SWIM ? swim.isEmpty() || !path.isEmpty() : !swim.isEmpty()) {
+            throw new IllegalArgumentException("Only GUARDIAN_SWIM carries a non-empty water route, and it has no plain path");
         }
         if (kind == Kind.DIVE ? attackIndex < 0 || attackIndex >= path.size() - 1 : attackIndex != -1) {
             throw new IllegalArgumentException("DIVE requires a zero-based attack index followed by a return path");
@@ -166,7 +193,7 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
     public static AiAction endTurn() { return of(Kind.END_TURN); }
     /** One surface route (a spider's floor/wall nodes); the server owns every gate and every edge price. */
     public static AiAction surfaceMove(List<SpiderSurface.Node> route) {
-        return new AiAction(Kind.SURFACE_MOVE, List.of(), -1, null, null, null, null, route, null);
+        return new AiAction(Kind.SURFACE_MOVE, List.of(), -1, null, null, null, null, route, null, null);
     }
     /** One salvo at the opponent this own turn locked; the server owns charge, count and price. */
     public static AiAction fireballVolley() { return of(Kind.FIREBALL_VOLLEY); }
@@ -178,8 +205,14 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
     public static AiAction spiderLeap() { return of(Kind.SPIDER_LEAP); }
     /** One hop route for this family; the server owns the edges, the arcs, the price and every safety gate. */
     public static AiAction slimeHop(List<com.tactical.neoforge.battle.SlimeGround.Node> route) {
-        return new AiAction(Kind.SLIME_HOP, List.of(), -1, null, null, null, null, null, route);
+        return new AiAction(Kind.SLIME_HOP, List.of(), -1, null, null, null, null, null, route, null);
+    }
+    /** One water route for this family; the server owns every node, edge, frame, price and safety gate. */
+    public static AiAction guardianSwim(List<com.tactical.neoforge.battle.GuardianMovement.Node> route) {
+        return new AiAction(Kind.GUARDIAN_SWIM, List.of(), -1, null, null, null, null, null, null, route);
     }
     /** One native contact at the opponent this turn locked; the server owns every gate and the real hurt result. */
     public static AiAction slimeContact() { return of(Kind.SLIME_CONTACT); }
+    /** One native charged beam at the opponent this turn locked; the server owns the goal, the price and the receipt. */
+    public static AiAction guardianBeam() { return of(Kind.GUARDIAN_BEAM); }
 }

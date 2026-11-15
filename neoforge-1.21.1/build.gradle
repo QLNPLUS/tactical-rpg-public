@@ -182,6 +182,17 @@ neoForge {
             systemProperty 'tactical.selftest', 'slime'
             systemProperty 'tactical.dev.trace', 'true'
         }
+        // Guardian/elder-guardian fixture: own throwaway world and ephemeral port. A real underwater body, a real
+        // 1x1 water tunnel a 0.85 block body fits and a 1.9975 block body does not, a real 3D water route with a
+        // frozen per-edge price and a real interruption are only decidable on a booted server; it starts no client
+        // and touches no other fixture's world.
+        serverGuardianTest {
+            server()
+            gameDirectory = file('run-server-guardian-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'guardian'
+            systemProperty 'tactical.dev.trace', 'true'
+        }
         serverVindicatorTest {            server()
             gameDirectory = file('run-server-vindicator-test')
             systemProperty 'tactical.selftest', 'vindicator'

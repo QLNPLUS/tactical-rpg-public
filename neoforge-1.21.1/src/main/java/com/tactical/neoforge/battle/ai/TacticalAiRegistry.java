@@ -61,6 +61,15 @@ public final class TacticalAiRegistry {
                 ignored -> new SlimeTacticalAi());
         register(ResourceLocation.withDefaultNamespace("magma_cube"), EntityType.MAGMA_CUBE,
                 ignored -> new SlimeTacticalAi());
+        // Exact type only, and one registration each: a guardian and an elder guardian share vanilla's class but
+        // not its body, its charge or its near gate - a 1.9975 block elder cannot pass a one-block water tunnel a
+        // 0.85 block guardian fits, its native charge is 60 instead of 80 ticks, and it alone may fire from close
+        // range. Neither may inherit the other's answer, and no other swimmer gains either by sharing a
+        // superclass.
+        register(ResourceLocation.withDefaultNamespace("guardian"), EntityType.GUARDIAN,
+                ignored -> new GuardianTacticalAi());
+        register(ResourceLocation.withDefaultNamespace("elder_guardian"), EntityType.ELDER_GUARDIAN,
+                ignored -> new GuardianTacticalAi());
     }
 
     private TacticalAiRegistry() { }

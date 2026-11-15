@@ -124,6 +124,8 @@ public final class BattleAiSession {
             case MOVE, DIVE -> throw new IllegalArgumentException("Battle owner must animate MOVE/DIVE; never resolve DIVE as an instant attack");
             case SPIDER_LEAP -> throw new IllegalArgumentException("Battle owner must animate SPIDER_LEAP; never resolve a leap as an instant attack");
             case SLIME_HOP -> throw new IllegalArgumentException("Battle owner must animate SLIME_HOP; a hop is ordinary movement, never an instant attack");
+            case GUARDIAN_SWIM -> throw new IllegalArgumentException("Battle owner must animate GUARDIAN_SWIM; a water route is ordinary movement, never an instant attack");
+            case GUARDIAN_BEAM -> throw new IllegalArgumentException("Battle owner must own GUARDIAN_BEAM's native goal; a charged beam is never an instant attack");
             case MELEE -> context.attackPlayer();
             case RANGED -> context.rangedAttackPlayer();
             case DRINK_POTION -> {
@@ -309,6 +311,28 @@ public final class BattleAiSession {
                         + "route the live world no longer holds", context.actor().getUUID());
                 return AiAction.endTurn();
             }
+        }
+        if (action.kind() == AiAction.Kind.GUARDIAN_SWIM) {
+            // Only an actor with this family's own water policy may swim this way, the route has to hold in the
+            // live world node by node and edge by edge, and it may not cost more edges than the actor can still
+            // pay for while keeping one beam affordable. A refused route charges nothing and is never swum halfway.
+            int budget = context.guardianEdgeBudget();
+            if (!context.guardianContext() || context.guardianHere() == null || budget <= 0
+                    || action.swim().size() > budget || !context.guardianRouteHolds(action.swim())) {
+                Tactical.LOGGER.debug("[Tactical] AI water route rejected for {}: no water node, no budget or a "
+                        + "route the live world no longer holds", context.actor().getUUID());
+                return AiAction.endTurn();
+            }
+        }
+        if (action.kind() == AiAction.Kind.GUARDIAN_BEAM
+                && (!context.guardianContext() || context.guardianBeamCost() <= 0
+                || context.ap() < context.guardianBeamCost() || !context.guardianBeamReady())) {
+            // No policy, no price, a price the unit cannot pay, or a shot every live gate refuses: refused here,
+            // before the native goal is touched and before anything is charged. The turn is spent either way, so a
+            // body whose water or sight changed cannot retry the same launch on every tick of its own turn.
+            Tactical.LOGGER.debug("[Tactical] AI guardian beam rejected for {}: no policy, no affordable quote or a "
+                    + "shot the live world no longer allows", context.actor().getUUID());
+            return AiAction.endTurn();
         }
         if (action.kind() == AiAction.Kind.SLIME_CONTACT
                 && (!context.slimeContext() || context.slimeContactCost() <= 0

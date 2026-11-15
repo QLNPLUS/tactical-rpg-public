@@ -317,6 +317,95 @@ public interface AiContext {
     default boolean slimeContact() { return false; }
 
     /**
+     * Whether this context carries the guardian family's own water policy at all.
+     *
+     * <p>Asked before any of the answers below, because "no legal water position right now" and "this context
+     * knows nothing about guardians" are different facts. A context that does not carry the policy - a
+     * third-party adapter, an older fixture - answers false, and the guardian adapter then ends its turn instead
+     * of pretending a one-cell melee is its native charged beam.</p>
+     */
+    default boolean guardianContext() { return false; }
+
+    /** The real water position this body holds right now, or null when the encounter cannot prove one. */
+    default com.tactical.neoforge.battle.GuardianMovement.Node guardianHere() { return null; }
+
+    /**
+     * Every real water position this body may swim to in one bounded pass, with the same 3D sweep, body, eye,
+     * occupancy and zone gates the encounter's own movement uses.
+     */
+    default List<com.tactical.neoforge.battle.GuardianMovement.Node> guardianNeighbours(
+            com.tactical.neoforge.battle.GuardianMovement.Node from) {
+        return List.of();
+    }
+
+    /**
+     * Whether that whole route still holds in the live world: every node a real water body, every edge a real
+     * provable sweep, the whole body inside the battlefield and no cell another unit holds.
+     */
+    default boolean guardianRouteHolds(List<com.tactical.neoforge.battle.GuardianMovement.Node> route) {
+        return false;
+    }
+
+    /**
+     * How many water edges this actor may still pay for this own turn while keeping one beam affordable.
+     *
+     * <p>Read from the same AP and price the commit charges, so a planner can never propose a route the
+     * execution path then refuses halfway.</p>
+     */
+    default int guardianEdgeBudget() { return 0; }
+
+    /**
+     * This turn's one bounded water route to a position the beam could really be fired from, or an empty list
+     * when no legal progress exists.
+     *
+     * <p>Resolved from the live world with the same gates the commit re-checks, and cached for this own turn, so
+     * asking twice never re-scans. The answer may be a prefix that closes in without arriving - a legal step is
+     * better than standing still - and it never contains the opponent's own cell.</p>
+     */
+    default List<com.tactical.neoforge.battle.GuardianMovement.Node> guardianApproach() { return List.of(); }
+
+    /**
+     * Whether this actor's real eye at that node has a native line of sight to the locked opponent, inside the
+     * distance gate the two exact types really have.
+     *
+     * <p>An ordinary guardian keeps the vanilla near gate - it fires only from more than three blocks out - while
+     * the elder guardian has none. Both are bounded by the current follow range and by this battlefield.</p>
+     */
+    default boolean guardianFiresFrom(com.tactical.neoforge.battle.GuardianMovement.Node node) { return false; }
+
+    /**
+     * Quoted price of one native charged beam this own turn, or 0 for an actor with no such beam.
+     *
+     * <p>Read from the same server state that charges the action, including this actor's own shared surcharge for
+     * already successful actions, so a planner can never validate a beam the execution path then prices
+     * differently. The quote is frozen when the beam is launched and is never re-read afterwards.</p>
+     */
+    default int guardianBeamCost() { return 0; }
+
+    /**
+     * Whether this actor may really launch its one native beam right now.
+     *
+     * <p>True only when every gate holds at the same moment: this context carries the family's policy, the body
+     * still holds a legal water node, its real eye has vanilla's own line of sight to the locked opposed opponent at
+     * a distance both this type's gate and the current follow range accept, no action is in flight, and the frozen
+     * quote is affordable. A body that could not fire from where it is answers false and swims instead.</p>
+     */
+    default boolean guardianBeamReady() { return false; }
+
+    /**
+     * Launch that one native beam as this own turn's main action.
+     *
+     * <p>The server owns the single commit point: it re-proves the locked opponent, the water node, the native line
+     * of sight, the distance gate and the frozen price, points the body at that exact opponent, starts the goal
+     * vanilla itself installed and charges nothing until one of the goal's two real hits settled. The beam then owns
+     * the turn until its settlement hands it back, so no generic melee and no second beam can be inserted after
+     * it.</p>
+     *
+     * @return true when a real native beam really started
+     */
+    default boolean guardianBeam() { return false; }
+
+    /**
      * The legacy text outlet: this mod keeps it as literal text, never as a translation key.
      *
      * <p>A third-party adapter that only knows how to write a finished sentence keeps working, and its
