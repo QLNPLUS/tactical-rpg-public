@@ -40,7 +40,7 @@ class BattleLogProtocolTest {
         assertNotEquals(TacticalNetwork.PROTOCOL, BattleLogNetwork.PROTOCOL,
                 "the three channels are versioned independently on purpose");
         assertNotEquals(SkillNetwork.PROTOCOL, BattleLogNetwork.PROTOCOL);
-        assertEquals("12", TacticalNetwork.PROTOCOL, "an unrelated channel keeps its own version");
+        assertEquals("13", TacticalNetwork.PROTOCOL, "an unrelated channel keeps its own version");
         assertEquals("4", SkillNetwork.PROTOCOL, "an unrelated channel keeps its own version");
     }
 

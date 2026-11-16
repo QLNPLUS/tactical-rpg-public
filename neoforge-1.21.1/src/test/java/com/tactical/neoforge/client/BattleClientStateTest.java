@@ -24,6 +24,7 @@ class BattleClientStateTest {
         BattleClientState.moving=true; BattleClientState.actorEntityId=42; BattleClientState.actionCount=8;
         BattleClientState.defending=true; BattleClientState.mode=BattleMode.MOVE; BattleClientState.selectedSlot=4;
         BattleClientState.participantHealth.put(42,new int[]{1,20});
+        BattleClientState.participantLevels.put(42,3);
         BattleClientState.dirty=false;
         for(int i=0;i<2;i++) {
             BattleClientState.clear();
@@ -33,6 +34,10 @@ class BattleClientStateTest {
             assertEquals(0,BattleClientState.ap+BattleClientState.maxAp+BattleClientState.moveCost);
             assertEquals(new GridPos(0,0,0),BattleClientState.playerCell());
             assertTrue(BattleClientState.reachable.isEmpty());assertTrue(BattleClientState.participantHealth.isEmpty());
+            assertTrue(BattleClientState.participantLevels.isEmpty(),
+                    "a level never outlives the encounter that published it");
+            assertEquals(com.tactical.neoforge.battle.BattleLevelTable.NONE,BattleClientState.levelOf(42),
+                    "after an exit nothing has a level to show");
             assertEquals("",BattleClientState.actor.getString(),"the mirror keeps structure, not text");
             assertTrue(BattleClientState.order.isEmpty());assertEquals(0,BattleClientState.gauges.length);
             assertEquals(0,BattleClientState.cursor);assertEquals("",BattleClientState.weapon.getString());

@@ -328,8 +328,18 @@ public final class NativeHud {
     static RosterRowText.Arrangement arrange(Minecraft minecraft, HudModel.RosterRow row, int nameBudget,
                                              int maxNameLines, double scale) {
         String chip = row.current() ? ClientText.get(JournalLabels.ACTING) : "";
-        return RosterRowText.arrange(row.name(), chip, row.health(), nameBudget, maxNameLines,
-                scale, minecraft.font::width);
+        return RosterRowText.arrange(row.name(), levelSuffix(row.level()), chip, row.health(), nameBudget,
+                maxNameLines, scale, minecraft.font::width);
+    }
+
+    /**
+     * The compact level suffix in this client's language, or an empty string when this unit has none.
+     *
+     * <p>Measurement and painting both ask this in the same frame, so a language switch re-measures the row
+     * rather than leaving a suffix wider than the space that was reserved for it.</p>
+     */
+    static String levelSuffix(int level) {
+        return LevelSuffix.of(ClientText.get(ClientText.Keys.HUD_LEVEL_LABEL), level);
     }
 
     /**
@@ -818,8 +828,18 @@ public final class NativeHud {
         Draw.scaledText(graphics, font, roundNumber, title.x() + textWidth(font, roundLabel), titleY, scale,
                 Slate.TEXT);
         // "Round n" stays whole; the actor's name is what gives way, with a real gap left between them.
-        String actor = vitals.hasActor() ? vitals.actorName() : ClientText.get(ClientText.Keys.HUD_ACTOR_WAITING);
+        // The actor's own level is the tail of that name: it is measured with it and kept while the name in
+        // front of it is what the ellipsis eats, so a long custom name never costs the real number.
         int actorBudget = Math.max(1, title.right() - (title.x() + roundWidth) - Scale.effectivePx(6, scale));
+        String actor;
+        if (!vitals.hasActor()) {
+            actor = ClientText.get(ClientText.Keys.HUD_ACTOR_WAITING);
+        } else {
+            String suffix = levelSuffix(vitals.actorLevel());
+            actor = suffix.isEmpty() ? vitals.actorName()
+                    : com.tactical.neoforge.client.ui.layout.TextMetrics.ellipsisKeepingTail(vitals.actorName(),
+                            suffix, actorBudget, scale, font::width);
+        }
         int actorWidth = textWidth(font, actor);
         if (actorWidth > actorBudget) {
             actor = ellipsis(font, actor, actorBudget);
@@ -932,7 +952,10 @@ public final class NativeHud {
         int nameX = box.x() + Scale.effectivePx(HudLayout.ROSTER_NAME_LEFT, scale);
         RosterRowText.Arrangement arrangement = arrange(minecraft(), data, layout.rosterNameBudget(),
                 layout.rosterNameLineCap(), scale);
-        ROW_TEXT.put(id, new String[]{data.name(), String.join(" ", arrangement.nameLines())});
+        // The tooltip is the untruncated truth of this row: the whole raw name and the real level, whatever
+        // the row itself could fit. It is only worth showing when the row really drew less than that.
+        ROW_TEXT.put(id, new String[]{LevelSuffix.join(data.name(), ClientText.get(ClientText.Keys.HUD_LEVEL_LABEL),
+                data.level()), String.join(" ", arrangement.nameLines())});
         int lineHeight = Scale.effectivePx(Motion.LINE, scale);
         int textTop = box.y() + Scale.effectivePx(3, scale);
         int right = box.right() - Scale.effectivePx(2, scale);
@@ -1248,17 +1271,15 @@ public final class NativeHud {
         TWEEN.hovered(hoveredId, lastFrame);
         if (!TWEEN.tooltipDue(now)) return;
         String full = null;
+        String secondary = null;
         Rect trigger = Rect.EMPTY;
         if (hoveredId.startsWith("roster-")) {
             String[] recorded = ROW_TEXT.get(hoveredId);
-            // A row that cannot be chosen states why, even when its name was not cut.
-            if (!hoverBlocked.isEmpty()) {
-                full = hoverBlocked;
-            } else if (recorded == null || recorded[0].equals(recorded[1])) {
-                return;
-            } else {
-                full = recorded[0];
-            }
+            String[] text = RosterRowText.tooltip(recorded == null ? null : recorded[0],
+                    recorded == null ? null : recorded[1], hoverBlocked);
+            full = text[0];
+            secondary = text[1];
+            if (full.isEmpty()) return;
             int id;
             try {
                 id = Integer.parseInt(hoveredId.substring("roster-".length()));
@@ -1311,7 +1332,7 @@ public final class NativeHud {
         if (full == null || full.isEmpty() || trigger.w() <= 0) return;
         Font font = minecraft().font;
         double scale = layout.scale();
-        Tooltip.Content content = Tooltip.content(full, null, scale, font::width);
+        Tooltip.Content content = Tooltip.content(full, secondary, scale, font::width);
         if (content.isEmpty()) return;
         int boxWidth = Tooltip.width(content, scale, font::width);
         int boxHeight = Tooltip.height(content, scale);
@@ -1328,6 +1349,12 @@ public final class NativeHud {
         for (String line : content.primary()) {
             Draw.scaledText(graphics, font, line, Tooltip.textLeft(box, scale), lineY, scale,
                     Motion.withAlpha(Slate.TEXT, fade));
+            drawn.add(line);
+            lineY += Scale.effectivePx(Motion.LINE, scale);
+        }
+        for (String line : content.secondary()) {
+            Draw.scaledText(graphics, font, line, Tooltip.textLeft(box, scale), lineY, scale,
+                    Motion.withAlpha(Slate.TEXT2, fade));
             drawn.add(line);
             lineY += Scale.effectivePx(Motion.LINE, scale);
         }

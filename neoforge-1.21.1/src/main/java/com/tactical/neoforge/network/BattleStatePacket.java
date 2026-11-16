@@ -32,9 +32,10 @@ import java.util.UUID;
  * <p>Every count inside the body is checked before anything is allocated: the two per-person arrays keep
  * the legacy 256 limit, the reachable set is bounded by the built-in zone geometry (the largest radius and
  * half height this mod can be configured with, which is a <em>network</em> ceiling and never changes what
- * the game itself offers), and the participant list is counted in whole {@code (entityId, hp, maxHp)}
- * triples. A declared count also has to fit the bytes that remain in the body, so a hostile header cannot
- * ask for an allocation it did not pay for.</p>
+ * the game itself offers), the participant list is counted in whole {@code (entityId, hp, maxHp)}
+ * triples, and the level projection is counted in {@code (entityId, displayLevel)} pairs that must name
+ * participants of this same snapshot. A declared count also has to fit the bytes that remain in the body, so
+ * a hostile header cannot ask for an allocation it did not pay for.</p>
  */
 public record BattleStatePacket(
         boolean active,
@@ -92,7 +93,18 @@ public record BattleStatePacket(
          * projection. At most one reachable set is ever on the wire: while commanding, the {@link #reachable}
          * array carries the companion's cells.</p>
          */
-        Command command
+        Command command,
+        /**
+         * The bounded {@code (entityId, displayLevel)} pairs of this encounter, or nothing at all.
+         *
+         * <p>Every id belongs to this participant list and appears at most once. A positive value is a real
+         * displayed level: a player's own Tactical character level, or a creature's Advanced-Leveling level.
+         * {@link com.tactical.neoforge.battle.BattleLevelTable#UNKNOWN} is a player whose own profile could not
+         * be read - explicitly unknown, never a level 1 the server invented. An absent entry is the whole
+         * answer for "nothing to show here": no optional mod, a hidden creature, or an unusable stored level.
+         * The table is a display projection only; it can change nothing about the fight.</p>
+         */
+        int[] entityLevels
 ) implements CustomPacketPayload, MemberScoped {
 
     /**
@@ -184,10 +196,22 @@ public record BattleStatePacket(
      */
     public static final int MAX_PARTICIPANT_INTS = 3 * 4096;
 
+    /**
+     * Largest level table one body may declare, as {@code (entityId, displayLevel)} pairs.
+     *
+     * <p>It is the same entity ceiling the participant list uses, so a table can never claim more rows than
+     * there are participants to name even if a header were hostile.</p>
+     */
+    public static final int MAX_LEVEL_PAIRS = 4096;
+
+    /** Largest level table one body may declare, in whole ints. */
+    public static final int MAX_LEVEL_INTS = 2 * MAX_LEVEL_PAIRS;
+
     public BattleStatePacket {
         actor = actor == null ? Component.empty() : actor;
         weapon = weapon == null ? Component.empty() : weapon;
         command = command == null ? Command.NONE : command;
+        entityLevels = entityLevels == null ? new int[0] : entityLevels;
         order = order == null ? List.of() : List.copyOf(order);
         if (order.size() > MAX_PER_PERSON) throw new IllegalArgumentException("Too many turn-order rows");
         if (turnEntityIds != null) {
@@ -211,6 +235,28 @@ public record BattleStatePacket(
         if (reachable != null && reachable.length % 3 != 0) {
             throw new IllegalArgumentException("Reachable array is not a whole number of cells");
         }
+        // The level table is a projection of the participants, so it is checked against them: whole pairs,
+        // non-negative ids and levels, no id twice, and no id that this encounter does not hold. A body that
+        // disagrees with its own participant list is refused before anything is stored or allocated.
+        if (entityLevels.length % 2 != 0) {
+            throw new IllegalArgumentException("Level table is not a whole number of pairs");
+        }
+        if (entityLevels.length > MAX_LEVEL_INTS) throw new IllegalArgumentException("Too many level rows");
+        if (entityLevels.length > 0) {
+            java.util.Set<Integer> held = new java.util.HashSet<>();
+            if (participants != null) {
+                for (int index = 0; index + 2 < participants.length; index += 3) held.add(participants[index]);
+            }
+            java.util.Set<Integer> seen = new java.util.HashSet<>();
+            for (int index = 0; index < entityLevels.length; index += 2) {
+                int entityId = entityLevels[index];
+                int level = entityLevels[index + 1];
+                if (entityId < 0) throw new IllegalArgumentException("Negative level entity id");
+                if (level < 0) throw new IllegalArgumentException("Negative display level");
+                if (!seen.add(entityId)) throw new IllegalArgumentException("Duplicate level entity id");
+                if (!held.contains(entityId)) throw new IllegalArgumentException("Level for a non-participant");
+            }
+        }
     }
 
     /**
@@ -229,7 +275,8 @@ public record BattleStatePacket(
         this(active,phase,round,ap,maxAp,moveCost,playerX,playerY,playerZ,reachable,actor,order,cursor,weapon,
             weaponKind,weaponRange,centerX,centerY,centerZ,zoneRadius,moving,actorEntityId,participants,gauges,
             actionCount,defending,turnEntityIds,attackCost,itemCost,placeCost,breakCost,apRecovery,paidActionCount,
-            terrainFalling,sessionId,turnEpoch,membershipServerEpoch,membershipGeneration,Command.NONE);
+            terrainFalling,sessionId,turnEpoch,membershipServerEpoch,membershipGeneration,Command.NONE,
+            new int[0]);
     }
 
     /** Source-compatible constructor for snapshots that do not supply action quotes. */
@@ -377,6 +424,10 @@ public record BattleStatePacket(
         // server instance it belongs to, so a restarted server is not mistaken for a stale packet.
         body.writeVarLong(packet.membershipServerEpoch);
         body.writeVarLong(packet.membershipGeneration);
+        // The level projection follows every scalar and stamp, and still precedes the command block, which
+        // stays the last block on the wire: a reader that stops at the levels has seen the whole older body.
+        body.writeVarInt(packet.entityLevels.length);
+        for (int value : packet.entityLevels) body.writeVarInt(value);
         writeCommand(body, packet.command);
     }
 
@@ -505,6 +556,10 @@ public record BattleStatePacket(
         long turnEpoch = body.readVarLong();
         long membershipServerEpoch = body.readVarLong();
         long membershipGeneration = body.readVarLong();
+        int levelCount = count(body, MAX_LEVEL_INTS, "entity levels");
+        if (levelCount % 2 != 0) throw new IllegalArgumentException("Level count is not a whole number of pairs");
+        int[] entityLevels = new int[levelCount];
+        for (int index = 0; index < levelCount; index++) entityLevels[index] = body.readVarInt();
         Command command = readCommand(body);
         return new BattleStatePacket(active, phase, round, ap, maxAp, moveCost,
                 playerX, playerY, playerZ, reachable, actor, order, cursor,
@@ -512,7 +567,7 @@ public record BattleStatePacket(
                 moving, actorEntityId, participants, gauges, actionCount, defending, turnEntityIds,
                 attackCost, itemCost, placeCost, breakCost, recovery, paidActions, terrainFalling,
                 sessionId, turnEpoch,
-                membershipServerEpoch, membershipGeneration, command);
+                membershipServerEpoch, membershipGeneration, command, entityLevels);
     }
 
     /**
@@ -590,7 +645,7 @@ public record BattleStatePacket(
                 actor,order,cursor,weapon,weaponKind,weaponRange,centerX,centerY,centerZ,zoneRadius,moving,
                 actorEntityId,participants,gauges,actionCount,defending,turnEntityIds,attackCost,itemCost,
                 placeCost,breakCost,apRecovery,paidActionCount,terrainFalling,sessionId,turnEpoch,serverEpoch,
-                generation,command);
+                generation,command,entityLevels);
     }
 
     @Override

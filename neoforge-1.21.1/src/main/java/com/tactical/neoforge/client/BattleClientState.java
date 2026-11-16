@@ -73,6 +73,17 @@ public final class BattleClientState {
     public static int selectedSlot = -1;
     public static final java.util.Map<Integer, int[]> participantHealth = new java.util.LinkedHashMap<>();
     /**
+     * The encounter's own display levels, by entity id, exactly as the server published them.
+     *
+     * <p>An entry is a number this battle really has: a positive player level, a positive creature level, or
+     * {@code 0} for a player whose own profile never produced one. An entity with no entry has nothing to
+     * show, and that is a different statement from an unknown level - so the HUD never invents a number and
+     * never invents an empty placeholder either. Every authoritative snapshot replaces this map rather than
+     * merging into it, and every lifecycle clear drops it, so a level can never outlive the encounter, the
+     * membership or the connection that produced it.</p>
+     */
+    public static final java.util.Map<Integer, Integer> participantLevels = new java.util.LinkedHashMap<>();
+    /**
      * The command projection of the companion this client may order right now, or {@link Command#NONE}.
      *
      * <p>It is a separate block from the player's own state on purpose: {@link #ap}, {@link #playerX} and the
@@ -146,6 +157,13 @@ public final class BattleClientState {
         for (int i = 0; i + 2 < participants.length; i += 3) {
             participantHealth.put(participants[i], new int[]{participants[i + 1], participants[i + 2]});
         }
+        // The new snapshot's table is the whole truth: an entry the server no longer sends is gone, so a
+        // creature that became hidden or a player who left cannot keep an older row's number.
+        participantLevels.clear();
+        int[] levels = packet.entityLevels();
+        for (int i = 0; i + 1 < levels.length; i += 2) {
+            participantLevels.put(levels[i], levels[i + 1]);
+        }
         dirty = true;
         return true;
     }
@@ -214,7 +232,21 @@ public final class BattleClientState {
         blockEntry = false;
         selectedSlot = -1;
         participantHealth.clear();
+        participantLevels.clear();
         dirty = true;
+    }
+
+    /**
+     * One entity's level in this encounter, or {@link com.tactical.neoforge.battle.BattleLevelTable#NONE}
+     * when it has none to show.
+     *
+     * <p>The lookup is the encounter's own published table and nothing else: a bystander, another battle, a
+     * client-side guess from vanilla experience and a stored value read from the world are all outside what
+     * this can answer.</p>
+     */
+    public static int levelOf(int entityId) {
+        Integer level = participantLevels.get(entityId);
+        return level == null ? com.tactical.neoforge.battle.BattleLevelTable.NONE : level;
     }
 
     /**

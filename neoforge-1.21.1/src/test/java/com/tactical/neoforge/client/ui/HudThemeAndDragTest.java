@@ -8,6 +8,7 @@ import com.tactical.neoforge.client.ui.hud.RosterRowText;
 import com.tactical.neoforge.client.ui.layout.Rect;
 import com.tactical.neoforge.client.ui.layout.Scale;
 import com.tactical.neoforge.client.ui.layout.TextMetrics;
+import com.tactical.neoforge.client.ui.theme.Motion;
 import com.tactical.neoforge.client.ui.theme.Palette;
 import com.tactical.neoforge.client.ui.theme.Slate;
 import org.junit.jupiter.api.Test;
@@ -90,11 +91,11 @@ class HudThemeAndDragTest {
     // ------------------------------------------------------------------ roster text
 
     @Test void aLongNameWrapsAndTheInformationJoinsTheLastLine() {
-        RosterRowText.Arrangement shortName = RosterRowText.arrange("Ann", "行动中", "20 / 20", 60, 3, 1.0D, MEASURE);
+        RosterRowText.Arrangement shortName = RosterRowText.arrange("Ann", "", "行动中", "20 / 20", 60, 3, 1.0D, MEASURE);
         assertTrue(shortName.infoMerged(), "a short name keeps the single-line look");
         assertEquals(1, shortName.textLines());
 
-        RosterRowText.Arrangement longName = RosterRowText.arrange("A very long participant name", "行动中",
+        RosterRowText.Arrangement longName = RosterRowText.arrange("A very long participant name", "", "行动中",
                 "20 / 20", 20, 3, 1.0D, MEASURE);
         assertTrue(longName.nameLines().size() > 1, "the name wraps at the real width");
         assertFalse(longName.infoMerged(), "nothing fits beside a full line");
@@ -102,7 +103,7 @@ class HudThemeAndDragTest {
     }
 
     @Test void theThirdLineIsCutAndTheRestIsATooltipOnly() {
-        RosterRowText.Arrangement tiny = RosterRowText.arrange("abcdefghijklmnopqrstuvwxyz", "", "1 / 1", 4, 3,
+        RosterRowText.Arrangement tiny = RosterRowText.arrange("abcdefghijklmnopqrstuvwxyz", "", "", "1 / 1", 4, 3,
                 1.0D, MEASURE);
         assertEquals(3, tiny.nameLines().size(), "at most three name lines");
         assertTrue(tiny.truncated());
@@ -334,24 +335,28 @@ class HudThemeAndDragTest {
         // Raw widths: 18 + gap 4 + 42 = 64. At 115% the real pieces are 21 + 5 + 49 = 75, so a 70-pixel
         // budget can only hold the single-line form if the comparison ignores the preset - which is
         // exactly the overlap R5 reported.
-        RosterRowText.Arrangement tight115 = RosterRowText.arrange(name, "", health, 70, 3, 1.15D, measure);
+        RosterRowText.Arrangement tight115 = RosterRowText.arrange(name, "", "", health, 70, 3, 1.15D, measure);
         assertFalse(tight115.infoMerged(), "at 115% the name and the health do not fit one 70-pixel line");
         // At 80% the same budget really does hold them: 15 + 3 + 34 = 52.
-        RosterRowText.Arrangement loose80 = RosterRowText.arrange(name, "", health, 60, 3, 0.8D, measure);
+        RosterRowText.Arrangement loose80 = RosterRowText.arrange(name, "", "", health, 60, 3, 0.8D, measure);
         assertTrue(loose80.infoMerged(), "at 80% the information belongs on the name's line");
-        // And whenever the merge is claimed, the scaled pieces really fit the budget.
+        // And whenever the merge is claimed, the scaled pieces really fit the budget - including the chip's
+        // own two painted sides, which is what the row actually draws.
         for (double scale : new double[]{0.8D, 1.0D, 1.15D}) {
             for (int budget = 40; budget <= 200; budget += 2) {
-                RosterRowText.Arrangement arrangement = RosterRowText.arrange(name, "行动中", health, budget, 3,
+                RosterRowText.Arrangement arrangement = RosterRowText.arrange(name, "", "行动中", health, budget, 3,
                         scale, measure);
                 if (!arrangement.infoMerged()) continue;
                 int merged = TextMetrics.width(measure.applyAsInt(arrangement.lastLine()), scale)
                         + Scale.effectivePx(RosterRowText.CHIP_GAP, scale)
                         + TextMetrics.width(measure.applyAsInt(arrangement.chip()), scale)
+                        + Scale.effectivePx(Motion.CHIP_PAD_X, scale) * 2
                         + Scale.effectivePx(RosterRowText.HEALTH_GAP, scale)
                         + TextMetrics.width(measure.applyAsInt(arrangement.health()), scale);
                 assertTrue(merged <= budget, "a merged line at " + scale + " with budget " + budget
                         + " needs " + merged + " pixels");
+                assertEquals(merged, arrangement.mergedWidth(),
+                        "the arrangement reports the box the painter really draws");
             }
         }
     }

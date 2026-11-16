@@ -38,7 +38,7 @@ class CompanionProjectionTest {
                 List.of(Component.translatable("entity.minecraft.wolf")), 0,
                 Component.translatable(BattleText.KEY_EMPTY_HAND), 0, 0, 0, 99, 0, 24, false, 913,
                 new int[]{913, 20, 40}, new int[]{100}, 1, false, new int[]{913}, 10, 8, 10, 13, 50, 2,
-                false, SESSION, 7L, 0L, 0L, command);
+                false, SESSION, 7L, 0L, 0L, command, new int[0]);
     }
 
     @Test

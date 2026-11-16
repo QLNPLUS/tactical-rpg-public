@@ -36,12 +36,46 @@ class ClientLifecycleRetirementTest {
     private static final long SERVER = 4242L;
 
     private static BattleStatePacket state(UUID session, long generation, long epoch) {
+        return state(session, generation, epoch, new int[0]);
+    }
+
+    /** The same snapshot, carrying the encounter's own level projection. */
+    private static BattleStatePacket state(UUID session, long generation, long epoch, int[] levels) {
         return new BattleStatePacket(true, 2, (int) epoch + 1, 80, 150, 10,
                 0, 64, 0, new int[]{0, 64, 0}, net.minecraft.network.chat.Component.literal("actor"),
                 List.of(net.minecraft.network.chat.Component.literal("actor")), 1,
-                net.minecraft.network.chat.Component.literal("sword"), 0, 0, 0, 64, 0, 24, false, 100, new int[]{100, 20, 20}, new int[]{50},
-                1, false, new int[]{100},
-                10, 8, 10, 10, 50, 0, false,session, epoch, SERVER, generation);
+                net.minecraft.network.chat.Component.literal("sword"), 0, 0, 0, 64, 0, 24, false, 100,
+                new int[]{100, 20, 20, 55, 10, 10}, new int[]{50}, 1, false, new int[]{100},
+                10, 8, 10, 10, 50, 0, false, session, epoch, SERVER, generation, BattleStatePacket.Command.NONE,
+                levels);
+    }
+
+    /**
+     * A level belongs to the snapshot that published it, never to the client that remembers it.
+     *
+     * <p>A new authoritative snapshot replaces the whole table, so a number the server no longer sends is
+     * gone rather than stale, and an exit clears the table outright.</p>
+     */
+    @Test
+    void aLevelNeverOutlivesTheSnapshotOrTheMembershipThatPublishedIt() {
+        BattleClientLifecycle.environmentForTesting(environment);
+        UUID session = UUID.randomUUID();
+        BattleClientLifecycle.accept(state(session, 5L, 1L, new int[]{100, 4, 55, 0}));
+        assertEquals(4, BattleClientState.levelOf(100), "a player's own level arrives with the snapshot");
+        assertEquals(0, BattleClientState.levelOf(55), "an unusable profile is the explicit unknown");
+        assertEquals(com.tactical.neoforge.battle.BattleLevelTable.NONE, BattleClientState.levelOf(77),
+                "an entity this snapshot says nothing about has no level to show");
+
+        // The next snapshot of the same membership simply does not carry one of them any more.
+        BattleClientLifecycle.accept(state(session, 5L, 2L, new int[]{100, 5}));
+        assertEquals(5, BattleClientState.levelOf(100), "a newer number replaces the old one");
+        assertEquals(com.tactical.neoforge.battle.BattleLevelTable.NONE, BattleClientState.levelOf(55),
+                "a row the server stopped sending is gone, not stale");
+
+        BattleClientLifecycle.accept(exit(session, 6L));
+        assertTrue(BattleClientState.participantLevels.isEmpty(),
+                "leaving the encounter drops its levels with everything else it published");
+        assertEquals(com.tactical.neoforge.battle.BattleLevelTable.NONE, BattleClientState.levelOf(100));
     }
 
     private static BattleStatePacket exit(UUID session, long generation) {

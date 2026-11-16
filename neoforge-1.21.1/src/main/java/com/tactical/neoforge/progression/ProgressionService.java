@@ -121,8 +121,10 @@ public final class ProgressionService {
             // store the record and give the XP back if that store fails.
             if (commit(player, rules, profile, next, spent, false) != Commit.COMMITTED)
                 return answer(player, requestId, false, rules, profile, ProgressionReason.SERVER_ERROR, null, false);
-            // The transaction is durable from here on. If the fresh numbers cannot be read back, the answer
-            // says so while still carrying the revision it really reached - never a failure that invites a retry.
+            // The transaction is durable from here on. A battle this player is in republishes the snapshot it
+            // can already see - now including the new character level - and, exactly like an allocation, that
+            // republish can never turn the commit into a failure.
+            refreshBattleGrowth(player);
             return answer(player, requestId, false, rules, next, mutationRefusal(player), null, false);
         } catch (RuntimeException unexpected) {
             return failed(player, requestId, false, rules, "upgrade", unexpected);
@@ -257,11 +259,15 @@ public final class ProgressionService {
     }
 
     /**
-     * Republishes the caps a committed allocation moved, for the encounter this player is fighting in.
+     * Republishes the state a committed character change made visible, for the encounter this player is
+     * fighting in.
      *
-     * <p>Deliberately forgiving: the commit is already durable, so a battle that cannot refresh must not turn
-     * a successful allocation into an answer that looks like a failure and invites a retry. Nothing is rolled
-     * back and nothing is replayed; the failure is logged and the answer tells the truth about the profile.</p>
+     * <p>Two commits use it: an allocation, whose caps and charge rate moved, and a level-up, whose own
+     * character level moved. Deliberately forgiving: the commit is already durable, so a battle that cannot
+     * refresh must not turn a successful change into an answer that looks like a failure and invites a retry.
+     * Nothing is rolled back, nothing is replayed, no experience or point is spent again, and no attribute is
+     * touched merely so a level can be drawn - the failure is logged and the answer tells the truth about the
+     * profile.</p>
      */
     private static void refreshBattleGrowth(ServerPlayer player) {
         if (player == null) return;
@@ -269,8 +275,8 @@ public final class ProgressionService {
             com.tactical.neoforge.battle.ServerBattle battle = BattleManager.containing(player);
             if (battle != null) battle.refreshGrowth(player);
         } catch (RuntimeException unreadable) {
-            Tactical.LOGGER.error("[Tactical] the battle could not republish the growth of {}; the allocation "
-                    + "itself is already stored", player.getUUID(), unreadable);
+            Tactical.LOGGER.error("[Tactical] the battle could not republish the growth of {}; the committed "
+                    + "character change itself is already stored", player.getUUID(), unreadable);
         }
     }
 

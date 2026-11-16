@@ -77,10 +77,10 @@ class UseItemTargetPacketTest {
     void theProtocolNumberCarriesEveryWireChangeOfThisChannel() {
         // Protocol 9 was this packet's own bump (the optional entity target), protocol 10 the battle
         // snapshot's (native component names and bounded slices), 11 the break-block intent with its own
-        // price and 12 the companion command projection in the snapshot. This channel keeps one number for
-        // all of them.
-        assertEquals("12", TacticalNetwork.PROTOCOL,
-                "the main payload layout changed again: protocol 11 -> 12");
+        // price, 12 the companion command projection in the snapshot and 13 the level projection beside the
+        // participant list. This channel keeps one number for all of them.
+        assertEquals("13", TacticalNetwork.PROTOCOL,
+                "the main payload layout changed again: protocol 12 -> 13");
         assertNotEquals(SkillNetwork.PROTOCOL, TacticalNetwork.PROTOCOL,
                 "the skill channel did not change and keeps its own number");
         assertNotEquals(BattleLogNetwork.PROTOCOL, TacticalNetwork.PROTOCOL,

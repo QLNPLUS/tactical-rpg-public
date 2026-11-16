@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -171,5 +172,77 @@ class BattleStatePacketTest {
         assertEquals(BattlePhase.INACTIVE.ordinal(), exit.phase());
         assertEquals(session, exit.sessionId());
         assertEquals(session, exit.membershipSession());
+    }
+
+    // ------------------------------------------------------------------ the level projection
+
+    /** The same model as {@link #packet}, carrying a level projection of its own participants. */
+    private static BattleStatePacket withLevels(int[] participants, int[] levels) {
+        BattleStatePacket base = packet(List.of(), new int[0], new int[0], participants, new int[0]);
+        return new BattleStatePacket(base.active(), base.phase(), base.round(), base.ap(), base.maxAp(),
+                base.moveCost(), base.playerX(), base.playerY(), base.playerZ(), base.reachable(), base.actor(),
+                base.order(), base.cursor(), base.weapon(), base.weaponKind(), base.weaponRange(), base.centerX(),
+                base.centerY(), base.centerZ(), base.zoneRadius(), base.moving(), base.actorEntityId(),
+                base.participants(), base.gauges(), base.actionCount(), base.defending(), base.turnEntityIds(),
+                base.attackCost(), base.itemCost(), base.placeCost(), base.breakCost(), base.apRecovery(),
+                base.paidActionCount(), base.terrainFalling(), base.sessionId(), base.turnEpoch(),
+                base.membershipServerEpoch(), base.membershipGeneration(), base.command(), levels);
+    }
+
+    /**
+     * The level projection is bounded by the participant list it describes.
+     *
+     * <p>Every id must be one of this snapshot's own participants and must appear once; a negative id, a
+     * negative level and half a pair are contradictions rather than rows the receiver would have to
+     * disambiguate, so they are refused before a body exists.</p>
+     */
+    @Test
+    void theLevelProjectionMustDescribeThisSnapshotsOwnParticipants() {
+        int[] participants = {72, 100, 100, 91, 20, 20};
+        assertArrayEquals(new int[]{72, 3, 91, 0},
+                withLevels(participants, new int[]{72, 3, 91, 0}).entityLevels(),
+                "a real level and the explicit unknown travel as sent");
+        assertEquals(0, withLevels(participants, new int[0]).entityLevels().length,
+                "no level to show is an empty table, not a placeholder row");
+
+        assertThrows(IllegalArgumentException.class, () -> withLevels(participants, new int[]{999, 3}),
+                "an id this snapshot does not hold is refused");
+        assertThrows(IllegalArgumentException.class, () -> withLevels(participants, new int[]{72, 3, 72, 4}),
+                "the same id twice is refused");
+        assertThrows(IllegalArgumentException.class, () -> withLevels(participants, new int[]{72, -1}),
+                "a negative level is refused");
+        assertThrows(IllegalArgumentException.class, () -> withLevels(participants, new int[]{-2, 3}),
+                "a negative entity id is refused");
+        assertThrows(IllegalArgumentException.class, () -> withLevels(participants, new int[]{72}),
+                "half a pair is refused");
+        assertThrows(IllegalArgumentException.class,
+                () -> withLevels(participants, new int[BattleStatePacket.MAX_LEVEL_INTS + 2]),
+                "a table above the wire ceiling is refused");
+        assertThrows(IllegalArgumentException.class, () -> withLevels(new int[0], new int[]{72, 3}),
+                "a snapshot with no participants cannot name a level at all");
+    }
+
+    /** A level projection is a display value: it never becomes an identity, a count or an action quote. */
+    @Test
+    void theLevelProjectionIsNeitherAnActorNorAQuote() {
+        BattleStatePacket packet = withLevels(new int[]{72, 100, 100}, new int[]{72, 6});
+        assertEquals(72, packet.actorEntityId(), "the actor is still the entity the server names");
+        assertEquals(1, packet.participants().length / 3, "the triples keep their own count");
+        assertEquals(19, packet.attackCost(), "the quotes are untouched");
+        assertEquals(6, packet.entityLevels()[1]);
+        assertEquals(0, BattleStatePacket.inactive().entityLevels().length,
+                "an ended encounter publishes no level at all");
+        // The membership stamp rewrites the stamps only, so the level table has to survive it.
+        BattleStatePacket stamped = packet.withMembership(999L, 1000L);
+        assertArrayEquals(packet.entityLevels(), stamped.entityLevels(),
+                "stamping a recipient keeps the same public table");
+        assertEquals(999L, stamped.membershipServerEpoch());
+    }
+
+    @Test
+    void theLevelCeilingMatchesTheParticipantCeiling() {
+        assertEquals(2 * BattleStatePacket.MAX_LEVEL_PAIRS, BattleStatePacket.MAX_LEVEL_INTS);
+        assertEquals(4096, BattleStatePacket.MAX_LEVEL_PAIRS,
+                "one row per entity the participant list could hold");
     }
 }

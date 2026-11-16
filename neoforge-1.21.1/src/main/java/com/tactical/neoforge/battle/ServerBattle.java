@@ -10391,7 +10391,7 @@ public final class ServerBattle {
 
     /** The parts of a snapshot every member shares; the per-member parts are added per recipient. */
     private record SharedSnapshot(List<Component> order, int[] gauges, int[] turnEntityIds, Component actorName,
-                                  int actorEntityId, int[] participants, boolean anyMoving,
+                                  int actorEntityId, int[] participants, int[] entityLevels, boolean anyMoving,
                                   UUID sessionId, long epoch) {
     }
 
@@ -10424,8 +10424,56 @@ public final class ServerBattle {
             participants[participantIndex++] = (int) Math.ceil(state.mob.getMaxHealth());
         }
         return new SharedSnapshot(order, gauges, turnEntityIds, actorName, actorEntityId, participants,
-                anyPlayerMoving() || enemyMoving || rangedBusy() || terrainFall.busy(),
+                levelTable(), anyPlayerMoving() || enemyMoving || rangedBusy() || terrainFall.busy(),
                 session.sessionId(), session.turnEpoch());
+    }
+
+    /**
+     * The level projection of this snapshot, built once for everybody.
+     *
+     * <p>Two independent sources, and each one is only ever asked for its own kind of entity: a player's
+     * number is Tactical's own character level, read read-only from that player's stored profile; a
+     * creature's number comes from the optional Advanced-Leveling API. A player is therefore never answered
+     * by that mod - not even when it is installed and the player happens to carry one of its stored levels -
+     * and no vanilla experience level is ever substituted for either. The rule set is read once here rather
+     * than once per row.</p>
+     *
+     * <p>Nothing is written, initialised, spent or refreshed: this is a display read on the snapshot path, so
+     * a missing or unusable profile becomes the explicit unknown value and a missing creature level simply
+     * produces no row.</p>
+     */
+    private int[] levelTable() {
+        com.tactical.core.progression.ProgressionRules rules =
+                com.tactical.neoforge.progression.ProgressionSettings.rules();
+        BattleLevelTable levels = new BattleLevelTable();
+        for (PlayerMember member : members.values()) {
+            levels.player(member.entity.getId(), playerDisplayLevel(member.entity, rules));
+        }
+        for (EnemyState state : enemies.values()) {
+            levels.creature(state.mob.getId(),
+                    com.tactical.neoforge.compat.AdvancedLevelingBridge.displayLevel(state.mob));
+        }
+        return levels.build();
+    }
+
+    /**
+     * One player's own character level, or {@link BattleLevelTable#UNKNOWN}.
+     *
+     * <p>{@code peek} is the read-only profile accessor: it creates nothing, advances no revision and spends
+     * nothing. A profile that is absent, unreadable or not a real level is unknown, never a level 1 the
+     * server made up, and no failure of this read may fail the snapshot that carries it.</p>
+     */
+    private static int playerDisplayLevel(ServerPlayer player, com.tactical.core.progression.ProgressionRules rules) {
+        if (player == null) return BattleLevelTable.UNKNOWN;
+        try {
+            com.tactical.neoforge.progression.ProgressionStore.Loaded loaded =
+                    com.tactical.neoforge.progression.ProgressionStore.peek(player, rules);
+            if (!loaded.usable()) return BattleLevelTable.UNKNOWN;
+            int level = loaded.profile().level();
+            return level > 0 ? level : BattleLevelTable.UNKNOWN;
+        } catch (RuntimeException unreadable) {
+            return BattleLevelTable.UNKNOWN;
+        }
     }
 
     private void sendState() {
@@ -10488,7 +10536,10 @@ public final class ServerBattle {
                 terrainFall.busy(), shared.sessionId(), shared.epoch(),
                 // Stamped by ServerPackets for this recipient at delivery time.
                 0L, 0L,
-                commandsCompanion ? commandProjection(commandState) : BattleStatePacket.Command.NONE);
+                commandsCompanion ? commandProjection(commandState) : BattleStatePacket.Command.NONE,
+                // The same public table for every recipient: nobody learns anybody's profile, points or
+                // revision from it - only the integer level the roster shows.
+                shared.entityLevels());
         // Through the single publication choke point, so this recipient's membership generation is
         // stamped at this very moment and a fixture sees exactly what was attempted.
         com.tactical.neoforge.network.ServerPackets.sendUncheckedType(player, packet);

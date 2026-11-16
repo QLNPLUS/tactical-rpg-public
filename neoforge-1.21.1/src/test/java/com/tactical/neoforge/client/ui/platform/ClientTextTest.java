@@ -154,7 +154,9 @@ class ClientTextTest {
                 ClientText.Keys.HUD_JOURNAL_TITLE, ClientText.Keys.HUD_ACTING, ClientText.Keys.HUD_STATUS_LATEST,
                 ClientText.Keys.HUD_STATUS_HISTORY, ClientText.Keys.HUD_COUNT,
                 ClientText.Keys.HUD_TOGGLE_COLLAPSE, ClientText.Keys.HUD_TOGGLE_EXPAND,
-                ClientText.Keys.HUD_HINT_PREFIX, ClientText.Keys.HUD_HINT_SUFFIX));
+                ClientText.Keys.HUD_HINT_PREFIX, ClientText.Keys.HUD_HINT_SUFFIX,
+                // The level suffix a name may carry: the label is wording, the number never is.
+                ClientText.Keys.HUD_LEVEL_LABEL));
         surfaces.put("journal chips", List.of(ClientText.Keys.JOURNAL_BATTLE, ClientText.Keys.JOURNAL_TURN,
                 ClientText.Keys.JOURNAL_MOVE, ClientText.Keys.JOURNAL_ATTACK, ClientText.Keys.JOURNAL_DAMAGE,
                 ClientText.Keys.JOURNAL_HEAL, ClientText.Keys.JOURNAL_EFFECT, ClientText.Keys.JOURNAL_DEATH,
@@ -305,6 +307,27 @@ class ClientTextTest {
     }
 
     @Test
+    void theShippedLevelLabelKeepsTheRowReadableAtEveryPreset() throws IOException {
+        Map<String, String> en = lang("en_us.json");
+        Map<String, String> zh = lang("zh_cn.json");
+        String health = "20 / 20";
+        for (Map.Entry<String, Map<String, String>> language : Map.of("en", en, "zh", zh).entrySet()) {
+            String label = language.getValue().get(ClientText.Keys.HUD_LEVEL_LABEL);
+            assertFalse(label == null || label.isBlank(), "the level label has to be worded in every language");
+            assertEquals(0, count(label),
+                    "the label takes no argument: the number is passed as text, never as a placeholder");
+            for (double scale : new double[]{0.80D, 0.85D, 0.90D, 0.95D, 1.00D, 1.05D, 1.10D, 1.15D}) {
+                RosterRowText.Arrangement arrangement = RosterRowText.arrange("阿强的名字",
+                        com.tactical.neoforge.client.ui.hud.LevelSuffix.of(label, 3),
+                        language.getValue().get(ClientText.Keys.HUD_ACTING), health, 90, 3, scale, ESTIMATE);
+                assertEquals(health, arrangement.health(), "the level never pushes the health aside");
+                assertTrue(String.join(" ", arrangement.nameLines()).endsWith(label + " 3"),
+                        "the level stays the tail of the row at " + scale + "x in " + language.getKey());
+            }
+        }
+    }
+
+    @Test
     void theActingChipIsMeasuredAndNeverCutsHealth() throws IOException {
         Map<String, String> en = lang("en_us.json");
         Map<String, String> zh = lang("zh_cn.json");
@@ -313,7 +336,7 @@ class ClientTextTest {
         for (Map.Entry<String, Map<String, String>> language : Map.of("en", en, "zh", zh).entrySet()) {
             String chip = language.getValue().get(ClientText.Keys.HUD_ACTING);
             RosterRowText.Arrangement arrangement =
-                    RosterRowText.arrange("TacticalA", chip, health, nameBudget, 3, 1.0D, ESTIMATE);
+                    RosterRowText.arrange("TacticalA", "", chip, health, nameBudget, 3, 1.0D, ESTIMATE);
             assertEquals(health, arrangement.health(), "health is placed from the right edge and never cut");
             assertEquals(chip, arrangement.chip());
             assertTrue(arrangement.textLines() >= 1);

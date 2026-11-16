@@ -249,7 +249,14 @@ public final class AttackRangeOverlay {
         if (ready && snapshot.truncated()) status += ClientText.get(ClientText.Keys.RANGE_TRUNCATED);
         String hover = ClientText.get(ClientText.Keys.RANGE_HOVER);
         if (ready && BattleAim.pickAtCursor() instanceof EntityHitResult hit) {
-            hover = hit.getEntity().getDisplayName().getString() + ClientText.get(validatedTarget(hit.getEntity())
+            // The legend may only repeat this encounter's own cached number: an entity this snapshot says
+            // nothing about - a bystander, another battle, a hidden creature - gets the plain name, and no
+            // level is asked of the world, of a profile or of another mod here.
+            String name = com.tactical.neoforge.client.ui.hud.LevelSuffix.join(
+                    hit.getEntity().getDisplayName().getString(),
+                    ClientText.get(ClientText.Keys.HUD_LEVEL_LABEL),
+                    BattleClientState.levelOf(hit.getEntity().getId()));
+            hover = name + ClientText.get(validatedTarget(hit.getEntity())
                     ? ClientText.Keys.RANGE_HOVER_OK : ClientText.Keys.RANGE_HOVER_FAIL);
         }
         // The legend wraps with the client's own line folder: Latin text breaks at spaces, Chinese between

@@ -342,6 +342,7 @@
   "tactical.ui.hud.weapon_bow": " · 弓 %s 格",
   "tactical.ui.hud.weapon_crossbow": " · 弩 %s 格",
   "tactical.ui.hud.entity": "实体 #%s",
+  "tactical.ui.hud.level_label": "Lv",
   "tactical.ui.hud.journal_title": "战斗记录",
   "tactical.ui.hud.acting": "行动中",
   "tactical.ui.hud.status_latest": "最新 · 滚轮查看历史",

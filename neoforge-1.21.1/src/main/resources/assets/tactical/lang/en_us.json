@@ -342,6 +342,7 @@
   "tactical.ui.hud.weapon_bow": " · Bow, %s blocks",
   "tactical.ui.hud.weapon_crossbow": " · Crossbow, %s blocks",
   "tactical.ui.hud.entity": "Entity #%s",
+  "tactical.ui.hud.level_label": "Lv",
   "tactical.ui.hud.journal_title": "Battle log",
   "tactical.ui.hud.acting": "Acting",
   "tactical.ui.hud.status_latest": "Latest · scroll for history",

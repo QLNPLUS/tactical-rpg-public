@@ -25,9 +25,15 @@ import java.util.Map;
  */
 public record HudModel(Roster roster, Vitals vitals, Charge charge, Journal journal, String hintText) {
 
-    /** One roster line: the entity id is the identity that binds hover, the world box and the rail. */
+    /**
+     * One roster line: the entity id is the identity that binds hover, the world box and the rail.
+     *
+     * <p>{@code level} is this encounter's own number for that unit, or
+     * {@link com.tactical.neoforge.battle.BattleLevelTable#NONE} when it has none to show. The name stays the
+     * raw name: the suffix is composed at the display point, so nothing here has to be parsed back apart.</p>
+     */
     public record RosterRow(int entityId, String name, int hp, int maxHp, boolean ally, boolean current,
-                            boolean dead) {
+                            boolean dead, int level) {
 
         public double fraction() {
             int max = Math.max(1, maxHp);
@@ -49,8 +55,8 @@ public record HudModel(Roster roster, Vitals vitals, Charge charge, Journal jour
      * The roster footer keeps the old HUD data on purpose: the AP line, the turn recovery (or the
      * defence state) and the weapon line. The command panel shows its own AP and does not replace it.
      */
-    public record Vitals(int round, String actorName, int ap, int maxAp, int apRecovery, boolean defending,
-                         String weaponText) {
+    public record Vitals(int round, String actorName, int actorLevel, int ap, int maxAp, int apRecovery,
+                         boolean defending, String weaponText) {
 
         /** Nothing but the numbers: the AP unit and the slash are not translated, the label is a key. */
         public String apValue() {
@@ -107,7 +113,8 @@ public record HudModel(Roster roster, Vitals vitals, Charge charge, Journal jour
     }
 
     private static Vitals snapshotVitals() {
-        return new Vitals(BattleClientState.round, text(BattleClientState.actor), BattleClientState.ap,
+        return new Vitals(BattleClientState.round, text(BattleClientState.actor),
+                BattleClientState.levelOf(BattleClientState.actorEntityId), BattleClientState.ap,
                 BattleClientState.maxAp, BattleClientState.apRecovery, BattleClientState.defending,
                 weaponText());
     }
@@ -133,7 +140,8 @@ public record HudModel(Roster roster, Vitals vitals, Charge charge, Journal jour
             int[] health = BattleClientState.participantHealth.get(id);
             if (health == null) continue;
             rows.add(new RosterRow(id, nameFor(minecraft, id), health[0], health[1],
-                    SkillClientState.friendly(id), id == BattleClientState.actorEntityId, health[0] <= 0));
+                    SkillClientState.friendly(id), id == BattleClientState.actorEntityId, health[0] <= 0,
+                    BattleClientState.levelOf(id)));
         }
         return new Roster(List.copyOf(rows));
     }
@@ -204,7 +212,8 @@ public record HudModel(Roster roster, Vitals vitals, Charge charge, Journal jour
 
     /** Empty model, used while a battle is not active so the HUD can never draw stale rows. */
     public static HudModel empty() {
-        return new HudModel(new Roster(List.of()), new Vitals(0, "", 0, 0, 0, false, ""),
+        return new HudModel(new Roster(List.of()),
+                new Vitals(0, "", com.tactical.neoforge.battle.BattleLevelTable.NONE, 0, 0, 0, false, ""),
                 new Charge(new int[0], new int[0], -1), Journal.EMPTY, null);
     }
 

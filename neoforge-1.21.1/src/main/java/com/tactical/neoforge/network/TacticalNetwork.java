@@ -10,22 +10,24 @@ import net.neoforged.neoforge.network.registration.PayloadRegistrar;
 /**
  * Packet registration and handlers.
  *
- * <p>Protocol 12: the battle snapshot carries the bounded command projection of the companion this recipient
- * may order right now, so a client still speaking protocol 11 is refused instead of reading a body whose
- * last block is missing, and a protocol-12 client never has to guess who is acting. Everything from protocol
- * 11 stands: breaking a block is its own intent and its own price, the snapshot carries native components and
- * every action quote, it is published as bounded parts, the use-item intent carries an optional entity
- * target, every client intent carries a session/turn stamp and is resolved against the real connection
- * identity, no payload can name the actor, and the nearby-list/join payloads carry only a target session
- * id.</p>
+ * <p>Protocol 13: the battle snapshot also carries this encounter's bounded {@code (entityId, displayLevel)}
+ * projection, so the roster can show a player's own character level and an Advanced-Leveling creature's
+ * level without any client guessing. A client still speaking protocol 12 is refused instead of reading a body
+ * whose level block is missing, and a protocol-13 client never has to infer a number from vanilla experience,
+ * from world data or from another mod. Everything from protocol 12 stands: the snapshot carries the bounded
+ * command projection of the companion this recipient may order, breaking a block is its own intent and its
+ * own price, the snapshot carries native components and every action quote, it is published as bounded parts,
+ * the use-item intent carries an optional entity target, every client intent carries a session/turn stamp and
+ * is resolved against the real connection identity, no payload can name the actor, and the nearby-list/join
+ * payloads carry only a target session id.</p>
  *
  * <p>The skill channel (protocol 4) and the journal channel (protocol 2) keep their own versions: neither
  * wire changed here, and bumping them would refuse clients for no reason.</p>
  */
 public final class TacticalNetwork {
 
-    /** Bumped 11 -> 12 for the companion command projection in the snapshot. */
-    public static final String PROTOCOL = "12";
+    /** Bumped 12 -> 13 for the level projection in the battle snapshot. */
+    public static final String PROTOCOL = "13";
 
     private TacticalNetwork() {
     }

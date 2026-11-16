@@ -44,6 +44,9 @@ import java.util.UUID;
  * <ol>
  *   <li>one small snapshot is one slice: every scalar, every per-person array, the participant triples,
  *       the session/epoch stamp and the three names survive the real codec;</li>
+ *   <li>the level projection beside those participants survives with its binding, an empty projection stays
+ *       empty, and a table that names a non-participant, repeats an id, goes negative or is half a pair is
+ *       refused rather than sent;</li>
  *   <li>a snapshot whose body is far above one payload is cut into slices, the slices join back into
  *       exactly the encoded bytes, and the whole state (roster order, AP, reachable set) is unchanged -
  *       which is also what proves two members' own snapshots stay their own;</li>
@@ -93,6 +96,7 @@ public final class BattleStateWireSelfTest {
         try {
             protocolChecks();
             singleSliceChecks(server);
+            levelTableChecks(server);
             crossSliceChecks(server);
             fullNameSetChecks(server);
             boundChecks(server);
@@ -120,9 +124,9 @@ public final class BattleStateWireSelfTest {
     // ---- 1. the channel version -------------------------------------------------------------
 
     private static void protocolChecks() {
-        check("the shared channel publishes protocol 12", () -> {
-            require("12".equals(TacticalNetwork.PROTOCOL),
-                    "the companion command projection is a wire change: 11 -> 12");
+        check("the shared channel publishes protocol 13", () -> {
+            require("13".equals(TacticalNetwork.PROTOCOL),
+                    "the level projection beside the participant list is a wire change: 12 -> 13");
             require("4".equals(SkillNetwork.PROTOCOL), "the skill channel is untouched");
             require("2".equals(BattleLogNetwork.PROTOCOL), "the journal channel is untouched");
         });
@@ -213,6 +217,67 @@ public final class BattleStateWireSelfTest {
             require(!roundTrip(server, landed).terrainFalling(),
                     "and the same snapshot clears it once the units have landed");
         });
+    }
+
+    // ---- 2b. the level projection ------------------------------------------------------------
+
+    private static void levelTableChecks(MinecraftServer server) {
+        check("the level projection survives the real codec with its participant binding", () -> {
+            BattleStatePacket packet = withLevels(snapshot(0, 1, new int[]{0, 99, 0},
+                    List.of(Component.translatable("entity.minecraft.zombie"), Component.literal("QLN")),
+                    new int[]{100, 40}, new int[]{72, 91}, new int[]{72, 20, 20, 91, 12, 12}),
+                    new int[]{72, 3, 91, 0});
+            BattleStatePacket decoded = roundTrip(server, packet);
+            require(Arrays.equals(decoded.entityLevels(), new int[]{72, 3, 91, 0}),
+                    "both a real level and the explicit unknown arrive as they were sent: "
+                            + Arrays.toString(decoded.entityLevels()));
+            require(Arrays.equals(decoded.participants(), packet.participants()),
+                    "the participant triples are unchanged beside the level table");
+            require(Arrays.equals(decoded.gauges(), packet.gauges())
+                            && Arrays.equals(decoded.turnEntityIds(), packet.turnEntityIds()),
+                    "the per-person arrays keep their own binding");
+            require(SESSION.equals(decoded.sessionId()), "the level table keeps the encounter's own stamp");
+
+            BattleStatePacket absent = roundTrip(server, snapshot(0, 1, new int[]{0, 99, 0},
+                    List.of(Component.translatable("entity.minecraft.zombie")), new int[]{100}, new int[]{72},
+                    new int[]{72, 20, 20}));
+            require(absent.entityLevels().length == 0,
+                    "a snapshot with nothing to show carries no level table at all");
+        });
+
+        check("a level table that disagrees with its own participants is refused", () -> {
+            BattleStatePacket base = snapshot(0, 1, new int[]{0, 99, 0},
+                    List.of(Component.translatable("entity.minecraft.zombie")), new int[]{100}, new int[]{72},
+                    new int[]{72, 20, 20});
+            requireRefusedLevels(base, new int[]{72, 3, 999, 5}, "an entity this snapshot does not hold");
+            requireRefusedLevels(base, new int[]{72, 3, 72, 4}, "the same entity twice");
+            requireRefusedLevels(base, new int[]{72, -1}, "a negative level");
+            requireRefusedLevels(base, new int[]{-2, 3}, "a negative entity id");
+            requireRefusedLevels(base, new int[]{72}, "half a pair");
+        });
+    }
+
+    private static void requireRefusedLevels(BattleStatePacket base, int[] levels, String what) {
+        boolean refused;
+        try {
+            withLevels(base, levels);
+            refused = false;
+        } catch (IllegalArgumentException expected) {
+            refused = true;
+        }
+        require(refused, "a level table with " + what + " must be refused: " + Arrays.toString(levels));
+    }
+
+    /** The same fixture snapshot, carrying this encounter's own level projection. */
+    private static BattleStatePacket withLevels(BattleStatePacket base, int[] levels) {
+        return new BattleStatePacket(base.active(), base.phase(), base.round(), base.ap(), base.maxAp(),
+                base.moveCost(), base.playerX(), base.playerY(), base.playerZ(), base.reachable(), base.actor(),
+                base.order(), base.cursor(), base.weapon(), base.weaponKind(), base.weaponRange(), base.centerX(),
+                base.centerY(), base.centerZ(), base.zoneRadius(), base.moving(), base.actorEntityId(),
+                base.participants(), base.gauges(), base.actionCount(), base.defending(), base.turnEntityIds(),
+                base.attackCost(), base.itemCost(), base.placeCost(), base.breakCost(), base.apRecovery(),
+                base.paidActionCount(), base.terrainFalling(), base.sessionId(), base.turnEpoch(),
+                base.membershipServerEpoch(), base.membershipGeneration(), base.command(), levels);
     }
 
     // ---- 3. a body larger than one payload --------------------------------------------------
@@ -755,7 +820,7 @@ public final class BattleStateWireSelfTest {
                 base.participants(), base.gauges(), base.actionCount(), base.defending(), base.turnEntityIds(),
                 base.attackCost(), base.itemCost(), base.placeCost(), base.breakCost(), base.apRecovery(),
                 base.paidActionCount(), base.terrainFalling(), base.sessionId(), base.turnEpoch(),
-                base.membershipServerEpoch(), base.membershipGeneration(), command);
+                base.membershipServerEpoch(), base.membershipGeneration(), command, base.entityLevels());
     }
 
     private static byte[] wire(MinecraftServer server, BattleStatePacket packet) {

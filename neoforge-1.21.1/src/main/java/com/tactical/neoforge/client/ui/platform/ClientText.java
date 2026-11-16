@@ -175,6 +175,13 @@ public final class ClientText {
         public static final String HUD_TOGGLE_EXPAND = "tactical.ui.hud.toggle_expand";
         public static final String HUD_HINT_PREFIX = "tactical.ui.hud.hint_prefix";
         public static final String HUD_HINT_SUFFIX = "tactical.ui.hud.hint_suffix";
+        /**
+         * The level's own compact wording ("Lv"), appended to a name the HUD already shows.
+         *
+         * <p>It is a key so a language may word it, not a sentence: the number and the separator are not
+         * translated, and a unit with no level to show never draws the label at all.</p>
+         */
+        public static final String HUD_LEVEL_LABEL = "tactical.ui.hud.level_label";
 
         // ------------------------------------------------------------------ journal category chips
         public static final String JOURNAL_BATTLE = "tactical.ui.journal.battle";
