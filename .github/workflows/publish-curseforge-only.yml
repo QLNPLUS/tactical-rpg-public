@@ -1,0 +1,344 @@
+name: Publish Tactical to CurseForge only
+
+# Manual, CurseForge-only publication of ONE already verified build artifact.
+#
+# This entry creates no Git tag, no GitHub Release, no push and no source upload.
+# The strong pin is the successful build run + its source commit + the expected
+# artifact digest, not a fabricated tag claim. The existing both/github tag
+# workflow (.github/workflows/build-release.yml) is unchanged and still owns any
+# tagged publication; this file only adds the missing CurseForge-only path.
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: 'Exact 40-hex source commit built by the verified run'
+        required: true
+        type: string
+      build_run_id:
+        description: 'Exact successful Build and release run ID on main (push)'
+        required: true
+        type: string
+      expected_version:
+        description: 'Exact mod_version of that source and artifact, e.g. 0.33.0'
+        required: true
+        type: string
+      expected_sha256:
+        description: 'Exact SHA-256 (64 hex) of the release JAR inside the artifact'
+        required: true
+        type: string
+      release_type:
+        description: 'CurseForge release type'
+        required: true
+        default: beta
+        type: choice
+        options: [alpha, beta, release]
+
+# Read-only everywhere: no write scope is ever requested, so no step can create a
+# Release, a tag, a push or any other repository write.
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: publish-curseforge-only-tactical-rpg
+  cancel-in-progress: false
+
+# Dispatch inputs stay in the environment; they are never interpolated into shell
+# source. Every value below is validated before any CurseForge credential exists.
+env:
+  SOURCE_COMMIT: ${{ inputs.source_commit }}
+  BUILD_RUN_ID: ${{ inputs.build_run_id }}
+  EXPECTED_VERSION: ${{ inputs.expected_version }}
+  EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+  RELEASE_TYPE: ${{ inputs.release_type }}
+  VERSION_LABEL: v${{ inputs.expected_version }}-neoforge-1.21.1
+
+jobs:
+  publish-curseforge:
+    runs-on: ubuntu-latest
+    # The existing protected environment that already holds the CurseForge secret.
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Validate dispatch inputs before checkout or any credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import re
+          import sys
+
+          problems = []
+          commit = os.environ['SOURCE_COMMIT']
+          run_id = os.environ['BUILD_RUN_ID']
+          version = os.environ['EXPECTED_VERSION']
+          digest = os.environ['EXPECTED_SHA256']
+          release_type = os.environ['RELEASE_TYPE']
+          label = os.environ['VERSION_LABEL']
+          if re.fullmatch(r'[0-9a-f]{40}', commit) is None:
+              problems.append('source_commit must be exactly 40 lowercase hex characters')
+          elif commit == '0' * 40:
+              problems.append('source_commit must not be the empty-tree placeholder')
+          if re.fullmatch(r'[1-9][0-9]*', run_id) is None:
+              problems.append('build_run_id must be a positive integer without padding')
+          if re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?', version) is None:
+              problems.append('expected_version must match the project mod_version format')
+          if re.fullmatch(r'[0-9a-f]{64}', digest) is None:
+              problems.append('expected_sha256 must be exactly 64 lowercase hex characters')
+          if release_type not in ('alpha', 'beta', 'release'):
+              problems.append('release_type must be alpha, beta or release')
+          if label != 'v' + version + '-neoforge-1.21.1':
+              problems.append('the version label is not derived from expected_version')
+          if problems:
+              sys.exit('; '.join(problems))
+          print('Dispatch inputs are well formed; no CurseForge credential has been mapped yet.')
+          PY
+
+      - name: Check out the exact pinned source commit without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Pin the verified build run, branch, source commit and workflow (read-only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Read-only metadata only: no release, tag, dispatch or any other GitHub write.
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" \
+            --jq '{id: .id, event: .event, head_branch: .head_branch, head_sha: .head_sha, status: .status, conclusion: .conclusion, run_attempt: .run_attempt, path: .path, repository: .repository.full_name, head_repository: .head_repository.full_name}' \
+            > "$RUNNER_TEMP/build-run.json"
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          run = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'], 'build-run.json').read_text(encoding='utf-8'))
+          canonical = 'QLNPLUS/tactical-rpg-public'
+          expected = {
+              'repository': canonical,
+              'head_repository': canonical,
+              'event': 'push',
+              'head_branch': 'main',
+              'head_sha': os.environ['SOURCE_COMMIT'],
+              'status': 'completed',
+              'conclusion': 'success',
+              'path': '.github/workflows/build-release.yml',
+          }
+          problems = []
+          if run.get('id') != int(os.environ['BUILD_RUN_ID']):
+              problems.append('run id expected %s, got %r' % (os.environ['BUILD_RUN_ID'], run.get('id')))
+          if os.environ.get('GITHUB_REPOSITORY') != canonical:
+              problems.append('dispatch repository expected %s, got %r'
+                              % (canonical, os.environ.get('GITHUB_REPOSITORY')))
+          for field, value in expected.items():
+              if run.get(field) != value:
+                  problems.append('%s expected %r, got %r' % (field, value, run.get(field)))
+          attempt = run.get('run_attempt')
+          if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+              problems.append('run_attempt expected a positive integer, got %r' % (attempt,))
+          if problems:
+              sys.exit('Refusing CurseForge-only publication: ' + '; '.join(problems))
+          print('Pinned run %d: %s to %s at %s, completed/success, workflow %s, attempt %d.'
+                % (run['id'], run['event'], run['head_branch'], run['head_sha'], run['path'], run['run_attempt']))
+          PY
+
+      - name: Download the verified release artifact from that exact run (never rebuild)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-release
+          path: build/release
+          run-id: ${{ env.BUILD_RUN_ID }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Recheck the artifact against this source, the version and the expected digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "$SOURCE_COMMIT" ]]; then
+            printf '%s\n' 'Checked-out commit is not the pinned source commit' >&2
+            exit 1
+          fi
+          # expected_version must be this source's gradle.properties mod_version.
+          python - <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          props = {}
+          for line in pathlib.Path('gradle.properties').read_text(encoding='utf-8').splitlines():
+              if '=' in line and not line.lstrip().startswith('#'):
+                  key, value = line.split('=', 1)
+                  props[key.strip()] = value.strip()
+          version = props.get('mod_version', '')
+          expected = os.environ['EXPECTED_VERSION']
+          if version != expected:
+              sys.exit('gradle.properties mod_version %r is not expected_version %r' % (version, expected))
+          if props.get('minecraft_version') != '1.21.1':
+              sys.exit('the pinned source does not target Minecraft 1.21.1')
+          print('Pinned source mod_version is %s on Minecraft 1.21.1.' % version)
+          PY
+          # validate() re-checks the version label, Minecraft/NeoForge pins and license metadata;
+          # verify() re-checks bytes, manifest, SHA256SUMS, the JAR's own neoforge.mods.toml
+          # version (the mod manifest version), logo, notices and the canonical nested library
+          # against this exact source tree. The bundle is never rebuilt and never modified.
+          python tools/release_pipeline.py validate --tag "$VERSION_LABEL"
+          python tools/release_pipeline.py verify --tag "$VERSION_LABEL"
+          JAR="build/release/tactical-neoforge-1.21.1-$EXPECTED_VERSION.jar"
+          ACTUAL_SHA256=$(python -c 'import hashlib,sys,pathlib; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$JAR")
+          if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+            printf 'Downloaded JAR SHA-256 %s does not match expected_sha256\n' "$ACTUAL_SHA256" >&2
+            exit 1
+          fi
+          printf 'Artifact matches source %s, version %s, file %s, sha256 %s.\n' \
+            "$SOURCE_COMMIT" "$EXPECTED_VERSION" "$JAR" "$ACTUAL_SHA256"
+          printf '%s\n' 'The version label is a release label only; no Git tag was created or pushed.'
+
+      - name: Assert the CurseForge target project before any credential is mapped
+        env:
+          CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${CURSEFORGE_PROJECT_ID:-}" != "1766445" ]]; then
+            printf '%s\n' 'CURSEFORGE_PROJECT_ID must be exactly 1766445 (Tactical RPG); refusing CurseForge publication' >&2
+            exit 1
+          fi
+          printf '%s\n' 'CurseForge project 1766445 (Tactical RPG) confirmed; the release type default stays beta.'
+
+      - name: Preflight CurseForge configuration and game versions (no upload)
+        env:
+          CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/release_pipeline.py curseforge-preflight --release-type "$RELEASE_TYPE"
+
+      - name: Upload the same verified JAR to CurseForge exactly once
+        env:
+          CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_SLUG }}
+          CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID: ${{ vars.CURSEFORGE_DUNGEONS_PERSPECTIVE_PROJECT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Exactly one upload: the helper performs one POST and never retries, and this step
+          # adds no retry loop either. An unknown response must be inspected on CurseForge
+          # before any rerun, because a rerun would upload the file a second time.
+          python tools/release_pipeline.py curseforge-upload --tag "$VERSION_LABEL" --release-type "$RELEASE_TYPE" \
+            > "$RUNNER_TEMP/curseforge-upload.log"
+          cat "$RUNNER_TEMP/curseforge-upload.log"
+          # The acknowledgement is only the sanitized stdout line; the upload already happened,
+          # so an unexpected line is recorded as unconfirmed instead of failing into a rerun.
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          text = pathlib.Path(os.environ['RUNNER_TEMP'], 'curseforge-upload.log').read_text(encoding='utf-8', errors='replace')
+          found = re.search(r'acknowledged file ID ([1-9][0-9]*)', text)
+          if found is None:
+              ack = {'curseforge_file_id': None, 'acknowledgement': 'unconfirmed'}
+              print('WARNING: no positive CurseForge file ID was found in the upload output; '
+                    'inspect the CurseForge file list before any retry and do not rerun blindly.')
+          else:
+              ack = {'curseforge_file_id': int(found.group(1)), 'acknowledgement': 'positive file ID acknowledged'}
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'curseforge-ack.json').write_text(
+              json.dumps(ack) + '\n', encoding='utf-8')
+          print('Recorded CurseForge acknowledgement: %s.' % ack['acknowledgement'])
+          PY
+
+      - name: Write a sanitized receipt for source, run, version, digest and file ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          ack = json.loads((temp / 'curseforge-ack.json').read_text(encoding='utf-8'))
+          run = json.loads((temp / 'build-run.json').read_text(encoding='utf-8'))
+          receipt = {
+              'mod': 'Tactical RPG',
+              'service': 'CurseForge only',
+              'curseforge_project_id': 1766445,
+              'release_type': os.environ['RELEASE_TYPE'],
+              'version': os.environ['EXPECTED_VERSION'],
+              'version_label': os.environ['VERSION_LABEL'],
+              'source_commit': os.environ['SOURCE_COMMIT'],
+              'build_run_id': run['id'],
+              'build_run_attempt': run['run_attempt'],
+              'build_run_event': run['event'],
+              'build_run_branch': run['head_branch'],
+              'build_workflow': run['path'],
+              'artifact_name': 'verified-release',
+              'jar_file': 'tactical-neoforge-1.21.1-%s.jar' % os.environ['EXPECTED_VERSION'],
+              'jar_sha256': os.environ['EXPECTED_SHA256'],
+              'curseforge_file_id': ack['curseforge_file_id'],
+              'curseforge_acknowledgement': ack['acknowledgement'],
+              'github_release_created': False,
+              'git_tag_created': False,
+              'moderation': 'separate; a positive file ID is not an approved or publicly available file',
+          }
+          target = temp / 'curseforge-only-receipt' / 'curseforge-only-receipt.json'
+          target.parent.mkdir(parents=True, exist_ok=True)
+          target.write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
+          print('Sanitized receipt written to %s' % target)
+          PY
+
+      - name: Summarize CurseForge-only publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          receipt = json.loads((temp / 'curseforge-only-receipt' / 'curseforge-only-receipt.json').read_text(encoding='utf-8'))
+          file_id = receipt['curseforge_file_id']
+          lines = [
+              '## CurseForge ONLY publication',
+              '',
+              '- Mod: Tactical RPG, CurseForge project %d' % receipt['curseforge_project_id'],
+              '- Version %s (label `%s`; label only, no Git tag created)' % (receipt['version'], receipt['version_label']),
+              '- Source commit `%s`' % receipt['source_commit'],
+              '- Verified build run %d (%s to `%s`, completed/success, attempt %d)'
+                  % (receipt['build_run_id'], receipt['build_run_event'], receipt['build_run_branch'], receipt['build_run_attempt']),
+              '- JAR `%s` sha256 `%s`' % (receipt['jar_file'], receipt['jar_sha256']),
+              '- CurseForge file ID: %s (%s)'
+                  % ('unconfirmed' if file_id is None else file_id, receipt['curseforge_acknowledgement']),
+              '',
+              'This workflow publishes to CurseForge ONLY: no GitHub Release, no tag, no push and no source upload.',
+              'Moderation and public availability are separate and are NOT verified here; a positive file ID is not an approved or visible file.',
+              'A rerun uploads again, so check the CurseForge file list before any retry.',
+          ]
+          with pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as summary:
+              summary.write('\n'.join(lines) + '\n')
+          PY
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: curseforge-only-receipt
+          path: ${{ runner.temp }}/curseforge-only-receipt/curseforge-only-receipt.json
+          if-no-files-found: error
+          retention-days: 14

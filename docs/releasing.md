@@ -9,14 +9,15 @@
 
 ## 入口和产物
 
-工作流：[build-release.yml](../.github/workflows/build-release.yml)。脚本仅依赖 Python 3.11+ 标准库（CI 使用 3.12）；GitHub 写操作由工作流中的 `gh` 执行，CF 使用官方 Upload API。
+工作流：[build-release.yml](../.github/workflows/build-release.yml) 保留既有两处发布 / GitHub-only 入口；[publish-curseforge-only.yml](../.github/workflows/publish-curseforge-only.yml) 提供独立的仅 CF 手动入口。脚本仅依赖 Python 3.11+ 标准库（CI 使用 3.12）；GitHub 写操作仅由既有两处 / GitHub-only 工作流中的 `gh` 执行，CF 使用官方 Upload API。
 
 | 事件 | 构建 / 检查 | GitHub Release / CurseForge |
 | --- | --- | --- |
 | 普通分支 push（含 main） | 是 | **不发布**，不向构建步骤提供发布凭据 |
 | pull_request | 是 | **不发布**，不使用 pull_request_target |
 | push `v*-neoforge-1.21.1` 标签 | 是，先核对版本与 tag | 两处发布；CF 配置缺失则阻断 |
-| workflow_dispatch | 是，检出显式输入的既有标签 | `both`（默认）或明确选择 `github` |
+| 原工作流 workflow_dispatch | 是，检出显式输入的既有标签 | `both`（默认）或明确选择 `github` |
+| CF-only workflow_dispatch | 复核指定成功构建的制品，不重构建 | **仅 CurseForge**；不创建 Git 标签或 GitHub Release |
 
 版本唯一来源是根 `gradle.properties` 的 `mod_version`；例如版本 `0.22.2` 只接受标签 `v0.22.2-neoforge-1.21.1`，不接受省略平台、版本不符或旧版本标签。手动运行也必须提供已存在且指向本次构建提交的标签。不要把本文的版本示例当作已发布事实。
 
@@ -84,11 +85,13 @@ python tools/release_pipeline.py package
 
 两家服务不支持跨站原子提交。当前顺序是 CF 上传成功后再创建 GitHub Release；如果随后 GitHub 失败，可能留下 CF 已接收、GitHub 未创建的**部分完成**状态。应先检查 CF 项目文件列表/审核状态及 GitHub Release，再决定人工恢复；不要直接反复 rerun 导致 CF 重复文件。GitHub 已有同名 Release 时拒绝继续，不覆盖旧附件。网络超时/未知响应同样需要人工确认 CF 是否已接收，不是自动重试的理由。
 
-若明确只发布 GitHub，手动选择 `target=github`。工作流摘要会写明 **CurseForge NOT enabled**；这种成功不能被描述为“两处发布成功”。对当前可见配置，这是唯一不依赖 CF token 的外部发布方式，但本次没有执行。
+若明确只发布 GitHub，原工作流手动选择 `target=github`。摘要会写明 **CurseForge NOT enabled**；这种成功不能被描述为“两处发布成功”。
+
+若明确只发布 CF，使用独立的 **Publish Tactical to CurseForge only** 工作流，不推原格式的发布标签（推标签会触发原两处发布工作流）。输入 `source_commit`、`build_run_id`、`expected_version`、制品内 JAR 的 `expected_sha256` 和 `release_type`。入口只接受规范仓库 main 上成功的 push 构建，精确核对提交、运行、版本、实际制品摘要及原有包门；GitHub 权限仅 contents/actions read，仍使用既有 release 环境。`v<version>-neoforge-1.21.1` 在此仅作已验证版本标签字符串，不创建 Git ref；真实来源以固定提交和成功构建为准。只有预检和唯一一次上传步骤映射 CF 密钥，回执不含凭据；文件 ID 接收与审核 / 公开状态分开。未知响应或后续回执步骤失败时，先检查 CF 文件列表，不能盲目 rerun。
 
 ## 发布说明、描述、美术与许可
 
-- **两家服务的发布说明只取当前版本章节**：`tools/release_pipeline.py` 的同一 `release_changelog` 提供 CurseForge metadata 和 GitHub 临时 notes；可用 `python tools/release_pipeline.py release-notes --version <版本> --output <路径>` 预览，不上传整本历史。当前版本 **0.33.0**（MC 1.21.1，主协议 13）完成依赖/API、等级投影/HUD，以及有限 C1–C5 实机验证：956 项 Java 单测（common 94 + NeoForge 862）、51 项发布辅助测试、构建/打包门、既有专服夹具、无 AL 与 248 联合运行、真实升级观察、双语/长名/预设/悬停、实际协议混连拒绝和生命周期。最后的 tooltip 小修只定向重测；未受影响的早前实机记录按原冻结来源复用，不冒充全矩阵重跑。客户端为独立开发启动器加载打包模组，正式启动器与测试机未验；补充的新会话第二成员入场因格子占用被拒，不记成功。显示环境通过运行目录自己的 `config/fml.toml` 中 `earlyWindowControl = false` 关闭 splash 后可真实开窗，不需物理显示器或会话/驱动改动。详见当前 CHANGELOG 的证据边界。**本版本仍未获 CF/GitHub Releases 二进制发布授权**，普通源码推送只构建测试，不创建标签或触发上传。当前版本章节须全文英文、小于 8000 字符；缺章直接失败，历史章节不上传。
+- **两家服务的发布说明只取当前版本章节**：`tools/release_pipeline.py` 的同一 `release_changelog` 提供 CurseForge metadata 和 GitHub 临时 notes；可用 `python tools/release_pipeline.py release-notes --version <版本> --output <路径>` 预览，不上传整本历史。当前版本 **0.33.0**（MC 1.21.1，主协议 13）完成依赖/API、等级投影/HUD，以及有限 C1–C5 实机验证：956 项 Java 单测（common 94 + NeoForge 862）、51 项发布辅助测试、构建/打包门、既有专服夹具、无 AL 与 248 联合运行、真实升级观察、双语/长名/预设/悬停、实际协议混连拒绝和生命周期。最后的 tooltip 小修只定向重测；未受影响的早前实机记录按原冻结来源复用，不冒充全矩阵重跑。客户端为独立开发启动器加载打包模组，正式启动器与测试机未验；补充的新会话第二成员入场因格子占用被拒，不记成功。显示环境通过运行目录自己的 `config/fml.toml` 中 `earlyWindowControl = false` 关闭 splash 后可真实开窗，不需物理显示器或会话/驱动改动。详见当前 CHANGELOG 的证据边界。**2026-11-16 QLN 已明确授权本轮仅发布到 CF；GitHub Releases 不在本轮授权范围**，普通源码推送只构建测试，不创建标签或触发上传。当前版本章节须全文英文、小于 8000 字符；缺章直接失败，历史章节不上传。
 - 临时 notes 文件只放在 runner 临时目录，**不进** `build/release` 这个只含二进制的制品包。
 - 英文 CF 正文：[curseforge.md](curseforge.md)，上传到 CF 项目描述栏；工作流只上传文件，不改写 CF 项目描述或项目头像。GitHub Release 也不会用该文件作 notes。
 - 模组 logo 位于 `neoforge-1.21.1/src/main/resources/logo.png`，`neoforge.mods.toml` 的 `logoFile` 指向 `logo.png`；发布包检查要求该 PNG 实际存在。

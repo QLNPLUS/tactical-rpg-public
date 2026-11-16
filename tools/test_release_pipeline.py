@@ -545,5 +545,135 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('case "$INPUT_RELEASE_TYPE" in alpha|beta|release) ;; *) exit 1 ;; esac', text)
 
 
+class CurseForgeOnlyWorkflowTests(unittest.TestCase):
+    """Source contracts for the manual CurseForge-only entry.
+
+    This workflow is never executed by these tests: no token is read, no GitHub API is
+    called, no artifact is downloaded and no CurseForge upload happens. Each assertion
+    is a property the file must keep - manual only, read-only, pinned to one verified
+    build run and to the expected version/digest, one upload, and a credential exposed
+    only to the two CurseForge steps.
+    """
+
+    WORKFLOW = '.github/workflows/publish-curseforge-only.yml'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (release.ROOT / cls.WORKFLOW).read_text(encoding='utf-8')
+
+    def steps(self):
+        steps, current = [], None
+        for line in self.text.splitlines():
+            if re.match(r'^      - (name|uses|run):', line):
+                current = [line]
+                steps.append(current)
+            elif current is not None:
+                current.append(line)
+        return ['\n'.join(step) for step in steps]
+
+    def test_manual_only_trigger_with_five_inputs(self):
+        self.assertTrue(self.text.startswith('name: Publish Tactical to CurseForge only\n'))
+        self.assertIn('on:\n  workflow_dispatch:\n', self.text)
+        for trigger in ('push', 'pull_request', 'pull_request_target', 'schedule', 'workflow_run'):
+            with self.subTest(trigger=trigger):
+                self.assertIsNone(re.search(rf'(?m)^\s+{trigger}:\s*$', self.text))
+        for name in ('source_commit', 'build_run_id', 'expected_version', 'expected_sha256', 'release_type'):
+            with self.subTest(name=name):
+                self.assertRegex(self.text, rf'(?m)^      {name}:\n')
+        self.assertEqual(self.text.count('        required: true'), 5)
+        block = self.text[self.text.index('\n      release_type:'):self.text.index('\npermissions:')]
+        self.assertIn('required: true', block)
+        self.assertIn('default: beta', block)
+        self.assertIn('type: choice', block)
+        self.assertIn('options: [alpha, beta, release]', block)
+
+    def test_read_only_permissions_environment_and_concurrency(self):
+        # No scope may be writable: the entry cannot create a Release, a tag or a push.
+        self.assertIsNone(re.search(r'(?m)^\s*[a-z-]+: write\s*$', self.text))
+        self.assertIn('permissions:\n  contents: read\n  actions: read\n', self.text)
+        self.assertIn('      contents: read\n      actions: read\n', self.text)
+        self.assertIn('environment: release', self.text)
+        self.assertRegex(self.text, r'(?m)^concurrency:\n'
+                                    r'  group: publish-curseforge-only-[a-z-]+\n'
+                                    r'  cancel-in-progress: false$')
+
+    def test_no_github_release_tag_or_push_command(self):
+        for forbidden in ('gh release', 'git tag', 'git push', '--verify-tag', '--method POST',
+                          'contents: write', 'id-token: write', 'gradlew',
+                          'tools/release_pipeline.py package', 'release-notes', 'CHANGELOG'):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.text)
+
+    def test_actions_are_the_existing_pinned_shas(self):
+        build = (release.ROOT / '.github/workflows/build-release.yml').read_text(encoding='utf-8')
+        known = set(re.findall(r'uses: (\S+)', build))
+        used = re.findall(r'uses: (\S+)', self.text)
+        # checkout, setup-python, download-artifact and upload-artifact.
+        self.assertEqual(len(used), 4)
+        for action in used:
+            with self.subTest(action=action):
+                self.assertRegex(action, r'^actions/[a-z-]+@[a-f0-9]{40}$')
+                self.assertIn(action, known)
+
+    def test_source_run_version_and_digest_are_pinned(self):
+        for needle in ('QLNPLUS/tactical-rpg-public', 'actions/runs/$BUILD_RUN_ID',
+                       "'event': 'push'", "'head_branch': 'main'", "'status': 'completed'",
+                       "'conclusion': 'success'", "'path': '.github/workflows/build-release.yml'",
+                       'head_sha', 'head_repository', 'run_attempt',
+                       'ref: ${{ env.SOURCE_COMMIT }}', 'persist-credentials: false',
+                       'run-id: ${{ env.BUILD_RUN_ID }}', 'name: verified-release',
+                       'repository: ${{ github.repository }}', 'github-token: ${{ github.token }}',
+                       'gradle.properties', 'EXPECTED_SHA256',
+                       'tools/release_pipeline.py validate --tag',
+                       'tools/release_pipeline.py verify --tag', 'never rebuild'):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, self.text)
+        self.assertEqual(self.text.count('tools/release_pipeline.py verify'), 1)
+        self.assertEqual(self.text.count('tools/release_pipeline.py validate'), 1)
+        self.assertIn('"$ACTUAL_SHA256" != "$EXPECTED_SHA256"', self.text)
+        self.assertIn('gradle.properties mod_version', self.text)
+        # The version label is derived from expected_version, not typed in twice.
+        self.assertIn('v${{ inputs.expected_version }}-neoforge-1.21.1', self.text)
+        self.assertIn('no Git tag was created or pushed', self.text)
+
+    def test_exactly_one_upload_and_credential_isolation(self):
+        self.assertEqual(self.text.count('tools/release_pipeline.py curseforge-preflight'), 1)
+        self.assertEqual(self.text.count('tools/release_pipeline.py curseforge-upload'), 1)
+        steps = self.steps()
+        self.assertGreaterEqual(len(steps), 10)
+        secret_steps = [index for index, step in enumerate(steps) if 'secrets.CURSEFORGE_TOKEN' in step]
+        self.assertEqual(len(secret_steps), 2)
+        for index in secret_steps:
+            with self.subTest(step=steps[index].splitlines()[0]):
+                self.assertIn('CURSEFORGE_API_TOKEN:', steps[index])
+                self.assertTrue('curseforge-preflight' in steps[index] or 'curseforge-upload' in steps[index])
+        # The CurseForge target is asserted, without the credential, before those two steps.
+        target_steps = [index for index, step in enumerate(steps)
+                        if 'CURSEFORGE_PROJECT_ID' in step and 'secrets.CURSEFORGE_TOKEN' not in step]
+        self.assertTrue(target_steps)
+        self.assertIn('1766445', steps[target_steps[0]])
+        self.assertLess(min(target_steps), min(secret_steps))
+        # The one exposed secret is the CurseForge token; nothing else is read.
+        self.assertEqual(self.text.count('secrets.'), 2)
+        # Dispatch inputs stay in env; no expression is interpolated into shell source.
+        self.assertNotIn('${{ inputs.', self.text.split('jobs:')[1])
+
+    def test_receipt_is_sanitized_and_cf_only(self):
+        self.assertIn('name: curseforge-only-receipt', self.text)
+        self.assertIn('if-no-files-found: error', self.text)
+        self.assertIn("temp / 'curseforge-only-receipt' / 'curseforge-only-receipt.json'", self.text)
+        self.assertIn('## CurseForge ONLY publication', self.text)
+        self.assertIn('no GitHub Release, no tag, no push and no source upload', self.text)
+        self.assertIn('Moderation and public availability are separate', self.text)
+        self.assertIn("'github_release_created': False", self.text)
+        self.assertIn("'git_tag_created': False", self.text)
+        # The acknowledgement is parsed from sanitized stdout, and an unexpected line
+        # must not turn a completed upload into a retry.
+        self.assertIn('curseforge-upload.log', self.text)
+        self.assertIn('do not rerun blindly', self.text)
+        self.assertNotIn('X-Api-Token', self.text)
+        self.assertNotIn('CURSEFORGE_TOKEN', self.text.replace('secrets.CURSEFORGE_TOKEN', ''))
+
+
 if __name__ == '__main__':
     unittest.main()
