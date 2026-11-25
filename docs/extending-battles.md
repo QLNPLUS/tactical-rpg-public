@@ -6,6 +6,12 @@
 
 战斗区域、AI 与原生伤害修饰器使用代码内注册表，并非数据包或 NeoForge 注册事件；伤害另外提供 NeoForge 事件。目前没有脚本加载或任意动作执行器接口。战术属性使用原生 NeoForge 属性注册与同步。
 
+## 潜影贝与旋风人（0.34.0 本地候选版）
+
+[TacticalAiRegistry](../neoforge-1.21.1/src/main/java/com/tactical/neoforge/battle/ai/TacticalAiRegistry.java) 只给 `EntityType.SHULKER` 和 `EntityType.BREEZE` 注册这两套 AI。[ShulkerController](../neoforge-1.21.1/src/main/java/com/tactical/neoforge/battle/ShulkerController.java) 接入原生附着、开壳、传送和追踪弹；原生复制体仍须经过战斗的入场检查。[BreezeController](../neoforge-1.21.1/src/main/java/com/tactical/neoforge/battle/BreezeController.java) 管理自身回合的跳跃和风弹，沿用服务端锁定目标、行动费用与弹体生命周期。两者都是服务端内部适配，不提供客户端指定落点或任意动作回调的扩展接口。
+
+该候选版构建基线为 Minecraft 1.21.1 / NeoForge 21.1.216，协议为 Tactical `13`、Skill `4`、BattleLog `2`；未完成实机验收，限制见 [更新记录中的 0.34.0 小节](../CHANGELOG.md)。下文的 0.20.0 接口说明是历史参考，不按此候选版推断。
+
 ## 战术属性与管理员 AP（0.20.0）
 
 入口：[TacticalAttributes](../neoforge-1.21.1/src/main/java/com/tactical/neoforge/battle/TacticalAttributes.java)。三个属性均为原生、可同步属性，通过属性修改事件添加给所有已注册属性供应器的生物类型，包括玩家和模组生物；不局限于内置敌人或已注册战术 AI 的类型。

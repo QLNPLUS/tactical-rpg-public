@@ -41,6 +41,14 @@ public final class TacticalConfig {
     public final ModConfigSpec.IntValue spiderLeapApCost;
     /** Base price of one enderman teleport: this ruleset's value, not a vanilla fact. */
     public final ModConfigSpec.IntValue endermanTeleportApCost;
+    /** Base price of one native shulker bullet: this ruleset's value, not a vanilla fact. */
+    public final ModConfigSpec.IntValue shulkerBulletApCost;
+    /** Base price of one native shulker relocation, own turn or reaction: this ruleset's value. */
+    public final ModConfigSpec.IntValue shulkerTeleportApCost;
+    /** Base price of one native breeze wind charge: this ruleset's value, not a vanilla fact. */
+    public final ModConfigSpec.IntValue breezeWindChargeApCost;
+    /** Base price of one native breeze long jump: this ruleset's value, not a vanilla fact. */
+    public final ModConfigSpec.IntValue breezeJumpApCost;
     public final ModConfigSpec.IntValue witchDrinkApCost;
     public final ModConfigSpec.IntValue witchThrowApCost;
     public final ModConfigSpec.IntValue witchDrinkCooldownTurns;
@@ -126,6 +134,18 @@ public final class TacticalConfig {
         builder.push("enderman");
         endermanTeleportApCost = builder.comment("Base AP cost of one enderman teleport, whether it is the own-turn relocation or the single reaction to a hit, and the price charged to that enderman only. The own-turn relocation shares the successful-action surcharge; the reaction is paid at this base price and does not advance that surcharge.")
                 .defineInRange("teleportCost", com.tactical.core.combat.BattleRules.ENDERMAN_TELEPORT_COST, 1, 1_000_000);
+        builder.pop();
+        builder.push("shulker");
+        shulkerBulletApCost = builder.comment("Base AP cost of one native shulker bullet, paid from the firing shulker only. It shares the same successful-action surcharge as every other main action and is charged once, when the real projectile joined the world.")
+                .defineInRange("bulletCost", com.tactical.core.combat.MotionRules.SHULKER_BULLET_COST, 1, 1_000_000);
+        shulkerTeleportApCost = builder.comment("Base AP cost of one native shulker relocation, whether it is the own-turn action or the single reaction to a hit, and the price charged to that shulker only. The own-turn action shares the successful-action surcharge; the reaction is paid at this base price and does not advance that surcharge.")
+                .defineInRange("teleportCost", com.tactical.core.combat.MotionRules.SHULKER_TELEPORT_COST, 1, 1_000_000);
+        builder.pop();
+        builder.push("breeze");
+        breezeWindChargeApCost = builder.comment("Base AP cost of one native breeze wind charge, paid from the firing breeze only. It shares the same successful-action surcharge as every other main action and is charged once, after the native inhale, when the real projectile joined the world.")
+                .defineInRange("windChargeCost", com.tactical.core.combat.BreezeRules.WIND_CHARGE_COST, 1, 1_000_000);
+        breezeJumpApCost = builder.comment("Base AP cost of one native breeze long jump, paid from the jumping breeze only. It shares the same successful-action surcharge and is charged once, at the first real displacement; a jump refused before take-off is free.")
+                .defineInRange("jumpCost", com.tactical.core.combat.BreezeRules.JUMP_COST, 1, 1_000_000);
         builder.pop();
         builder.push("witch");
         witchDrinkApCost = builder.comment("Base AP cost of one witch self-drink; it shares the same successful-action surcharge as other main actions and is not a player item cost.")

@@ -140,7 +140,7 @@ public final class BlazeFireballs {
         HitResult hit = event.getRayTraceResult();
         boolean legal = hit != null && hit.getType() == HitResult.Type.ENTITY
                 && hit instanceof EntityHitResult entityHit
-                && mark.battle().acceptsFireball(mark.actorId(), entityHit.getEntity());
+                && mark.battle().acceptsFireball(mark.actorId(), entityHit.getEntity(), event.getProjectile());
         if (legal) {
             // Deliberately still marked. A later listener may cancel this impact - vanilla then keeps the
             // projectile flying - and the same fireball must stay under this encounter's rule for its next

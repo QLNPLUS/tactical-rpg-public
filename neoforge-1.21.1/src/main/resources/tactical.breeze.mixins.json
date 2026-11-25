@@ -1,0 +1,17 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.tactical.neoforge.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "TacticalBlockStateBaseMixin",
+    "TacticalBreezeMixin",
+    "TacticalBreezeWindChargeMixin",
+    "TacticalExplosionMixin",
+    "TacticalWindChargeHitMixin",
+    "TacticalProjectileDeflectionMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

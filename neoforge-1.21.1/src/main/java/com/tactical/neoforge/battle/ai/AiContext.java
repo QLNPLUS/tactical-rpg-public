@@ -113,6 +113,44 @@ public interface AiContext {
     default List<GridPos> dryEscapePath() { return List.of(); }
 
     /**
+     * Everything the shulker tactics need, read once from the same authoritative state that prices its actions.
+     *
+     * <p>A context without a controlled shulker (an old adapter, a fixture) answers {@link ShulkerState#NONE},
+     * which makes every shulker tactic decline instead of inventing a free shot.</p>
+     */
+    default ShulkerState shulker() { return ShulkerState.NONE; }
+
+    /** One native shulker bullet at the opponent this own turn locked; the encounter owns the real projectile. */
+    default boolean shulkerShot() { return false; }
+
+    /** One native shulker relocation; the encounter owns the landing gate, the price and the commit. */
+    default boolean shulkerTeleport() { return false; }
+
+    /**
+     * Everything the breeze tactics need, read once from the same authoritative state that prices its actions.
+     *
+     * <p>A context without a controlled breeze (an old adapter, a fixture) answers {@link BreezeState#NONE}, which
+     * makes every breeze tactic decline instead of inventing a free charge or a free jump.</p>
+     */
+    default BreezeState breeze() { return BreezeState.NONE; }
+
+    /** One native breeze wind charge at the opponent this own turn locked; the encounter owns the projectile. */
+    default boolean breezeShot() { return false; }
+
+    /** One native breeze long jump; the encounter owns the cached arc, the price and the commit. */
+    default boolean breezeJump() { return false; }
+
+    /**
+     * The one bounded ground route this own turn may still walk, or an empty list when there is none.
+     *
+     * <p>A breeze has no melee at all, so a body that is too near for its native firing band has to step away
+     * over ordinary per-edge movement instead of inventing a contact attack. The answer is bounded by the AP the
+     * same state quotes, every cell is proved free and inside the battlefield, and every edge is priced exactly
+     * as an ordinary move is - this is not a manoeuvre and it never advances the per-turn manoeuvre quota.</p>
+     */
+    default List<GridPos> breezeSlide() { return List.of(); }
+
+    /**
      * One native teleport as this own turn's action.
      *
      * <p>The server owns the one commit point: it re-validates the landing point after the native event had its

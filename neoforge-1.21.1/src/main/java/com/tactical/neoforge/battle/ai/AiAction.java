@@ -105,7 +105,47 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
          * and every geometry gate are re-resolved from the same state that charges the action - so a stale plan can
          * never fire at a body this turn never locked.</p>
          */
-        GUARDIAN_BEAM
+        GUARDIAN_BEAM,
+        /**
+         * One native shulker bullet at the opponent this own turn locked.
+         *
+         * <p>Deliberately its own kind: the projectile is a real {@code ShulkerBullet} whose own tick curves it
+         * around cover, whose own hit deals its native damage and its native levitation, and which can be destroyed
+         * in flight. Routing it through {@code RANGED} would price it as a bow, validate it against an arrow and
+         * pretend a straight line-of-sight shot is what it is. The intent carries no target and no vector - the
+         * opponent, the axis, the price and every gate are re-resolved from the state that charges it.</p>
+         */
+        SHULKER_SHOT,
+        /**
+         * One native shulker relocation: a change of attachment, not an attack.
+         *
+         * <p>Like the enderman's relocation the intent carries no destination: vanilla resolves the landing point
+         * inside its own private search, after the cancelable {@code EnderEntity} event had its say, so a point
+         * named here could be one the world already replaced. What the encounter commits is where the body really
+         * ended up, validated as a whole shulker attachment before anything is charged.</p>
+         */
+        SHULKER_TELEPORT,
+        /**
+         * One native breeze wind charge at the opponent this own turn locked.
+         *
+         * <p>Deliberately its own kind and never a {@code RANGED}: the projectile is a real
+         * {@code BreezeWindCharge} with the native origin, the native {@code 0.7} speed and the difficulty's own
+         * spread, whose own burst carries vanilla's radius, falloff, exposure and resistance - none of which is a
+         * bow, an arrow or a line-of-sight shot. The intent carries no target, no vector and no price: the
+         * opponent, the facing decision, the price and every gate are re-resolved from the state that charges it,
+         * after the native inhale, and nothing is charged unless the world really took the charge.</p>
+         */
+        BREEZE_SHOT,
+        /**
+         * One native breeze long jump: an arc from a real standing spot to a real standing spot.
+         *
+         * <p>Deliberately its own kind and never a {@code MOVE} with a longer edge: the jump is one fixed arc
+         * solved by {@code LongJumpUtil} from the native angle list, it has one native animation and one price,
+         * and it exists to buy a firing position. Like every other bounded proposal it carries no destination: the
+         * encounter re-proves the same cached arc frame by frame and charges only when the body really left the
+         * ground, so a stale plan can never name a landing the live world has already refused.</p>
+         */
+        BREEZE_JUMP
     }
 
     /** Preserve existing adapters' constructors. */
@@ -215,4 +255,10 @@ public record AiAction(Kind kind, List<GridPos> path, int attackIndex,
     public static AiAction slimeContact() { return of(Kind.SLIME_CONTACT); }
     /** One native charged beam at the opponent this turn locked; the server owns the goal, the price and the receipt. */
     public static AiAction guardianBeam() { return of(Kind.GUARDIAN_BEAM); }
+    /** One native shulker relocation; the encounter owns the landing gate, the price and the commit. */
+    public static AiAction shulkerTeleport() { return of(Kind.SHULKER_TELEPORT); }
+    /** One native breeze wind charge at the opponent this turn locked; the encounter owns the whole commit. */
+    public static AiAction breezeShot() { return of(Kind.BREEZE_SHOT); }
+    /** One native breeze long jump; the encounter owns the arc, the price and every safety gate. */
+    public static AiAction breezeJump() { return of(Kind.BREEZE_JUMP); }
 }

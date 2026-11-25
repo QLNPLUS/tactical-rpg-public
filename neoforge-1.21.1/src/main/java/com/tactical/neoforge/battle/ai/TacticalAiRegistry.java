@@ -66,6 +66,13 @@ public final class TacticalAiRegistry {
         // 0.85 block guardian fits, its native charge is 60 instead of 80 ticks, and it alone may fire from close
         // range. Neither may inherit the other's answer, and no other swimmer gains either by sharing a
         // superclass.
+        // Exact type only: a shulker is glued to a face of its own block, its shell opens along that axis and it
+        // never walks, so no other golem and no mob sharing a superclass may inherit its attachment, its native
+        // bullet or its relocation.
+        register(ResourceLocation.withDefaultNamespace("shulker"), EntityType.SHULKER, ShulkerTacticalAi::new);
+        // Exact type only: a breeze is the one body whose only attack is a native wind charge and whose only
+        // manoeuvre is a native long jump. No other monster, and no mob sharing a superclass, may inherit either.
+        register(ResourceLocation.withDefaultNamespace("breeze"), EntityType.BREEZE, BreezeTacticalAi::new);
         register(ResourceLocation.withDefaultNamespace("guardian"), EntityType.GUARDIAN,
                 ignored -> new GuardianTacticalAi());
         register(ResourceLocation.withDefaultNamespace("elder_guardian"), EntityType.ELDER_GUARDIAN,

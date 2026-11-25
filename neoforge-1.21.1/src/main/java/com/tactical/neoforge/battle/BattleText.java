@@ -125,6 +125,34 @@ public final class BattleText {
     public static final String KEY_ENEMY_TELEPORT_REACTION = "tactical.journal.enemy.teleport_reaction";
     /** Its own turn starts with one real native water/rain hit instead of wall-clock ticks. */
     public static final String KEY_ENEMY_WATER_CLOCK = "tactical.journal.enemy.water_clock";
+    /** The unit still carried the native levitation effect at its own turn start and rose once. */
+    public static final String KEY_ENEMY_LEVITATION_RISE = "tactical.journal.enemy.levitation_rise";
+    /** One real native shulker bullet left the shell. */
+    public static final String KEY_ATTACK_ENEMY_SHULKER_BULLET = "tactical.journal.attack.shulker_bullet";
+    /** A native relocation really changed this shell's attachment. */
+    public static final String KEY_ENEMY_SHULKER_TELEPORT = "tactical.journal.enemy.shulker_teleport";
+    /** A native hit made this shell relocate inside its own reaction window. */
+    public static final String KEY_ENEMY_SHULKER_REACTION = "tactical.journal.enemy.shulker_reaction";
+    /** The shell re-glued itself to a face that still exists. */
+    public static final String KEY_ENEMY_SHULKER_REATTACH = "tactical.journal.enemy.shulker_reattach";
+    /** No shot was legal: no projectile joined the world and nothing was charged. */
+    public static final String KEY_ENEMY_SHULKER_NO_SHOT = "tactical.journal.enemy.shulker_no_shot";
+    /** No relocation was legal or needed: nothing moved and nothing was charged. */
+    public static final String KEY_ENEMY_SHULKER_NO_RELOCATION = "tactical.journal.enemy.shulker_no_relocation";
+    /** A native replication really produced a child. */
+    public static final String KEY_ENEMY_SHULKER_SPLIT = "tactical.journal.enemy.shulker_split";
+    /** A native-born child could not be admitted and stays in the world untouched. */
+    public static final String KEY_ENEMY_SHULKER_SPLIT_REFUSED = "tactical.journal.enemy.shulker_split_refused";
+    /** The shell lost every legal attachment and left the encounter by name. */
+    public static final String KEY_ENEMY_SHULKER_RELEASED = "tactical.journal.enemy.shulker_released";
+    /** One real native breeze wind charge left the body. */
+    public static final String KEY_ATTACK_ENEMY_BREEZE_WIND_CHARGE = "tactical.journal.attack.breeze_wind_charge";
+    /** No charge was released: no projectile joined the world and nothing was charged. */
+    public static final String KEY_ENEMY_BREEZE_NO_SHOT = "tactical.journal.enemy.breeze_no_shot";
+    /** No jump was legal: the body never left the ground and nothing was charged. */
+    public static final String KEY_ENEMY_BREEZE_NO_JUMP = "tactical.journal.enemy.breeze_no_jump";
+    /** A native long jump really landed at that cell. */
+    public static final String KEY_ENEMY_BREEZE_JUMP = "tactical.journal.enemy.breeze_jump";
     /** Prefix of the potion names a witch row carries as an argument, e.g. {@code tactical.brew.healing}. */
     public static final String BREW_PREFIX = "tactical.brew.";
     public static final String KEY_ENEMY_FLIGHT_MOVE = "tactical.journal.enemy.flight_move";

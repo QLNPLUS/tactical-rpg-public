@@ -27,6 +27,8 @@ import com.tactical.neoforge.battle.ai.*;
 import com.tactical.core.combat.ProjectileAim;
 import com.tactical.core.combat.RangedWeapon;
 import com.tactical.core.combat.ThrowProfile;
+import com.tactical.core.combat.MotionRules;
+import com.tactical.core.combat.BreezeRules;
 import com.tactical.core.grid.GridPos;
 import com.tactical.neoforge.Tactical;
 import com.tactical.neoforge.TacticalConfig;
@@ -56,6 +58,7 @@ import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.Pose;
 import net.minecraft.world.entity.ai.attributes.AttributeModifier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.damagesource.DamageSource;
@@ -68,6 +71,7 @@ import net.minecraft.world.entity.monster.Witch;
 import net.minecraft.world.entity.projectile.ThrownPotion;
 import net.minecraft.world.effect.MobEffect;
 import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.entity.monster.Shulker;
 import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.CrossbowItem;
@@ -122,6 +126,12 @@ public final class ServerBattle {
 
     private static final int PLAYER_STEP_TICKS = 3;
     /**
+     * How far the feet of a newly committed controlled frame may sit from the feet the owning client was last
+     * given before that frame costs a corrected position, as a squared distance (one thousandth of a block).
+     * A held tick that is already there is an animation update, never a correction.
+     */
+    private static final double CLIENT_FEET_ALIGNED = 1.0E-6D;
+    /**
      * Vanilla's own near gate for the ordinary guardian, in blocks: {@code GuardianAttackGoal} keeps firing only
      * while the target is strictly further than three blocks away, which is the squared distance 9.
      */
@@ -141,6 +151,13 @@ public final class ServerBattle {
         final ServerPlayer entity;
         final PlayerParticipant state;
         ItemStack lastSyncedWeapon = ItemStack.EMPTY;
+        /**
+         * The exact feet last handed to this member's own client, or {@code null} when the client is following a
+         * trajectory of its own. It exists so one committed frame costs exactly one corrected position instead of
+         * a correction on every aligned tick - the client half of the repair owns the physics, so a body that is
+         * already there must not be re-corrected.
+         */
+        Vec3 clientFeet;
 
         PlayerMember(ServerPlayer entity, PlayerParticipant state) {
             this.entity = entity;
@@ -249,6 +266,13 @@ public final class ServerBattle {
     private UUID pendingEnemyShot;
     private int shotRecoveryTicks;
     /**
+     * The breeze whose own native charge timeline really ended while its shot was still in the air.
+     *
+     * <p>It names the unit the queue still owes one advance to, so the hand-back happens exactly once and only
+     * after the shot that turn paid for has really resolved. {@code null} means no breeze is holding it.</p>
+     */
+    private UUID breezeHandBack;
+    /**
      * The one self-drink this encounter is presenting right now, or null.
      *
      * <p>It is a bounded, vanilla-styled hold: the borrowed bottle in the hand, vanilla's own drinking flag and
@@ -302,6 +326,9 @@ public final class ServerBattle {
             public boolean isPassable(GridPos cell) { return zone.contains(cell); }
         });
         this.projectiles = new BattleProjectiles(level, creator);
+        // A projectile this encounter fired may only land on a real opponent of this encounter. The guard is the
+        // one place that happens before vanilla applies damage, enchantments and effects.
+        this.projectiles.impactGuard(this::guardProjectileImpact);
         this.zoneRadius = intConfig(TacticalConfig.INSTANCE.zoneRadius, BattleRules.ZONE_RADIUS);
         this.zoneHeight = intConfig(TacticalConfig.INSTANCE.zoneHeight, BattleRules.ZONE_HEIGHT);
         this.participantCap = intConfig(TacticalConfig.INSTANCE.participantCap, BattleRules.PARTICIPANT_CAP);
@@ -551,6 +578,19 @@ public final class ServerBattle {
         // The same question for the water family: a held guardian whose water is gone is not held any more, and
         // nothing else would ever move it because its native travel is switched off.
         maintainGuardianHold();
+        // A shell glued to a block that is gone, and a shell whose native peek no longer matches the encounter's
+        // own window, are both settled here - on the encounter's own tick - before anything is planned.
+        maintainShulker();
+        // The breeze family's own native timeline: one inhale, one facing decision, one real charge, one recovery.
+        // A charge that really ended hands its own turn back exactly once.
+        tickBreezes();
+        if (finished) return;
+        // One tick of every body this encounter is holding up: the hold keeps its exact height. A change here is
+        // authoritative state, so the members are told.
+        if (motion.tick()) sendState();
+        // The native effect's presence is a live fact, not an own-turn one: the tick it really disappears, the hold
+        // ends and the descent rule owns the body from the position it really has.
+        maintainLevitationHolds();
         // The blaze salvo owns the turn while it runs: charge first, then its three shots, then hand back.
         tickBlazeVolley();
         if (finished) return;
@@ -566,6 +606,9 @@ public final class ServerBattle {
         // Vanilla gravity still runs with NoAI. Only airborne-policy actors are pinned,
         // and never while their authoritative own-turn trajectory is advancing.
         for(var entry:enemies.entrySet()) {
+            // A body this encounter is carrying keeps its own authoritative motion: the pin below would drag it
+            // back onto a cell the native push already left, and the driver is the one place that may settle it.
+            if (motionOwns(entry.getKey())) continue;
             EnemyState air=entry.getValue();
             if(air.flying&&!(enemyMoving&&entry.getKey().toString().equals(queue.current()))) {
                 Vec3 held=AerialMovement.feet(air.cell,air.airOffset);
@@ -653,6 +696,10 @@ public final class ServerBattle {
         // flight keeps its own tick, but nobody starts anything on a battlefield whose dead parent has not
         // produced its children yet.
         if (splits.pending()) return;
+        // A native breeze timeline already owns this turn. Keep its opponent lock and proposal frozen rather
+        // than calling planEnemyTurn (and lockOpponent) again on every inhale/recovery tick.
+        // Owned jump frames were advanced above; this gate never stalls the active arc.
+        if (breezes.busy()) return;
         if (phase == BattlePhase.ENEMY_TURN) {
             if (aiDelay > 0) {
                 aiDelay--;
@@ -673,6 +720,10 @@ public final class ServerBattle {
             return;
         }
         ending = true;
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace battle finishing session={} tick={} end={} reason={}",
+                    session.sessionId(), ticks, endCode, reason.getString());
+        }
         journal.finish(reason);
         TacticalSkills.onBattleEnd(this);
         finished = true;
@@ -689,6 +740,21 @@ public final class ServerBattle {
         // while the roster entry is still here.
         dropGuardianBeamOnExit();
         BlazeFireballs.clearBattle(this);
+        // No controlled hold, no native relocation permission, no child window, no reaction scope and no marked
+        // shot may outlive the encounter. Every controlled shell gives its borrowed seam back with it, so a
+        // released unit is a plain vanilla one with no handler, no window and no permission left behind.
+        motion.clear();
+        for (EnemyState endingState : List.copyOf(enemies.values())) releaseShulkerState(endingState);
+        // Every controlled shell gives its own permission, gate and window back in releaseShulkerState, so this
+        // teardown never has to sweep a global: another encounter's in-flight relocation is not this one's to drop.
+        shulkers.clear();
+        ShulkerBullets.forgetSession(session.sessionId());
+        // The same for the breeze family: no charge of this encounter may keep a mark, and no reversed projectile
+        // may keep this encounter's relation authority, once the encounter is over.
+        for (EnemyState endingBreeze : List.copyOf(enemies.values())) releaseBreezeState(endingBreeze);
+        breezes.clear();
+        BreezeWindCharges.forgetSession(session.sessionId());
+        BreezeDeflections.forgetSession(session.sessionId());
         // No marked trident and no SPEAR pose may outlive the encounter that owns them.
         DrownedTridents.clearBattle(this);
         for (EnemyState state : enemies.values()) releaseTridentPose(state.mob.getUUID());
@@ -701,9 +767,11 @@ public final class ServerBattle {
         for (EnemyState state : enemies.values()) released.add(state.mob);
         awaitingShotResolution = false;
         pendingEnemyShot=null;
+        breezeHandBack = null;
         // No fall may outlive the encounter: its state and its reservations. The client interpolation of
         // each member is cancelled by releaseMemberVisuals below, on the same exit snapshot.
         terrainFall.clear();
+        authoritativeFeet.clear();
         spiderFallFeet.clear();
         guardianFallFeet.clear();
         pendingTurnAdvance = false;
@@ -754,6 +822,12 @@ public final class ServerBattle {
         // Drop this encounter's registry entries and ownership claims; other encounters keep theirs.
         BattleManager.onBattleFinished(this);
         Tactical.LOGGER.info("[Tactical] battle end: {}", reason);
+    }
+
+    /** The enumerated reason this encounter ended, or {@code null} while it still runs. */
+    @javax.annotation.Nullable
+    public String endCodeName() {
+        return endCode == null ? null : endCode.name();
     }
 
     public boolean finished() {
@@ -1157,6 +1231,11 @@ public final class ServerBattle {
         // interpolation is cancelled further down by releaseMemberVisuals, which is the one place that
         // sends the empty trajectory for a member leaving.
         if (terrainFall.unit(id) != null) terrainFall.end(id);
+        // A departing member may be a wind charge's locked target or the body that really reversed a shot. Both
+        // authorities end with the member - only its own, so another member's shot and another encounter's flight
+        // keep theirs - and a shot that lost its guard is removed with it instead of staying harmful.
+        BreezeWindCharges.forgetTarget(id);
+        BreezeDeflections.forgetDeflector(id);
         boolean acting = id.toString().equals(queue.current());
         boolean wasManager = session.isManager(id);
         members.remove(id);
@@ -1199,6 +1278,14 @@ public final class ServerBattle {
     /** Individual exit: own animation, own reach modifier, own effects only. */
     private void releaseMemberVisuals(PlayerMember member, boolean battleEnd) {
         member.state.clearMotion();
+        // A partial exit drops every controlled hold of that body immediately: a hold that outlived its own
+        // participant would keep the encounter answering for a unit it no longer has.
+        motion.release(member.id());
+        releaseFeet(member.id());
+        // A member that leaves stops being the owner or the target of anything: its own marked shots are
+        // discarded with their marks, so a still-flying bullet cannot outlive the body it was fired at.
+        ShulkerBullets.forgetActor(member.id());
+        ShulkerBullets.forgetTarget(member.id());
         restoreReach(member);
         com.tactical.neoforge.network.ServerPackets.sendUncheckedType(member.entity,
                 new PlayerStepPacket(member.state.cell(), List.of(), stepTicks, member.entity.getYRot(), false));
@@ -1482,6 +1569,13 @@ public final class ServerBattle {
             // The same single commit point for the water family: the real water position the body was admitted on,
             // plus the motion seam its own tick answers.
             installGuardianState(state);
+            // The same single commit point for this family: the attachment the body was admitted on, plus the
+            // shell/relocation seam its own tick answers. From here until release, this encounter owns that body.
+            installShulkerHandler(state);
+            // The same single commit point for the breeze family: the pose and friction flag the body really had,
+            // plus the deflection seam its own native code answers. From here until release, this encounter owns
+            // that body's charge timeline, its one jump and its own route.
+            installBreezeState(state);
             if (DeveloperTrace.enabled()) {
                 // Development trace: which exact unit joined which encounter. Needed because a client
                 // mirror cannot tell two same-typed mobs apart.
@@ -1568,6 +1662,14 @@ public final class ServerBattle {
         releaseSpiderState(state);
         releaseSlimeState(state);
         releaseGuardianState(state);
+        // A shell gives back its own native pose as well: the attach face and the raw peek this encounter wrote
+        // are exactly what makes a rolled-back admission the same creature it was.
+        shulkers.restore(state);
+        // A breeze gives back the pose and the friction flag it was admitted with, and never a position this
+        // encounter never wrote.
+        releaseBreezeState(state);
+        motion.release(state.mob.getUUID());
+        ShulkerBullets.forgetActor(state.mob.getUUID());
         try {
             restoreUnit(state.mob, state.originalNoAi, state.originalPersistenceRequired,
                     state.originalPosition, state.originalTarget, state.originalFallDistance,
@@ -1703,7 +1805,7 @@ public final class ServerBattle {
 
     public boolean isBusy() {
         return anyPlayerMoving() || enemyMoving || rangedBusy() || witchDrinking() || terrainFall.busy()
-                || splits.pending() || guardianBeamBusy();
+                || splits.pending() || guardianBeamBusy() || motion.busy() || breezes.busy();
     }
 
     /**
@@ -1752,6 +1854,24 @@ public final class ServerBattle {
     public int actorAp(LivingEntity actor) {
         if (sideOf(actor) == null) return 0;
         return actor instanceof ServerPlayer p ? memberState(p).ap() : enemies.get(actor.getUUID()).ap;
+    }
+
+    /** How many successful paid actions that actor has taken this own turn: the surcharge clock, read-only. */
+    public int actorPaidActions(LivingEntity actor) {
+        if (sideOf(actor) == null) return 0;
+        return actor instanceof ServerPlayer p ? memberState(p).paidActions()
+                : enemies.get(actor.getUUID()).paidActions;
+    }
+
+    /** The height this encounter is holding that body at, or {@code null} when it owns no hold of it. */
+    @javax.annotation.Nullable
+    public Double heldHeight(LivingEntity body) {
+        return body == null ? null : motion.heldY(body.getUUID());
+    }
+
+    /** Whether that actor really holds a slot in this encounter's own turn track. */
+    public boolean hasTurnSlot(LivingEntity actor) {
+        return actor != null && queue.order().contains(actor.getUUID().toString());
     }
 
     public int quoteActorActionCost(LivingEntity actor, int base, boolean ramp) {
@@ -3201,6 +3321,20 @@ public final class ServerBattle {
     private java.util.Optional<Vec3> deploymentPosition(Mob mob,java.util.function.Predicate<BlockPos> occupied,
                                                         java.util.function.Predicate<BlockPos> allowed,
                                                         java.util.function.Predicate<Vec3> ready) {
+        // A shell is not a body standing on a floor: it is glued to one of the six faces of its own block, and the
+        // pose it already holds is the first candidate. Asking the ordinary ground question here would move a wall
+        // or ceiling shell onto a floor row - or refuse a body that is already perfectly placed.
+        if (ShulkerController.isActor(mob) && mob instanceof net.minecraft.world.entity.monster.Shulker shell) {
+            java.util.Optional<Vec3> found = ShulkerPlacement.find(level, shell,
+                    cell -> occupied.test(new BlockPos(cell.x(), cell.y(), cell.z())),
+                    cell -> allowed.test(new BlockPos(cell.x(), cell.y(), cell.z())),
+                    ready == null ? zone::contains : cell -> true);
+            if (found.isEmpty()) return found;
+            // A caller with its own would-be battlefield (an absorbing expansion) answers for the whole body
+            // itself; a candidate it refuses is simply not this shell's place.
+            if (ready != null && !ready.test(found.get())) return java.util.Optional.empty();
+            return found;
+        }
         boolean family = SlimeGround.supports(mob) || GuardianMovement.supports(mob);
         java.util.function.Predicate<Vec3> gate = family
                 ? (ready != null ? ready : feet -> familyCandidateFits(mob, feet, zone::contains))
@@ -3225,6 +3359,13 @@ public final class ServerBattle {
      */
     private boolean familyCandidateFits(LivingEntity mob, Vec3 feet, java.util.function.Predicate<GridPos> wouldBeZone) {
         if (mob == null) return false;
+        // The shell's whole full-open box is the body, not its base cell: a closed shell is a smaller box than
+        // the one it opens into, so the base cell alone would let it be granted a battlefield it sticks out of.
+        if (mob instanceof Mob shellMob && ShulkerController.isActor(shellMob)
+                && shellMob instanceof net.minecraft.world.entity.monster.Shulker shell) {
+            return ShulkerPlacement.candidateFits(level, shell, feet,
+                    cell -> occupiedByOthers(cell, shell.getUUID()), wouldBeZone);
+        }
         if (SlimeGround.supports(mob)) return slimeCandidateFits(mob, feet, wouldBeZone);
         if (GuardianMovement.supports(mob)) return guardianCandidateFits(mob, feet, wouldBeZone);
         return true;
@@ -3306,6 +3447,12 @@ public final class ServerBattle {
         // its own bounded control is the only thing that moves that body.
         if (enemy.swim != null) {
             stepGuardianSwim(enemy);
+            return;
+        }
+        // A native long jump owns the turn its own arc: the encounter's own frame step is the only thing that
+        // moves that body until it lands or stops being real.
+        if (breezes.jumping(enemy.mob.getUUID())) {
+            stepBreezeJump(enemy);
             return;
         }
         // A hop edge in flight owns the turn its own arc, exactly like a walked edge owns its segment. It is
@@ -4842,7 +4989,12 @@ public final class ServerBattle {
      * is refused because it is not a participant at all.</p>
      */
     public boolean acceptsTrident(UUID actorId, Entity candidate) {
-        return acceptsMarkedProjectile(actorId, candidate);
+        return acceptsMarkedProjectile(actorId, candidate, null);
+    }
+
+    /** The same answer for one exact thrown trident, so a breeze-reversed throw keeps its own relation rule. */
+    public boolean acceptsTrident(UUID actorId, Entity candidate, Entity projectile) {
+        return acceptsMarkedProjectile(actorId, candidate, projectile);
     }
 
     /**
@@ -5146,28 +5298,37 @@ public final class ServerBattle {
      * never ignited, hurt or given post-attack enchantment effects in the first place.</p>
      */
     public boolean acceptsFireball(UUID actorId, Entity candidate) {
-        return acceptsMarkedProjectile(actorId, candidate);
+        return acceptsMarkedProjectile(actorId, candidate, null);
+    }
+
+    /** The same answer for one exact fireball, so a breeze-reversed shot keeps its own relation rule. */
+    public boolean acceptsFireball(UUID actorId, Entity candidate, Entity projectile) {
+        return acceptsMarkedProjectile(actorId, candidate, projectile);
     }
 
     /**
      * The one predicate both marked-projectile rules share: a real participant of this encounter that is
      * opposed to the shooter, and nothing else. Extracted rather than copied, so a fireball and a trident can
      * never disagree about what "legal target" means.
+     *
+     * <p>A projectile a controlled breeze really reversed answers the deflector's own relations <em>instead of</em>
+     * the shooter's: the reversal exists to send the shot back at the side that fired it, and requiring both sides'
+     * opposition at once would be an empty set in a two-side battle. That branch is asked with the exact
+     * projectile, so an unreflected shot keeps this predicate's original answer bit for bit.</p>
      */
-    private boolean acceptsMarkedProjectile(UUID actorId, Entity candidate) {
+    private boolean acceptsMarkedProjectile(UUID actorId, Entity candidate, @javax.annotation.Nullable Entity projectile) {
         if (finished || ending || actorId == null || candidate == null) return false;
+        if (!(candidate instanceof LivingEntity victim)) return false;
+        if (victim.level() != level || !victim.isAlive() || victim.isRemoved()) return false;
+        if (!holdsParticipant(victim)) return false;
+        if (projectile instanceof net.minecraft.world.entity.projectile.Projectile shot) {
+            BreezeDeflections.Reflection reflection = reflectedAuthority(shot);
+            if (reflection != null) return deflectorAllows(reflection, victim);
+        }
         EnemyState shooter = enemies.get(actorId);
         if (shooter == null || shooter.mob == null || shooter.mob.isRemoved() || !shooter.mob.isAlive()) return false;
         if (candidate == shooter.mob) return false;
-        if (!(candidate instanceof LivingEntity victim)) return false;
-        if (victim.level() != level || !victim.isAlive() || victim.isRemoved()) return false;
-        if (!opposed(shooter.mob, victim)) return false;
-        if (victim instanceof ServerPlayer player) {
-            PlayerMember member = members.get(player.getUUID());
-            return member != null && member.entity == player;
-        }
-        EnemyState state = enemies.get(victim.getUUID());
-        return state != null && state.mob == victim;
+        return opposed(shooter.mob, victim);
     }
 
     // ------------------------------------------------------------------
@@ -5473,12 +5634,26 @@ public final class ServerBattle {
      * </p>
      */
     public boolean acceptsSplash(LivingEntity thrower, LivingEntity candidate) {
+        return acceptsSplash(thrower, candidate, null);
+    }
+
+    /**
+     * The same answer for one exact bottle, so a breeze-reversed throw keeps its own relation rule.
+     *
+     * <p>A bottle that really was reversed answers the deflecting body's relations instead of the thrower's, on the
+     * same reasoning as every other marked kind: the reversal replaced the side the throw was made for. An
+     * unreflected bottle keeps the original answer exactly.</p>
+     */
+    public boolean acceptsSplash(LivingEntity thrower, LivingEntity candidate,
+                                 @javax.annotation.Nullable Entity projectile) {
         if (finished || thrower == null || candidate == null || candidate == thrower) return false;
         if (candidate.level() != level || !candidate.isAlive() || candidate.isRemoved()) return false;
-        if (!opposed(thrower, candidate)) return false;
-        if (candidate instanceof ServerPlayer player) return members.containsKey(player.getUUID());
-        EnemyState state = enemies.get(candidate.getUUID());
-        return state != null && state.mob == candidate;
+        if (!holdsParticipant(candidate)) return false;
+        if (projectile instanceof net.minecraft.world.entity.projectile.Projectile shot) {
+            BreezeDeflections.Reflection reflection = reflectedAuthority(shot);
+            if (reflection != null) return deflectorAllows(reflection, candidate);
+        }
+        return opposed(thrower, candidate);
     }
 
     private static TacticalWitchAccess witchAccess(Mob mob) {
@@ -5924,6 +6099,72 @@ public final class ServerBattle {
     }
 
     /**
+     * The turn translation of the native levitation effect, for one AI unit at its own turn start.
+     *
+     * <p>Vanilla lifts a floating body every tick; a turn-based encounter cannot honour that without letting a
+     * wall-clock timer decide where a unit stands, and the effect's own duration is already settled on this
+     * unit's own-turn clock by {@code BattleEffects}. What is left is one controlled relocation per own turn,
+     * bounded by the live ceiling, the battlefield and the unit's own body space, and a hold that keeps the
+     * unit exactly there until the effect is gone. A unit with no effect is not lifted and is not held: if it is
+     * standing in the air its descent belongs to the existing forced-fall rule, from the position it really has.</p>
+     *
+     * <p>A hold from the previous own cycle is <b>renewed</b>, not a reason to stand still: while the native
+     * effect lasts, every own turn rises once from the feet the body really has. Otherwise the rule would lift a
+     * body exactly once and then freeze it for the whole duration, which is not a translation of anything.</p>
+     *
+     * <p>Deliberately not {@code flying}: a floating unit keeps its ordinary cell, its ordinary pathing and
+     * its ordinary support rules, and gains no air route from this. Deliberately not a victim charge either: being
+     * lifted is not an action of the lifted unit.</p>
+     */
+    private void riseWithLevitation(UUID id, LivingEntity body, GridPos cell, boolean player) {
+        if (id == null || body == null) return;
+        if (!body.isAlive() || body.isRemoved() || body.level() != level) {
+            motion.release(id);
+            return;
+        }
+        net.minecraft.world.effect.MobEffectInstance levitation =
+                body.getEffect(net.minecraft.world.effect.MobEffects.LEVITATION);
+        if (levitation == null) {
+            // Expired, removed or cancelled by another mod: the hold ends here and the descent is the fall rule's
+            // business, from the position the body really has.
+            motion.release(id);
+            return;
+        }
+        boolean risen = motion.beginRise(body, player, levitation.getAmplifier());
+        if (DeveloperTrace.enabled()) {
+            GridPos fromCell = new GridPos(Mth.floor(body.getX()), Mth.floor(body.getY() + 1.0E-7D),
+                    Mth.floor(body.getZ()));
+            GridPos upCell = new GridPos(fromCell.x(), fromCell.y() + 1, fromCell.z());
+            Tactical.LOGGER.info("[Tactical] dev-trace levitation rise session={} tick={} uuid={} amplifier={} "
+                            + "risen={} feet={} cell={} held={} from={}/in={} up={}/in={} free={} loaded={} "
+                            + "clear={}", session.sessionId(), ticks, id,
+                    levitation.getAmplifier(), risen, body.position(), cell, motion.describe(),
+                    fromCell, zone.contains(fromCell), upCell, zone.contains(upCell),
+                    occupied(upCell),
+                    level.isLoaded(BlockPos.containing(body.getX(), body.getY() + 1.0D, body.getZ())),
+                    level.noCollision(body, body.getBoundingBox().move(0.0D, 1.0D, 0.0D)));
+        }
+        if (risen) {
+            journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_LEVITATION_RISE,
+                    BattleText.name(body)));
+            sendState();
+        }
+    }
+
+    /** The AI-unit form of the same rule. */
+    private void riseWithLevitation(EnemyState enemy) {
+        if (enemy == null || enemy.mob == null) return;
+        riseWithLevitation(enemy.mob.getUUID(), enemy.mob, enemy.cell, false);
+    }
+
+    /** The member form: an ordinary player is lifted by exactly the same rule and its own frame is synchronized. */
+    private void riseWithLevitation(PlayerMember member) {
+        if (member == null || member.entity == null) return;
+        GridPos cell = member.state.cell();
+        riseWithLevitation(member.id(), member.entity, cell == null ? cellOf(member.entity) : cell, true);
+    }
+
+    /**
      * Start one own turn of a controlled enderman.
      *
      * <p>Fresh quotas for this turn, the exposure fact read from the entity itself, and - when it is really
@@ -5975,6 +6216,1003 @@ public final class ServerBattle {
         state.endermanHurtDepth = 0;
         state.endermanHurtBranch = false;
         if (state.mob instanceof TacticalEndermanAccess access) access.tactical$setLandingHandler(null);
+    }
+
+    // ------------------------------------------------------------------
+    // shulker: typed routing into the dedicated controller
+    // ------------------------------------------------------------------
+
+    /**
+     * The encounter's own door into the shulker controller.
+     *
+     * <p>Nothing about this family's rules lives in this class any more: the attachment geometry, the per-kind
+     * quotas, the visible window, the relocation proposal, the native reaction scope and the child hand-over all
+     * belong to {@link ShulkerController}. What stays here is exactly what a controller may not know - identity,
+     * AP, the roster, the battlefield, the journal and the admission transaction - exposed through a small seat.</p>
+     */
+    private final ShulkerController shulkers = new ShulkerController(new ShulkerSeat());
+
+    /** Install the one routing handler this shell's native code answers while this encounter owns it. */
+    private void installShulkerHandler(EnemyState state) {
+        shulkers.install(state);
+    }
+
+    /** Give one shell back to its own vanilla tick, keeping its real final position and effects. */
+    private void releaseShulkerState(EnemyState state) {
+        if (state == null || state.mob == null) return;
+        shulkers.release(state);
+        ShulkerBullets.forgetActor(state.mob.getUUID());
+    }
+
+    /** Start one own turn of a controlled shell. */
+    private void beginShulkerTurn(EnemyState state) {
+        shulkers.beginTurn(state);
+    }
+
+    /** Keep every controlled shell honest once per encounter tick. */
+    private void maintainShulker() {
+        shulkers.maintain();
+    }
+
+    /** What the planner is allowed to know about one shell. */
+    private ShulkerState shulkerState(EnemyState state) {
+        ShulkerState answer = shulkers.state(state);
+        if (DeveloperTrace.enabled() && answer.valid()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace shulker state session={} uuid={} ap={} paid={} busy={} "
+                            + "actorTurn={} shoot={} teleport={} target={} cell={} runs={}", session.sessionId(),
+                    state.mob.getUUID(), state.ap, state.paidActions, isBusy(), isActorTurn(state.mob),
+                    answer.mayShoot(), answer.mayTeleport(),
+                    actionOpponent(state) == null ? "none" : actionOpponent(state).getName().getString(),
+                    state.cell, shulkers.describe());
+        }
+        return answer;
+    }
+
+    /** One native bullet, committed through the controller. */
+    private boolean shulkerShot(EnemyState state) {
+        return shulkers.shoot(state);
+    }
+
+    /** One native relocation, committed through the controller. */
+    private boolean shulkerTeleport(EnemyState state) {
+        return shulkers.relocate(state);
+    }
+
+    /**
+     * The encounter's own entry for a real hit on a controlled shell.
+     *
+     * <p>Called from the incoming-damage hook inside the native {@code hurt} scope, before vanilla's damage path,
+     * because the one bounded reaction a shell may take lives inside it.</p>
+     */
+    public void shulkerIncomingDamage(Shulker shulker, DamageSource source) {
+        if (finished || ending || shulker == null) return;
+        EnemyState state = enemies.get(shulker.getUUID());
+        if (state == null || state.mob != shulker) return;
+        shulkers.incomingDamage(state, source);
+    }
+
+    /** Native {@code hurt} entry of one shell: open its own bounded reaction scope. */
+    public void shulkerHurtBegan(Shulker shulker) {
+        if (finished || ending || shulker == null) return;
+        EnemyState state = enemies.get(shulker.getUUID());
+        if (state == null || state.mob != shulker) return;
+        shulkers.beginHurt(shulker);
+    }
+
+    /** Native {@code hurt} return: settle the real receipt and drop the whole scope. */
+    public void shulkerHurtEnded(Shulker shulker) {
+        if (shulker == null) return;
+        EnemyState state = enemies.get(shulker.getUUID());
+        if (state == null || state.mob != shulker) return;
+        shulkers.endHurt(shulker);
+    }
+
+    // ------------------------------------------------------------------
+    // breeze: typed routing into the dedicated controller
+    // ------------------------------------------------------------------
+
+    /**
+     * The encounter's own door into the breeze controller.
+     *
+     * <p>Nothing about this family's rules lives in this class: the per-kind quotas, the charge timeline, the one
+     * jump arc, the bounded retreat and the deflection record all belong to {@link BreezeController}. What stays
+     * here is exactly what a controller may not know - identity, AP, the roster, the battlefield, the journal, the
+     * real native entity writes and the admission of one native projectile - exposed through a small seat.</p>
+     */
+    private final BreezeController breezes = new BreezeController(new BreezeSeat());
+
+    /** Install the one routing handler this breeze's own native code answers while this encounter owns it. */
+    private void installBreezeState(EnemyState state) {
+        if (state == null || state.mob == null) return;
+        if (!BreezeController.isActor(state.mob)) return;
+        breezes.install(state);
+    }
+
+    /** Give one breeze back to its own vanilla tick, keeping its real final position and effects. */
+    private void releaseBreezeState(EnemyState state) {
+        if (state == null || state.mob == null) return;
+        breezes.release(state);
+    }
+
+    /** Start one own turn of a controlled breeze. */
+    private void beginBreezeTurn(EnemyState state) {
+        breezes.beginTurn(state);
+    }
+
+    /** What the planner is allowed to know about one breeze. */
+    private BreezeState breezeState(EnemyState state) {
+        BreezeState answer = breezes.state(state);
+        if (DeveloperTrace.enabled() && answer.valid()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace breeze state session={} uuid={} ap={} paid={} busy={} "
+                            + "actorTurn={} shoot={} jump={} shotUsed={} maneuvered={} shotCost={} jumpCost={} "
+                            + "target={} cell={} runs={}", session.sessionId(),
+                    state.mob.getUUID(), state.ap, state.paidActions, isBusy(), isActorTurn(state.mob),
+                    answer.mayShoot(), answer.mayJump(), answer.shotUsed(), answer.maneuvered(),
+                    answer.shotCost(), answer.jumpCost(),
+                    actionOpponent(state) == null ? "none" : actionOpponent(state).getName().getString(),
+                    state.cell, breezes.describe());
+        }
+        return answer;
+    }
+
+    /** One native wind charge, committed through the controller. */
+    private boolean breezeShot(EnemyState state) {
+        return breezes.shoot(state);
+    }
+
+    /** One native long jump, committed through the controller. */
+    private boolean breezeJump(EnemyState state) {
+        return breezes.jump(state);
+    }
+
+    /** One bounded ground retreat, resolved by the controller. */
+    private List<GridPos> breezeSlide(EnemyState state) {
+        return breezes.slide(state);
+    }
+
+    /**
+     * One tick of every controlled breeze's own charge timeline.
+     *
+     * <p>A breeze's charge is two clocks, not one: the native inhale/recovery timeline, which the controller owns,
+     * and the real tracked flight of the shot it released, which the encounter already tracks for every other
+     * ranged kind. The turn is handed back exactly once and only when <em>both</em> are finished. The native
+     * recovery is four ticks while a shot fired from the far end of the band flies for twenty or more, so a
+     * timeline-only hand-back would start the next own turn - its recovery and its AP - while the shot that turn
+     * paid for was still in the air.</p>
+     *
+     * <p>Nothing is billed here and no clock is advanced early: the price of the charge was committed when the
+     * world really took the projectile. A cancelled spawn, a refused facing or a dying actor clears the barrier
+     * without a second charge, and if the queue already moved on for another reason the deferred hand-back is
+     * simply dropped instead of advancing a turn twice.</p>
+     */
+    private void tickBreezes() {
+        BreezeController.Tick tick = breezes.tick();
+        if (tick.handBack() != null) {
+            String current = queue.current();
+            if (!finished && !ending && tick.handBack().toString().equals(current)) {
+                // That breeze's own native timeline really ended. Its shot may still be flying, so the turn stays
+                // with it until the real tracked flight has resolved too.
+                breezeHandBack = tick.handBack();
+            }
+        }
+        if (breezeHandBack != null) {
+            UUID handBack = breezeHandBack;
+            if (breezeHandBackIsOver(handBack)) {
+                breezeHandBack = null;
+                String current = queue.current();
+                if (!finished && !ending && handBack.toString().equals(current)) {
+                    advanceTurn();
+                    return;
+                }
+            }
+        }
+        if (tick.changed()) sendState();
+    }
+
+    /**
+     * Whether the deferred breeze hand-back can no longer be honoured, or is not owed yet.
+     *
+     * <p>The barrier is released - never advanced from here - when the encounter is finishing, when the breeze
+     * stopped holding the turn for any other reason, or when that breeze left the roster. It is held while the
+     * breeze still owns another frame of its own timeline or while any real flight of this encounter is still
+     * unresolved.</p>
+     */
+    private boolean breezeHandBackIsOver(UUID breezeId) {
+        if (finished || ending) return true;
+        if (breezeId == null) return true;
+        if (breezes.charging(breezeId) || breezes.jumping(breezeId)) return false;
+        EnemyState state = enemies.get(breezeId);
+        if (state == null || state.mob == null || !state.mob.isAlive() || state.mob.isRemoved()) return true;
+        return !projectiles.pending();
+    }
+
+    /**
+     * One frame of one controlled breeze's native jump.
+     *
+     * <p>Every frame is re-proved by the controller before the body is written; what stays here is the encounter's
+     * own turn handling: an untouched refusal is free and ends the turn, an interrupted jump keeps its price, stops
+     * where the body really is and hands the descent to the ordinary fall rule, and a landed jump buys exactly one
+     * newly legal shot or its end.</p>
+     */
+    private void stepBreezeJump(EnemyState enemy) {
+        BreezeController.JumpStep step = breezes.stepJump(enemy);
+        switch (step) {
+            case IDLE -> {
+                enemyMoving = false;
+                advanceTurn();
+            }
+            case ADVANCED -> { }
+            case LANDED -> {
+                enemyMoving = false;
+                enemyStepping = false;
+                enemyPath = List.of();
+                if (targetLost(enemy)) {
+                    sendState();
+                    advanceTurn();
+                    return;
+                }
+                AiAction followUp = ai.afterMovement(aiContext(enemy));
+                // A jump buys one shot or the end: never a second jump, never a fresh slide inside this turn.
+                boolean allowed = followUp.kind() == AiAction.Kind.BREEZE_SHOT
+                        || followUp.kind() == AiAction.Kind.END_TURN;
+                resolveAiAction(enemy, allowed ? followUp : AiAction.endTurn());
+            }
+            case REFUSED, STOPPED -> {
+                enemyMoving = false;
+                enemyStepping = false;
+                enemyPath = List.of();
+                sendState();
+                advanceTurn();
+            }
+        }
+    }
+
+    /**
+     * The encounter's answers for the burst of one of its own marked wind charges.
+     *
+     * <p>The controller of the charge's own firing breeze is not asked to decide anything here: the shape of the
+     * burst is vanilla's. What this encounter adds is who may be affected at all and who really performs the one
+     * displacement a body accepted.</p>
+     */
+    @javax.annotation.Nullable
+    BreezeBurst.Scope windBurst(net.minecraft.world.entity.projectile.windcharge.BreezeWindCharge charge,
+                                BreezeWindCharges.Owner owner) {
+        if (charge == null || owner == null || finished || ending) return null;
+        if (!owner.sessionId().equals(session.sessionId())) return null;
+        LivingEntity actor = liveParticipant(owner.actorId());
+        if (!(actor instanceof net.minecraft.world.entity.monster.breeze.Breeze breeze)) return null;
+        return new BreezeBurst.Scope() {
+            /** Every accepted body this encounter will move itself, with the displacement it really took. */
+            private final java.util.List<LivingEntity> bodies = new java.util.ArrayList<>();
+            private final java.util.List<Vec3> deltas = new java.util.ArrayList<>();
+
+            @Override public boolean protects(LivingEntity body) {
+                if (body == null) return true;
+                // An owned burst whose own source stopped being valid answerable - the firing body died, left or
+                // was replaced inside this very callback - stays fail-closed: nothing at all is affected. The
+                // stake is not "cancel the already-running native method" (a discard cannot do that) but "this
+                // exact burst may never become a wild one".
+                if (finished || ending) return true;
+                if (!stillOwned()) return true;
+                // The firing body itself, its own side, a bystander who is not in this encounter and another
+                // encounter's member are never part of this burst.
+                if (body == breeze) return true;
+                if (!isParticipant(body)) return true;
+                if (allied(breeze, body)) return true;
+                return !opposed(breeze, body);
+            }
+
+            /** Whether the firing body is still exactly the participant this encounter holds right now. */
+            private boolean stillOwned() {
+                if (!breeze.isAlive() || breeze.isRemoved() || breeze.level() != level) return false;
+                EnemyState held = enemies.get(breeze.getUUID());
+                return held != null && held.mob == breeze;
+            }
+
+            @Override public boolean capture(LivingEntity body, Vec3 accepted) {
+                if (body == null || accepted == null) return false;
+                if (finished || ending || !stillOwned()) return false;
+                if (!body.isAlive() || body.isRemoved() || body.level() != level) return false;
+                bodies.add(body);
+                deltas.add(accepted);
+                return true;
+            }
+
+            @Override public void settle() {
+                for (int index = 0; index < bodies.size(); index++) {
+                    LivingEntity body = bodies.get(index);
+                    Vec3 delta = deltas.get(index);
+                    if (body.isAlive() && !body.isRemoved() && body.level() == level) {
+                        // The one motion owner decides how far the body really goes: the native vector is the
+                        // request, the swept proof is what this encounter accepts, and the real fractional
+                        // position is authoritative afterwards.
+                        boolean player = body instanceof ServerPlayer;
+                        motion.applyImpulse(body, player, delta, breeze.getUUID());
+                    }
+                }
+                bodies.clear();
+                deltas.clear();
+                sendState();
+            }
+        };
+    }
+
+    /**
+     * Whether one already-reversed marked shot may still affect that body.
+     *
+     * <p>Asked by every per-kind projectile guard <em>after</em> it proved the projectile is one of this
+     * encounter's. A projectile the breeze never deflected keeps the guard's own original answer, so no old
+     * behaviour changes; a deflected one answers to the deflecting body's own live relations, so it can never
+     * strike that body, its allies, a bystander or another encounter, and the original firing receipt is untouched.
+     * </p>
+     */
+    boolean reflectionAllows(net.minecraft.world.entity.projectile.Projectile projectile, Entity victim) {
+        BreezeDeflections.Reflection reflection = reflectedAuthority(projectile);
+        if (reflection == null) return true;
+        if (!(victim instanceof LivingEntity body)) return false;
+        return deflectorAllows(reflection, body);
+    }
+
+    /**
+     * The real reflection of that exact shot, when it belongs to this live encounter.
+     *
+     * <p>Both facts are proved, never assumed: the record must have been written for this encounter's session, and
+     * the body that really deflected the shot must still be a live participant. Anything else answers {@code null},
+     * which sends the shot back to its own original rule instead of lending it an authority nobody is left to own.
+     * </p>
+     */
+    @javax.annotation.Nullable
+    private BreezeDeflections.Reflection reflectedAuthority(net.minecraft.world.entity.projectile.Projectile shot) {
+        BreezeDeflections.Reflection reflection = BreezeDeflections.of(shot);
+        if (reflection == null || finished || ending) return null;
+        if (!reflection.sessionId().equals(session.sessionId())) return null;
+        return liveParticipant(reflection.deflectorId()) == null ? null : reflection;
+    }
+
+    /**
+     * Whether a really reversed shot may affect that body, asked of the body that turned it around.
+     *
+     * <p>This <em>replaces</em> the shooting side's own relation rule, it is not ANDed with it. A reversal exists
+     * to send a shot back at the side that fired it, and in a two-side battle the set of bodies opposed to both the
+     * original shooter and the deflector is empty - so requiring both answers would make every reversed shot
+     * unable to hit anybody at all, which is the opposite of what the native reversal does. What stays untouched is
+     * everything about billing and lifetime: the payer, the price and the flight are the original shooter's.</p>
+     */
+    private boolean deflectorAllows(BreezeDeflections.Reflection reflection, LivingEntity victim) {
+        if (reflection == null || victim == null) return false;
+        LivingEntity deflector = liveParticipant(reflection.deflectorId());
+        if (deflector == null || victim == deflector) return false;
+        if (victim.level() != level || !victim.isAlive() || victim.isRemoved()) return false;
+        if (!holdsParticipant(victim)) return false;
+        if (!opposed(deflector, victim)) return false;
+        return !allied(deflector, victim);
+    }
+
+    /**
+     * Whether that exact body is a breeze this encounter really controls right now.
+     *
+     * <p>Identity, roster entry and an installed routing handler are all required, so only a body this encounter
+     * adopted and drives can ever answer a reversed shot with its own native deflection.</p>
+     */
+    private boolean isControlledBreezeOfThisEncounter(LivingEntity body) {
+        if (body == null || !(body instanceof net.minecraft.world.entity.monster.breeze.Breeze breeze)) return false;
+        EnemyState state = enemies.get(breeze.getUUID());
+        if (state == null || state.mob != breeze) return false;
+        if (!body.level().equals(level) || !body.isAlive() || body.isRemoved()) return false;
+        return breezes.controls(breeze.getUUID());
+    }
+
+    /** Whether that exact body is one of this encounter's participants right now. */
+    private boolean holdsParticipant(LivingEntity body) {
+        if (body instanceof ServerPlayer player) {
+            PlayerMember member = members.get(player.getUUID());
+            return member != null && member.entity == player;
+        }
+        EnemyState state = enemies.get(body.getUUID());
+        return state != null && state.mob == body;
+    }
+
+    /**
+     * Whether that exact body may be struck by one of this encounter's marked shots, before any native side effect.
+     *
+     * <p>One rule for every marked kind, so a bullet, a wind charge, a fireball and a trident can never disagree
+     * about who is a legal recipient. Two shapes are answered:</p>
+     *
+     * <ul>
+     *   <li>an <b>unreflected</b> shot keeps its original rule bit for bit: the locked target and nothing else, and
+     *       only while it is a live participant opposed to the shooter;</li>
+     *   <li>a <b>really reversed</b> shot answers to the deflector's own live relations instead - see
+     *       {@link #deflectorAllows} - because the reversal deliberately replaced the side the shot was fired
+     *       for.</li>
+     * </ul>
+     *
+     * <p>Everything else fails closed: an owner or target that left, a foreign body, a bystander, an ally.</p>
+     */
+    private boolean markedImpactAllowed(net.minecraft.world.entity.projectile.Projectile shot,
+                                        LivingEntity actor,
+                                        @javax.annotation.Nullable LivingEntity target,
+                                        Entity victim) {
+        if (finished || ending || actor == null || victim == null) return false;
+        if (!(victim instanceof LivingEntity body)) return false;
+        if (body == actor) return false;
+        if (body.level() != level || !body.isAlive() || body.isRemoved()) return false;
+        BreezeDeflections.Reflection reflection = reflectedAuthority(shot);
+        if (reflection != null) return deflectorAllows(reflection, body);
+        if (target == null || target.isRemoved() || !target.isAlive()) return false;
+        if (body != target) return false;
+        return opposed(actor, body) && !allied(actor, body);
+    }
+
+    /**
+     * The encounter's own pre-impact answer for a projectile <em>this encounter fired</em>.
+     *
+     * <p>Scoped to its own kinds on purpose. A native shulker bullet curves and can meet anything on the way, and a
+     * breeze wind charge damages the body it really strikes before it bursts, so both impacts are this encounter's
+     * decision - but an arrow, a trident or a fireball belongs to its own per-kind guard, and the existing
+     * retained-mark cancellation of a thrown trident must keep answering exactly as it did before this family
+     * existed. A projectile this encounter never marked is therefore left completely alone.</p>
+     *
+     * <p>For a marked shot the ownership is proved, not assumed: the session, the actor and the target are the
+     * ones the shot was fired with, and they must still be the same live participants. Anything else fails
+     * <b>closed</b> - the event is cancelled and the shot leaves with the projectile - so an owner or target that
+     * left the field can never make a still-flying shot hurt a bystander, a same-side unit or another encounter's
+     * member. Cancelling here is what makes the refusal real: a discarded projectile would still finish this
+     * tick's native hit, whose damage, enchantments and levitation happen before anything could look at it again.
+     * </p>
+     *
+     * @return true when the impact was refused and the event cancelled
+     */
+    private boolean guardProjectileImpact(net.neoforged.neoforge.event.entity.ProjectileImpactEvent event) {
+        if (finished || event.getProjectile().isRemoved()) return false;
+        if (event.getProjectile() instanceof net.minecraft.world.entity.projectile.windcharge.BreezeWindCharge charge) {
+            return guardWindChargeImpact(event, charge);
+        }
+        if (event.getProjectile() instanceof net.minecraft.world.entity.projectile.AbstractArrow arrow) {
+            // A plain arrow has no per-kind guard of its own: the only relation authority this encounter has over
+            // one is what a real reversal earned it, and refusing has to happen before the native hurt runs.
+            return guardReflectedArrowImpact(event, arrow);
+        }
+        if (!(event.getProjectile() instanceof net.minecraft.world.entity.projectile.ShulkerBullet bullet)) {
+            return false;
+        }
+        ShulkerBullets.Owner owner = ShulkerBullets.markOf(bullet);
+        if (owner == null) return false;
+        if (!(event.getRayTraceResult() instanceof net.minecraft.world.phys.EntityHitResult entityHit)) {
+            // A later listener may cancel this block impact. Retain ownership until the projectile really
+            // leaves or its tracked flight ends; a cancelled collision must never turn it into an unmarked shot.
+            return false;
+        }
+        Entity victim = entityHit.getEntity();
+        LivingEntity actor = liveParticipant(owner.actorId());
+        LivingEntity target = liveParticipant(owner.targetId());
+        boolean stillOurs = !ending && owner.sessionId().equals(session.sessionId())
+                && actor != null && target != null && target.isAlive() && !target.isRemoved();
+        if (!stillOurs) {
+            refuseMarkedShot(event, bullet);
+            return true;
+        }
+        if (markedImpactAllowed(bullet, actor, target, victim)) return false;
+        refuseMarkedShot(event, bullet);
+        return true;
+    }
+
+    /**
+     * The same answer for the direct entity impact of one marked breeze wind charge.
+     *
+     * <p>The native charge hurts the body it strikes for {@code 1.0} and then runs its burst in place, and the
+     * burst's own explosion does no entity damage at all - so the only way a protected body can be hurt by this
+     * family is this one direct hit. It is therefore decided here, at the seam that runs before the damage event,
+     * the post-attack enchantments and the burst: a body this encounter may not touch takes no direct damage, and
+     * the charge is cancelled with its projectile instead of bursting at that body. A charge whose ownership no
+     * longer holds - session, actor or target gone, or a replacement in the same seat - fails closed the same way,
+     * so a still-flying charge can never become an unguarded one.</p>
+     */
+    private boolean guardWindChargeImpact(net.neoforged.neoforge.event.entity.ProjectileImpactEvent event,
+                                          net.minecraft.world.entity.projectile.windcharge.BreezeWindCharge charge) {
+        BreezeWindCharges.Owner owner = BreezeWindCharges.markOf(charge);
+        if (owner == null) return false;
+        if (!(event.getRayTraceResult() instanceof net.minecraft.world.phys.EntityHitResult entityHit)) {
+            // A block impact is vanilla's own burst and is answered by the burst scope, not here.
+            return false;
+        }
+        Entity victim = entityHit.getEntity();
+        LivingEntity actor = liveParticipant(owner.actorId());
+        LivingEntity target = liveParticipant(owner.targetId());
+        boolean stillOurs = !ending && owner.sessionId().equals(session.sessionId()) && actor != null;
+        if (stillOurs && markedImpactAllowed(charge, actor, target, victim)) return false;
+        BreezeWindCharges.forget(charge);
+        event.setCanceled(true);
+        charge.discard();
+        return true;
+    }
+
+    /**
+     * The same answer for a shot this encounter fired that a controlled breeze really reversed.
+     *
+     * <p>An ordinary arrow is the one ranged kind with no per-kind collision rule of its own, so before this
+     * family existed nothing could refuse it. Once a controlled breeze really turns one around, its recipients are
+     * the deflector's own relations - and a body outside that set must be refused before the native hurt, the
+     * arrow's own damage and its pickup state. Refusing here cancels the impact and removes the arrow, exactly like
+     * every other refused marked shot; an arrow this encounter never reversed has no record and is untouched.</p>
+     */
+    private boolean guardReflectedArrowImpact(net.neoforged.neoforge.event.entity.ProjectileImpactEvent event,
+                                              net.minecraft.world.entity.projectile.AbstractArrow arrow) {
+        BreezeDeflections.Reflection reflection = reflectedAuthority(arrow);
+        if (reflection == null) return false;
+        if (!(event.getRayTraceResult() instanceof net.minecraft.world.phys.EntityHitResult entityHit)) {
+            // A block impact is the arrow's own business; only a body can be a refused recipient.
+            return false;
+        }
+        Entity victim = entityHit.getEntity();
+        if (victim instanceof LivingEntity body) {
+            if (deflectorAllows(reflection, body)) return false;
+            // A controlled breeze of this same encounter is never a recipient: vanilla answers that impact with its
+            // own passive deflection instead of a hit, and a second controlled body of this encounter turning the
+            // shot around is exactly how a reversed arrow earns its new authority. The exception is deliberately
+            // narrowed to that case - a body of this encounter that this encounter really controls - and never to
+            // "anything whose deflection() is not NONE", so a wild or foreign breeze can neither borrow nor eat an
+            // impact permission this encounter granted.
+            if (isControlledBreezeOfThisEncounter(body)) return false;
+        }
+        com.tactical.neoforge.Tactical.LOGGER.info("[Tactical] breeze reflected arrow refused victim={} kind={} "
+                        + "deflection={} session={} deflector={}", victim,
+                victim.getType(), victim instanceof LivingEntity deflectCheck
+                        ? deflectCheck.deflection(arrow) : "notLiving",
+                reflection.sessionId(), reflection.deflectorId());
+        BreezeDeflections.forget(arrow);
+        event.setCanceled(true);
+        arrow.discard();
+        return true;
+    }
+
+    /** A shot whose ownership no longer holds is cancelled together with its projectile. */
+    private void refuseMarkedShot(net.neoforged.neoforge.event.entity.ProjectileImpactEvent event,
+                                  net.minecraft.world.entity.projectile.ShulkerBullet bullet) {
+        ShulkerBullets.forget(bullet);
+        event.setCanceled(true);
+        bullet.discard();
+    }
+
+    /** The exact participant behind that id, or {@code null} when it is gone or replaced. */
+    @javax.annotation.Nullable
+    private LivingEntity liveParticipant(UUID id) {
+        if (id == null) return null;
+        for (PlayerMember member : members.values()) {
+            if (member.id().equals(id) && member.entity.isAlive() && !member.entity.isRemoved()) {
+                return member.entity;
+            }
+        }
+        EnemyState state = enemies.get(id);
+        if (state == null || !state.mob.isAlive() || state.mob.isRemoved()) return null;
+        return state.mob;
+    }
+
+    /**
+     * The controller's seat: this encounter's identity, AP, roster, battlefield and journal, and nothing else.
+     *
+     * <p>Every answer is read from the live encounter, so a stale shell can neither act for a finished battle nor
+     * charge a unit this encounter no longer holds.</p>
+     */
+    private final class ShulkerSeat implements ShulkerController.Seat {
+
+        @Override public ServerLevel level() { return level; }
+
+        @Override public long tick() { return ticks; }
+
+        @Override public UUID sessionId() { return session.sessionId(); }
+
+        @Override public boolean live() { return !finished && !ending; }
+
+        @Override public boolean insideZone(GridPos cell) { return cell != null && zone.contains(cell); }
+
+        @Override public boolean cellFree(GridPos cell, UUID bodyId) { return !occupiedByOthers(cell, bodyId); }
+
+        @Override public boolean isParticipant(Entity entity) { return ServerBattle.this.isParticipant(entity); }
+
+        @Override public boolean opposed(LivingEntity a, LivingEntity b) { return ServerBattle.this.opposed(a, b); }
+
+        @Override public boolean allied(LivingEntity a, LivingEntity b) { return ServerBattle.this.allied(a, b); }
+
+        @Override public boolean actorTurn(LivingEntity unit) { return isActorTurn(unit); }
+
+        @Override public boolean encounterBusy() { return isBusy(); }
+
+        @Override public boolean heldByMotion(UUID id) { return motionOwns(id); }
+
+        @Override public int bulletBase() {
+            return intConfig(TacticalConfig.INSTANCE.shulkerBulletApCost, MotionRules.SHULKER_BULLET_COST);
+        }
+
+        @Override public int teleportBase() {
+            return intConfig(TacticalConfig.INSTANCE.shulkerTeleportApCost, MotionRules.SHULKER_TELEPORT_COST);
+        }
+
+        @Override public int surcharge(int base, int paidActions) { return quote(base, paidActions); }
+
+        @Override public LivingEntity opponent(Mob actor) {
+            EnemyState state = actor == null ? null : enemies.get(actor.getUUID());
+            return state == null || state.mob != actor ? null : actionOpponent(state);
+        }
+
+        @Override public GridPos cellOf(LivingEntity entity) { return entity == null ? null : participantCell(entity); }
+
+        @Override public void faceTowards(Mob actor, GridPos cell) { faceDirection(actor, cell); }
+
+        @Override public ShulkerController.Unit unit(Mob mob) {
+            EnemyState state = mob == null ? null : enemies.get(mob.getUUID());
+            return state == null || state.mob != mob ? null : state;
+        }
+
+        @Override public List<ShulkerController.Unit> units() {
+            return List.copyOf(enemies.values());
+        }
+
+        @Override public void journal(String channel, Component text) { journal.record(channel, text); }
+
+        @Override public void stateChanged() { sendState(); }
+
+        /**
+         * Hand one native-born child to the ordinary admission transaction.
+         *
+         * <p>The child exists because vanilla decided it: its own roll, its own origin and its own colour. This
+         * method never creates, re-rolls, moves or deletes one. It goes through the same gate any newcomer does -
+         * side, capacity, claim, a six-face attachment, a queue entry and a fresh resource set - and a child the
+         * roster cannot take stays in the world, alive, where the existing isolation rule already handles a
+         * cap-refused hostile.</p>
+         */
+        @Override public boolean admitChild(ShulkerController.Unit parent, Shulker child) {
+            if (child == null || parent == null || !ShulkerController.isActor(child)) return false;
+            if (child.level() != level || !child.isAlive() || child.isRemoved()) return false;
+            if (enemies.containsKey(child.getUUID())) return false;
+            journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_SHULKER_SPLIT,
+                    BattleText.name(parent.mob())));
+            if (parent.side() == BattleSide.PLAYER) {
+                // A friendly shell's child joins the friendly side through the one friendly admission path, which
+                // already applies the friendly cap, the queue entry and its own rollback.
+                boolean added = addFriendly(child, false);
+                if (!added) refuseNativeChild(child);
+                return added;
+            }
+            if (hostileCount() >= participantCap) {
+                refuseNativeChild(child);
+                return false;
+            }
+            java.util.Optional<Vec3> safe = shulkerDeployment(child, this::cellOccupied);
+            if (safe.isEmpty()) {
+                refuseNativeChild(child);
+                return false;
+            }
+            Vec3 position = safe.get();
+            GridPos cell = new GridPos(Mth.floor(position.x), Mth.floor(position.y), Mth.floor(position.z));
+            EnemyState admitted;
+            try {
+                admitted = admit(child, cell, position, BattleSide.HOSTILE);
+            } catch (RuntimeException failure) {
+                Tactical.LOGGER.error("[Tactical] shulker child admission failed for {}", child.getUUID(), failure);
+                refuseNativeChild(child);
+                return false;
+            }
+            if (admitted == null) {
+                refuseNativeChild(child);
+                return false;
+            }
+            queue.add(child.getUUID().toString(), TacticalAttributes.chargeRate(child, admitted.initiative));
+            refreshTacticalAttributes();
+            sendState();
+            return true;
+        }
+
+        @Override public int fireBullet(Mob actor, LivingEntity target,
+                                        java.util.function.Consumer<Entity> joined) {
+            java.util.function.Consumer<net.minecraft.world.entity.projectile.Projectile> report =
+                    joined == null ? null : joined::accept;
+            return projectiles.capture(actor, null, () -> level.addFreshEntity(
+                            new net.minecraft.world.entity.projectile.ShulkerBullet(level, actor, target,
+                                    ShulkerNative.attachFace((Shulker) actor).getAxis())),
+                    MotionRules.SHULKER_BULLET_FLIGHT_TICKS, report);
+        }
+
+        /**
+         * Adopt one displacement vanilla already wrote, through the shared validated handoff.
+         *
+         * <p>The encounter is the only mover: the segment is proved and clipped in the shared driver, the
+         * authoritative cell is updated in the same call, and the caller therefore skips vanilla's own
+         * {@code move}.</p>
+         */
+        @Override public boolean adoptPush(LivingEntity body, Vec3 displacement, UUID pusher) {
+            return motion.applyImpulse(body, body instanceof ServerPlayer, displacement, pusher);
+        }
+
+        @Override public void releaseUnit(ShulkerController.Unit unit, String journalKey) {
+            if (unit instanceof EnemyState state) releaseShulkerUnit(state, journalKey);
+        }
+
+        /**
+         * Adopt the real point one successful native relocation landed on.
+         *
+         * <p>A relocation is a new authority over this exact body, so the older levitation hold is retired before
+         * the accepted feet are kept: a hold anchored where the body used to float would otherwise drag it back on
+         * its next motion tick and leave the new authoritative cell describing a body that is not there. Only the
+         * motion lease is dropped - the native effect, its own clock, the health and the AP are untouched, and this
+         * body's next own turn rises from the place it really has now.</p>
+         */
+        @Override public void landed(ShulkerController.Unit unit, ShulkerAttachment node) {
+            if (!(unit instanceof EnemyState state) || node == null) return;
+            motion.release(state.mob.getUUID());
+            state.cell = node.cell();
+            state.airOffset = state.mob.position().subtract(centerOf(node.cell()));
+            retainFeet(state.mob.getUUID(), state.mob.position());
+        }
+
+        /** Occupancy for one block position, in the shape the deployment search asks for. */
+        private boolean cellOccupied(BlockPos pos) {
+            return occupied(new GridPos(pos.getX(), pos.getY(), pos.getZ()));
+        }
+    }
+
+    /**
+     * The breeze controller's seat: this encounter's identity, AP, roster, battlefield and journal, plus the exact
+     * native entity writes that family's presentation needs and nothing else.
+     *
+     * <p>Every answer is read from the live encounter, so a stale breeze can neither act for a finished battle nor
+     * charge a unit this encounter no longer holds. The native writes are the smallest set the family really uses:
+     * one pose, one friction flag, one body-rotation write, four native sounds and the native spawn of the charge.
+     * </p>
+     */
+    private final class BreezeSeat implements BreezeController.Seat {
+
+        @Override public ServerLevel level() { return level; }
+
+        @Override public long tick() { return ticks; }
+
+        @Override public UUID sessionId() { return session.sessionId(); }
+
+        @Override public boolean live() { return !finished && !ending; }
+
+        @Override public boolean insideZone(GridPos cell) { return cell != null && zone.contains(cell); }
+
+        @Override public boolean cellFree(GridPos cell, UUID bodyId) { return !occupiedByOthers(cell, bodyId); }
+
+        @Override public boolean standable(GridPos cell) { return standableCell(cell); }
+
+        @Override public boolean isParticipant(Entity entity) { return ServerBattle.this.isParticipant(entity); }
+
+        @Override public boolean opposed(LivingEntity a, LivingEntity b) { return ServerBattle.this.opposed(a, b); }
+
+        @Override public boolean allied(LivingEntity a, LivingEntity b) { return ServerBattle.this.allied(a, b); }
+
+        @Override public boolean actorTurn(LivingEntity unit) { return isActorTurn(unit); }
+
+        @Override public boolean encounterBusy() { return isBusy(); }
+
+        @Override public boolean heldByMotion(UUID id) { return motionOwns(id); }
+
+        @Override public int windChargeBase() {
+            return intConfig(TacticalConfig.INSTANCE.breezeWindChargeApCost, BreezeRules.WIND_CHARGE_COST);
+        }
+
+        @Override public int jumpBase() {
+            return intConfig(TacticalConfig.INSTANCE.breezeJumpApCost, BreezeRules.JUMP_COST);
+        }
+
+        @Override public int surcharge(int base, int paidActions) { return quote(base, paidActions); }
+
+        @Override public int moveEdgeCost(BreezeController.Unit unit) {
+            return unit instanceof EnemyState state ? state.moveCost : 0;
+        }
+
+        @Override public LivingEntity opponent(Mob actor) {
+            EnemyState state = actor == null ? null : enemies.get(actor.getUUID());
+            return state == null || state.mob != actor ? null : actionOpponent(state);
+        }
+
+        @Override public GridPos cellOf(LivingEntity entity) { return entity == null ? null : participantCell(entity); }
+
+        @Override public void faceTowards(Mob actor, GridPos cell) { faceDirection(actor, cell); }
+
+        @Override public void aimAt(Mob actor, LivingEntity target) {
+            if (target == null) return;
+            actor.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, target.position());
+        }
+
+        @Override public boolean facingTarget(Mob actor, LivingEntity target) {
+            if (!(actor instanceof net.minecraft.world.entity.monster.breeze.Breeze breeze) || target == null) {
+                return false;
+            }
+            // The native test, asked with the body's real view vector and the real direction to the target.
+            Vec3 view = breeze.getViewVector(1.0F);
+            Vec3 toTarget = target.position().subtract(breeze.position());
+            return BreezeRules.isFacingTarget(view.x, view.y, view.z, toTarget.x, toTarget.y, toTarget.z);
+        }
+
+        /**
+         * Fire exactly one native wind charge.
+         *
+         * <p>The entity, its native origin, its native {@code 0.7} speed and the difficulty's own spread are all
+         * vanilla's: this method calls the same constructor and the same {@code shoot} the native behaviour calls,
+         * and only observes what the world really registered.</p>
+         */
+        @Override public int fireWindCharge(Mob actor, LivingEntity target,
+                                            java.util.function.Consumer<Entity> joined) {
+            if (!(actor instanceof net.minecraft.world.entity.monster.breeze.Breeze breeze) || target == null) {
+                return 0;
+            }
+            double dx = target.getX() - breeze.getX();
+            double dy = target.getY(target.isPassenger() ? 0.8 : 0.3) - breeze.getY(0.5);
+            double dz = target.getZ() - breeze.getZ();
+            float spread = BreezeRules.shotSpread(level.getDifficulty().getId());
+            java.util.function.Consumer<net.minecraft.world.entity.projectile.Projectile> report =
+                    joined == null ? null : joined::accept;
+            return projectiles.capture(actor, null, () -> {
+                net.minecraft.world.entity.projectile.windcharge.BreezeWindCharge charge =
+                        new net.minecraft.world.entity.projectile.windcharge.BreezeWindCharge(breeze, level);
+                charge.shoot(dx, dy, dz, BreezeRules.SHOT_SPEED, spread);
+                level.addFreshEntity(charge);
+            }, BreezeRules.WIND_CHARGE_FLIGHT_TICKS, report);
+        }
+
+        /**
+         * The gate every per-projectile authority of this family is granted behind.
+         *
+         * <p>Read from the encounter's one real-flight tracker, so only a shot this encounter really fired and still
+         * tracks can earn a deflection record. Nothing about a wild breeze's shot or another encounter's flight is
+         * visible here.</p>
+         */
+        @Override public boolean recognizedFlight(
+                net.minecraft.world.entity.projectile.Projectile projectile) {
+            return projectiles.tracks(projectile);
+        }
+
+        @Override public void playInhaleSound(Mob actor) {            actor.playSound(net.minecraft.sounds.SoundEvents.BREEZE_INHALE, 1.0F, 1.0F);
+        }
+
+        @Override public void playJumpChargeSound(Mob actor) {
+            level.playSound(null, actor, net.minecraft.sounds.SoundEvents.BREEZE_CHARGE,
+                    net.minecraft.sounds.SoundSource.HOSTILE, 1.0F, 1.0F);
+        }
+
+        @Override public void playShotSound(Mob actor) {
+            actor.playSound(net.minecraft.sounds.SoundEvents.BREEZE_SHOOT, 1.5F, 1.0F);
+        }
+
+        @Override public void playJumpSound(Mob actor) {
+            actor.playSound(net.minecraft.sounds.SoundEvents.BREEZE_JUMP, 1.0F, 1.0F);
+        }
+
+        @Override public void playLandSound(Mob actor) {
+            actor.playSound(net.minecraft.sounds.SoundEvents.BREEZE_LAND, 1.0F, 1.0F);
+        }
+
+        @Override public void pose(Mob actor, Pose pose) {
+            if (pose != null && actor.getPose() != pose) actor.setPose(pose);
+        }
+
+        @Override public void discardFriction(Mob actor, boolean discard) {
+            if (actor.shouldDiscardFriction() != discard) actor.setDiscardFriction(discard);
+        }
+
+        @Override public void faceBodyRotation(Mob actor) {
+            actor.setYRot(actor.yBodyRot);
+        }
+
+        @Override public Pose poseOf(Mob actor) {
+            return actor.getPose();
+        }
+
+        @Override public BreezeController.Unit unit(Mob mob) {
+            EnemyState state = mob == null ? null : enemies.get(mob.getUUID());
+            return state == null || state.mob != mob ? null : state;
+        }
+
+        @Override public List<BreezeController.Unit> units() {
+            return List.copyOf(enemies.values());
+        }
+
+        @Override public void journal(String channel, Component text) { journal.record(channel, text); }
+
+        @Override public void stateChanged() { sendState(); }
+
+        @Override public void landed(BreezeController.Unit unit, GridPos cell, Vec3 feet) {
+            if (!(unit instanceof EnemyState state) || cell == null) return;
+            state.cell = cell;
+            Vec3 real = feet == null ? state.mob.position() : feet;
+            state.airOffset = real.subtract(centerOf(cell));
+            retainFeet(state.mob.getUUID(), real);
+        }
+
+        @Override public void releaseUnit(BreezeController.Unit unit, String journalKey) {
+            if (unit instanceof EnemyState state) releaseBreezeUnit(state, journalKey);
+        }
+
+        @Override public int difficultyId() { return level.getDifficulty().getId(); }
+    }
+
+    /**
+     * Leave the encounter by name: the body stays in the world at its real position, this encounter gives back
+     * every borrowed pose and flag and forgets it.
+     *
+     * <p>Only used when a breeze has nothing legal left to do at all. The unit is not deleted, not healed and not
+     * teleported, and the encounter is never left busy on a body that cannot act.</p>
+     */
+    private void releaseBreezeUnit(EnemyState state, String reasonKey) {
+        if (state == null || state.mob == null) return;
+        Mob body = state.mob;
+        boolean wasCurrent = body.getUUID().toString().equals(queue.current());
+        journal.record("enemy", BattleText.translatable(reasonKey, BattleText.name(body)));
+        enemies.remove(body.getUUID());
+        queue.remove(body.getUUID().toString());
+        terrainFall.end(body.getUUID());
+        BattleEffects.forget(body);
+        motion.release(body.getUUID());
+        releaseBreezeState(state);
+        ai.remove(body);
+        BattleManager.releaseActor(this, body.getUUID());
+        body.setNoAi(state.originalNoAi);
+        ((com.tactical.neoforge.mixin.BattleMobPersistenceAccess) body)
+                .tactical$persistenceRequired(state.originalPersistenceRequired);
+        body.setTarget(null);
+        if (!finished) {
+            sendState();
+            if (wasCurrent && (phase == BattlePhase.ENEMY_TURN || phase == BattlePhase.COMPANION_TURN)) {
+                advanceTurn();
+            }
+        }
+    }
+
+    /** One native-born child this encounter cannot take keeps its own vanilla life in the world. */
+    private void refuseNativeChild(Shulker child) {
+        journal.record("enemy", BattleText.translatable(BattleText.KEY_ENEMY_SHULKER_SPLIT_REFUSED,
+                BattleText.name(child)));
+        // The existing isolation rule owns a native child this encounter cannot take: it is never deleted here,
+        // never re-timed and never rostered, and it is released by the encounter-end rule like any held child.
+        handOffSplitChild(child, BattleSide.HOSTILE);
+        sendState();
+    }
+
+    /**
+     * Leave the encounter by name: the body stays in the world at its real position, this encounter gives back
+     * every borrowed flag and forgets it.
+     *
+     * <p>Only used when a shell has no legal attachment left at all. The unit is not deleted, not healed and not
+     * teleported, and the encounter is never left busy on a body that cannot act.</p>
+     */
+    private void releaseShulkerUnit(EnemyState state, String reasonKey) {
+        if (state == null || state.mob == null) return;
+        Mob body = state.mob;
+        boolean wasCurrent = body.getUUID().toString().equals(queue.current());
+        if (DeveloperTrace.enabled()) {
+            // Development trace: which shell left the encounter, from where, and why. A release is a named
+            // outcome, so it must be answerable in a log rather than inferred from a missing unit.
+            Tactical.LOGGER.info("[Tactical] dev-trace shulker released session={} tick={} uuid={} reason={} at={}",
+                    session.sessionId(), ticks, body.getUUID(), reasonKey, body.position());
+        }
+        journal.record("enemy", BattleText.translatable(reasonKey, BattleText.name(body)));
+        enemies.remove(body.getUUID());
+        queue.remove(body.getUUID().toString());
+        terrainFall.end(body.getUUID());
+        BattleEffects.forget(body);
+        motion.release(body.getUUID());
+        releaseShulkerState(state);
+        ai.remove(body);
+        BattleManager.releaseActor(this, body.getUUID());
+        body.setNoAi(state.originalNoAi);
+        ((com.tactical.neoforge.mixin.BattleMobPersistenceAccess) body)
+                .tactical$persistenceRequired(state.originalPersistenceRequired);
+        body.setTarget(null);
+        if (!finished) {
+            sendState();
+            if (wasCurrent && (phase == BattlePhase.ENEMY_TURN || phase == BattlePhase.COMPANION_TURN)) {
+                advanceTurn();
+            }
+        }
+    }
+
+    /** The six-face deployment answer for one shell, inside this encounter's live battlefield. */
+    private java.util.Optional<Vec3> shulkerDeployment(Shulker shell,
+                                                       java.util.function.Predicate<BlockPos> occupied) {
+        return ShulkerPlacement.find(level, shell,
+                cell -> occupied.test(new BlockPos(cell.x(), cell.y(), cell.z())),
+                cell -> zone.contains(cell), zone::contains);
     }
 
     /**
@@ -7828,6 +9066,13 @@ public final class ServerBattle {
                 return ServerBattle.this.canThrowTridentFrom(state, opponent, from);
             }
             public boolean throwTrident() { return ServerBattle.this.throwTrident(state); }
+            public ShulkerState shulker() { return shulkerState(state); }
+            public boolean shulkerShot() { return ServerBattle.this.shulkerShot(state); }
+            public boolean shulkerTeleport() { return ServerBattle.this.shulkerTeleport(state); }
+            public BreezeState breeze() { return breezeState(state); }
+            public boolean breezeShot() { return ServerBattle.this.breezeShot(state); }
+            public boolean breezeJump() { return ServerBattle.this.breezeJump(state); }
+            public List<GridPos> breezeSlide() { return ServerBattle.this.breezeSlide(state); }
             public EndermanState enderman() { return endermanState(state); }
             public int teleportCost() { return ServerBattle.this.endermanTeleportCost(state); }
             public boolean canTeleport() { return endermanCanTeleport(state); }
@@ -7995,6 +9240,31 @@ public final class ServerBattle {
             sendState();
             return;
         }
+        if (action.kind() == AiAction.Kind.BREEZE_JUMP) {
+            /* One native long jump. It is not an instant attack and it is not a walk: the body inhales for the
+               native ten ticks and then flies one arc this encounter proves frame by frame before every write.
+               Nothing is charged before the first real displacement, and the encounter's own step owns the body
+               until it lands or the arc stops being real. */
+            if (!breezeJump(enemy)) {
+                if (DeveloperTrace.enabled()) {
+                    Tactical.LOGGER.info("[Tactical] dev-trace breeze jump commit refused session={} tick={} "
+                            + "uuid={} ap={} busy={}", session.sessionId(), ticks, enemy.mob.getUUID(), enemy.ap,
+                            isBusy());
+                }
+                advanceTurn();
+                return;
+            }
+            // The adapter's own record of the resolved kind is what restricts the follow-up after the landing to
+            // exactly one shot or the end.
+            TacticalMobAi adapter = ai.adapter(enemy.mob);
+            if (adapter != null) adapter.onActionResolved(action.kind());
+            enemyMoving = true;
+            enemyStepping = false;
+            enemyPath = List.of();
+            enemyPathIndex = 0;
+            sendState();
+            return;
+        }
         if (action.kind() == AiAction.Kind.GUARDIAN_BEAM) {
             /* One native charged beam. The server re-proves the locked opponent, the held water node, vanilla's own
                line of sight and distance band, the captured native goal and the frozen quote, then starts that body's
@@ -8019,13 +9289,19 @@ public final class ServerBattle {
             return;
         }
         if (result == AiResolution.RELOCATED) {
-            // The same own turn continues after a controlled relocation, with exactly one follow-up and only
-            // towards a melee or its end: no second relocation, no new walk and no fresh plan inside this turn.
+            // The same own turn continues after a controlled relocation, with exactly one follow-up and no fresh
+            // plan, no second relocation and no new walk inside this turn. Which follow-up is legal depends on
+            // which relocation was taken, because the two have different vocabularies:
+            //   * an enderman's native teleport continues with a melee or its end;
+            //   * a shell's maneuver exists to buy a shot, so it continues with one shot or its end - and that
+            //     shot goes through the ordinary SHULKER_SHOT commit, so it is priced and billed exactly once.
             if (finished || !enemy.mob.getUUID().toString().equals(queue.current())) return;
+            boolean shellManeuver = action.kind() == AiAction.Kind.SHULKER_TELEPORT;
             AiAction followUp = ai.afterMovement(aiContext(enemy));
-            if (followUp.kind() != AiAction.Kind.MELEE && followUp.kind() != AiAction.Kind.END_TURN) {
-                followUp = AiAction.endTurn();
-            }
+            boolean allowed = shellManeuver
+                    ? followUp.kind() == AiAction.Kind.SHULKER_SHOT || followUp.kind() == AiAction.Kind.END_TURN
+                    : followUp.kind() == AiAction.Kind.MELEE || followUp.kind() == AiAction.Kind.END_TURN;
+            if (!allowed) followUp = AiAction.endTurn();
             resolveAiAction(enemy, followUp);
             return;
         }
@@ -8035,6 +9311,9 @@ public final class ServerBattle {
         if (blazeVolley != null) return;
         // The presented drink settles itself and only then hands the turn over.
         if (witchDrinking()) return;
+        // A breeze's own native charge owns the turn while it runs: inhale, one facing decision, the real
+        // projectile, then recovery. The controller hands the turn back itself once that timeline is over.
+        if (breezes.busy()) return;
         advanceTurn();
     }
 
@@ -8045,7 +9324,13 @@ public final class ServerBattle {
         // A commanded companion is never played by the AI: its slot waits for its controller's order.
         if(enemy==null || enemy.companionAdapter != null) {if(enemy==null)advanceTurn();return;}
         if(!lockOpponent(enemy)) {advanceTurn();return;}
-        resolveAiAction(enemy,ai.planTurn(aiContext(enemy)));
+        AiAction planned = ai.planTurn(aiContext(enemy));
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace planned action session={} tick={} uuid={} kind={} cell={} "
+                            + "ap={}", session.sessionId(), ticks, enemy.mob.getUUID(), planned.kind(), enemy.cell,
+                    enemy.ap);
+        }
+        resolveAiAction(enemy, planned);
     }
 
     // ------------------------------------------------------------------
@@ -8354,6 +9639,9 @@ public final class ServerBattle {
         terrainFall.end(id);
         queue.remove(id.toString());
         BattleEffects.forget(mob);
+        motion.release(id);
+        ShulkerBullets.forgetActor(id);
+        ShulkerBullets.forgetTarget(id);
         ai.remove(mob);
         BattleManager.releaseActor(this, id);
         Tactical.LOGGER.info("[Tactical] companion released {} (battleEnd={})", id, battleEnd);
@@ -8575,6 +9863,9 @@ public final class ServerBattle {
             state.takenTurn(true);
             state.resetPaidActions();
             state.defending(false);
+            // The same native-effect translation an AI unit gets: a player who still carries levitation rises once
+            // at their own turn start, from the feet they really have, and keeps its ordinary cell and pathing.
+            riseWithLevitation(member);
         } else {
             EnemyState enemy = enemies.get(id);
             if (enemy == null) {
@@ -8597,6 +9888,10 @@ public final class ServerBattle {
                 // else. It runs after the effect clock so a freshly applied instance first baselines and is only
                 // charged a complete own cycle later.
                 pulseElderFatigue(enemy);
+                // The native levitation effect is translated into this turn's own rule before anything is
+                // planned: a body that still carries it rises once, and a body whose effect is gone stops being
+                // held and hands its real position to the ordinary descent rule.
+                riseWithLevitation(enemy);
                 enemy.maxAp=TacticalAttributes.maxAp(enemy.mob);
                 enemy.moveCost=ApCalculator.moveCost(attribute(enemy.mob,Attributes.MOVEMENT_SPEED));
                 enemy.ap=ApCalculator.beginOwnTurnAp(enemy.ap,enemy.maxAp,TacticalAttributes.apRecovery(enemy.mob),!enemy.hasTakenTurn);
@@ -8608,6 +9903,10 @@ public final class ServerBattle {
                 // A controlled enderman gets its own-turn quotas here, and settles its water clock once:
                 // vanilla's per-tick water call is suspended for exactly as long as this encounter holds it.
                 beginEndermanTurn(enemy);
+                // A shell re-reads its attachment, resets its two quotas and closes a window that ran out.
+                beginShulkerTurn(enemy);
+                // A breeze resets its shot and manoeuvre quotas and drops the previous turn's cached arc.
+                beginBreezeTurn(enemy);
                 if (finished || !enemy.mob.isAlive()) return;
                 // A new own turn may leap once, and it starts with no leap from the previous turn still in
                 // flight and no cached proposal to reuse.
@@ -8649,6 +9948,18 @@ public final class ServerBattle {
         }
         pendingTurnAdvance = false;
         refreshTacticalAttributes();
+        // The actor whose own turn is over may be leaving an open shell behind. That window exists for the
+        // opponent's opportunity, so it is kept while there is still something to shoot and closed the moment the
+        // unit ends its turn on purpose with nothing to aim at.
+        String endingActor = queue.current();
+        if (endingActor != null) {
+            for (EnemyState state : enemies.values()) {
+                if (state.mob.getUUID().toString().equals(endingActor)) {
+                    shulkers.onTurnEnding(state.mob);
+                    break;
+                }
+            }
+        }
         String next = queue.advance();
         beginTurn(next);
     }
@@ -8758,6 +10069,15 @@ public final class ServerBattle {
                     terrainFall.end(entry.getKey());
                     queue.remove(entry.getKey().toString());
                     BattleEffects.forget(departed.mob);
+                    motion.release(entry.getKey());
+                    ShulkerBullets.forgetActor(entry.getKey());
+                    ShulkerBullets.forgetTarget(entry.getKey());
+                    // The breeze family answers for exactly this body's charges, the charges fired at it and the
+                    // shots it really reversed: a partial exit drops them here, so a live shot never loses its
+                    // guard and stays harmful, and no other unit's shot is touched.
+                    BreezeWindCharges.forgetActor(entry.getKey());
+                    BreezeWindCharges.forgetTarget(entry.getKey());
+                    BreezeDeflections.forgetDeflector(entry.getKey());
                     // A departed thrower's trident and pose end with its control, not later in the world.
                     DrownedTridents.clearOwner(this, entry.getKey());
                     releaseTridentPose(entry.getKey());
@@ -8765,6 +10085,8 @@ public final class ServerBattle {
                     releaseSpiderState(departed);
                     releaseSlimeState(departed);
                     releaseGuardianState(departed);
+                    releaseShulkerState(departed);
+                    releaseBreezeState(departed);
                     ai.remove(departed.mob);
                     // A departed unit gives up its ownership claim, but only this encounter's: another
                     // encounter's identical UUID or a same-UUID respawn must keep its own routing.
@@ -8985,8 +10307,9 @@ public final class ServerBattle {
 
     private boolean rangedBusy() {
         // A running blaze salvo owns the turn exactly like a tracked projectile does: charge, shots and the
-        // hand-back are one bounded action, so nothing else may act or advance while it lasts.
-        return projectiles.pending() || awaitingShotResolution || blazeVolley != null;
+        // hand-back are one bounded action, so nothing else may act or advance while it lasts. A breeze whose own
+        // native timeline ended while its shot still flies owns the turn the same way, until that flight resolves.
+        return projectiles.pending() || awaitingShotResolution || blazeVolley != null || breezeHandBack != null;
     }
 
     private boolean hasMovingEnemies() {
@@ -9002,6 +10325,7 @@ public final class ServerBattle {
         for (EnemyState state : enemies.values()) {
             Mob mob = state.mob;
             if (!mob.isAlive()) continue;
+            if (motionOwns(mob.getUUID())) continue;
             if(state.flying) {
                 if(AerialMovement.isClearAir(level,mob,mob.position())){
                     state.cell=cellOf(mob);state.airOffset=mob.position().subtract(centerOf(state.cell));
@@ -9014,8 +10338,16 @@ public final class ServerBattle {
                 state.cell = landing;
             }
             // Vanilla damage/enchantments have already applied. Resolve their
-            // physical tail onto a safe grid cell before any next action/turn.
-            moveEntity(mob, state.cell);
+            // physical tail onto a safe grid cell before any next action/turn - but a body whose displacement
+            // this encounter itself proved keeps the exact feet it really has, instead of being pulled onto the
+            // centre of its cell by a rule that never saw that displacement.
+            Vec3 retained = authoritativeFeet.get(mob.getUUID());
+            if (retained != null) {
+                mob.setPos(retained.x, retained.y, retained.z);
+                mob.setDeltaMovement(Vec3.ZERO);
+            } else {
+                moveEntity(mob, state.cell);
+            }
             mob.fallDistance = 0;
             // A spider knocked off its surface is re-read where it really ended up.
             resyncSpiderSurface(state, state.cell);
@@ -9180,6 +10512,23 @@ public final class ServerBattle {
         if (state.cell() == null) {
             return;
         }
+        // A body the driver is holding up is pinned to the height it is really held at, not to the centre of its
+        // cell: the cell is authoritative and the fractional feet are a fact, and snapping to the centre would
+        // quietly drop a floating unit back to its floor every tick.
+        Vec3 held = motion.heldFeet(member.id());
+        if (held != null) {
+            if (member.entity.position().distanceToSqr(held) > 1.0E-6D) setPlayerPosition(member, held);
+            member.entity.setDeltaMovement(Vec3.ZERO);
+            return;
+        }
+        // A controlled displacement may legitimately end between two cells. Those exact feet stay authoritative
+        // until something real replaces them, so the pin keeps them instead of dragging the body to the centre.
+        Vec3 retained = authoritativeFeet.get(member.id());
+        if (retained != null) {
+            if (member.entity.position().distanceToSqr(retained) > 1.0E-6D) setPlayerPosition(member, retained);
+            member.entity.setDeltaMovement(Vec3.ZERO);
+            return;
+        }
         Vec3 target = centerOf(state.cell());
         if (member.entity.position().distanceToSqr(target) > 0.25D) {
             snapPlayer(member, state.cell());
@@ -9201,8 +10550,37 @@ public final class ServerBattle {
         player.fallDistance = 0;
     }
 
+    /**
+     * Hand the owning client the exact fractional feet of one newly committed controlled frame.
+     *
+     * <p>Nothing else can carry that fact. {@link #setPlayerPosition} writes the server body and calls
+     * {@code connection.resetPosition()}, which only updates the server's own good/bad position scalars and sends
+     * no packet; the step packet's {@code start} is an integer cell and its empty path is deliberately a
+     * stop/facing fact. So the fractional displacement stayed on the server and the client kept integrating its
+     * own motion. Vanilla's {@code ServerPlayer.teleportTo(double,double,double)} is the existing acknowledged
+     * correction - it calls {@code connection.teleport} with the current rotation - so it is used as it is, with
+     * no new packet, no new field and no rounding to a cell.</p>
+     */
+    private void correctPlayerPosition(PlayerMember member, Vec3 feet) {
+        ServerPlayer player = member.entity;
+        player.setDeltaMovement(Vec3.ZERO);
+        player.fallDistance = 0.0F;
+        // Exact native ServerPlayer.teleportTo dereferences the connection directly, and this encounter
+        // deliberately supports a member without a transport (the headless scene fixtures) exactly as
+        // setPlayerPosition and snapPlayer already do. The exact feet, the zeroed motion and the cleared fall
+        // distance are already written by the caller; with no transport there is no owning client to correct.
+        if (player.connection == null) return;
+        player.teleportTo(feet.x, feet.y, feet.z);
+    }
+
     private void sendPlayerMotion(PlayerMember member, List<GridPos> path) {
         if (member == null) return;
+        if (path != null && !path.isEmpty()) {
+            releaseFeet(member.id());
+            // A real trajectory makes the client animate its own way to the next cell, so what it was last
+            // handed is no longer where it is.
+            member.clientFeet = null;
+        }
         PlayerParticipant state = member.state;
         ServerPlayer player = member.entity;
         if (state.cell() != null) {
@@ -9213,6 +10591,10 @@ public final class ServerBattle {
 
     private void snapPlayer(PlayerMember member, GridPos cell) {
         if (cell == null) return;
+        releaseFeet(member.id());
+        // A cell snap puts the body somewhere the client was never handed, so the next controlled frame must
+        // correct it again instead of trusting a stale reading.
+        member.clientFeet = null;
         ServerPlayer player = member.entity;
         if (player.connection == null) {
             player.setPos(cell.x() + 0.5D, cell.y(), cell.z() + 0.5D);
@@ -9223,6 +10605,7 @@ public final class ServerBattle {
     }
 
     private void moveEntity(Mob mob, GridPos cell) {
+        releaseFeet(mob.getUUID());
         mob.teleportTo(cell.x() + 0.5D, cell.y(), cell.z() + 0.5D);
         mob.setDeltaMovement(Vec3.ZERO);
     }
@@ -9230,6 +10613,174 @@ public final class ServerBattle {
     // ------------------------------------------------------------------
     // forced fall: the block under a unit is gone
     // ------------------------------------------------------------------
+
+    /**
+     * This encounter's own hand on a body: one controlled rise and one accepted displacement.
+     *
+     * <p>The encounter is the only authority over where a participant stands, so the vanilla writes that move a
+     * body on wall-clock ticks - levitation and an accepted knockback or an opening shell's push - cannot be left
+     * to argue with the grid pin, the shot reconciliation and the forced-fall rule. While a body is owned here,
+     * every one of those rules stands down for that exact unit, and nothing else changes: the driver never charges
+     * AP, never advances the queue, never widens a zone and never invents a displacement vanilla refused.</p>
+     *
+     * <p>Two facts are deliberately synchronized here rather than only the AI side: a risen body's
+     * <b>authoritative cell</b> and its <b>real fractional feet</b>, and for a player also the frame its client
+     * follows. A hold that only moved the server body would be undone by the next pin, and one that only moved the
+     * cell would leave the client drawing a unit somewhere else.</p>
+     */
+    /**
+     * The real fractional feet this encounter is treating as authoritative for a unit, when they are not the cell
+     * centre.
+     *
+     * <p>A grid cell is a whole-cell fact, and a controlled displacement can legitimately end between two cells -
+     * a clipped push, a parted rise. Snapping such a body back to the centre of its cell would silently undo a
+     * displacement this encounter itself proved, so the exact feet are retained here until a real new authority
+     * replaces them: a new trajectory, a relocation, a fall, or the unit leaving. Nothing here is a second opinion
+     * about where the body is - it is the same authority, kept to the fraction the body really has.</p>
+     */
+    private final java.util.Map<UUID, Vec3> authoritativeFeet = new java.util.HashMap<>();
+
+    /** Adopt those exact feet as the body's authority (written by the motion driver and by a landed relocation). */
+    private void retainFeet(UUID id, Vec3 feet) {
+        if (id == null || feet == null) return;
+        authoritativeFeet.put(id, feet);
+    }
+
+    /** Give that body's authority back to its cell centre: some other rule now decides where it really is. */
+    private void releaseFeet(UUID id) {
+        if (id != null) authoritativeFeet.remove(id);
+    }
+
+    private final com.tactical.neoforge.battle.motion.ControlledMotion motion =
+            new com.tactical.neoforge.battle.motion.ControlledMotion(new com.tactical.neoforge.battle.motion.ControlledMotion.Seat() {
+                @Override public ServerLevel level() { return level; }
+
+                @Override public boolean insideZone(GridPos cell) { return cell != null && zone.contains(cell); }
+
+                @Override public boolean cellFree(GridPos cell, UUID bodyId) { return !occupiedByOthers(cell, bodyId); }
+
+                /**
+                 * Every cell of that swept box, not only its destination: another live body and a reservation
+                 * both count.
+                 *
+                 * <p>The exempt body is the one whose own action caused the displacement - an opening shell is
+                 * legitimately inside the box it opens into. Nothing else is excused, so a bystander, an ally, an
+                 * opponent of another encounter or a member mid-trajectory still refuses the move instead of being
+                 * passed through.</p>
+                 */
+                @Override public boolean sweepFree(UUID bodyId, AABB box, UUID exceptBody) {
+                    return boxFreeOfBodies(bodyId, box, exceptBody);
+                }
+
+                /**
+                 * Make the encounter agree with where the body really is, for an AI unit or for a member.
+                 *
+                 * <p>This is also the one place an accepted displacement is handed back to the forced-fall rule.
+                 * A push can end <em>inside</em> the body's own cell - 0.601 above its floor - and the ordinary
+                 * rule asks the block below the integer cell, which answers "supported" about a body standing in
+                 * mid air. The real feet are adopted first, so the question is asked of the whole body at the
+                 * exact place it really is; a body the driver still owns (a rise being held) is never dropped
+                 * here, which is what keeps a held or still-rising unit exactly where the native cause put it.</p>
+                 */
+                @Override public void settled(LivingEntity body, UUID bodyId, GridPos cell, Vec3 feet) {
+                    if (cell == null) return;
+                    EnemyState state = enemies.get(bodyId);
+                    if (state != null && state.mob == body) {
+                        state.cell = cell;
+                        state.airOffset = feet == null ? Vec3.ZERO : feet.subtract(centerOf(cell));
+                        retainFeet(bodyId, feet);
+                        beginPreciseFallIfUnsupported(body, bodyId, false, cell, feet);
+                        return;
+                    }
+                    PlayerMember member = members.get(bodyId);
+                    if (member != null && member.entity == body) {
+                        member.state.cell(cell);
+                        retainFeet(bodyId, feet);
+                        beginPreciseFallIfUnsupported(body, bodyId, true, cell, feet);
+                    }
+                }
+
+                /**
+                 * A player's own frame follows its held body physically; an AI unit has no client of its own.
+                 *
+                 * <p>A newly committed frame is the one moment the exact fractional feet have to reach the owning
+                 * client, and they can only do so through vanilla's acknowledged correction. The correction is
+                 * spent only when the frame really moves the body away from the feet the client was last given, so
+                 * a held tick that is already aligned stays a plain animation update. The stop/facing packet is
+                 * still sent afterwards, unchanged.</p>
+                 */
+                @Override public void frameWritten(LivingEntity body, UUID bodyId, Vec3 feet) {
+                    if (feet == null) return;
+                    PlayerMember member = members.get(bodyId);
+                    if (member == null || member.entity != body) return;
+                    if (member.clientFeet == null || member.clientFeet.distanceToSqr(feet) > CLIENT_FEET_ALIGNED) {
+                        setPlayerPosition(member, feet);
+                        correctPlayerPosition(member, feet);
+                        member.clientFeet = feet;
+                    } else {
+                        setPlayerPosition(member, feet);
+                    }
+                    sendPlayerMotion(member, List.of());
+                }
+
+                @Override public void released(LivingEntity body, UUID bodyId) { }
+            });
+
+    /**
+     * End every controlled hold whose native cause is really gone.
+     *
+     * <p>Levitation's duration belongs to the own-turn clock, but whether the effect is on the body is a fact of
+     * this tick. A hold that outlived its own effect would keep a unit floating for free until its next turn, so it
+     * is released here - and only here - as soon as the effect is gone, dies, is removed or leaves this level. Both
+     * an AI unit and an ordinary member are checked: the translation is a rule about the native effect, not about
+     * which side of the battle the body fights on.</p>
+     */
+    private void maintainLevitationHolds() {
+        for (EnemyState state : List.copyOf(enemies.values())) {
+            UUID id = state.mob.getUUID();
+            if (motion.heldY(id) == null) continue;
+            Mob body = state.mob;
+            if (!body.isAlive() || body.isRemoved() || body.level() != level
+                    || !body.hasEffect(net.minecraft.world.effect.MobEffects.LEVITATION)) {
+                // Hand the body over at the position it really has, so the descent begins where it really floats
+                // instead of from a cell it left several turns ago.
+                state.cell = new GridPos(Mth.floor(body.getX()), Mth.floor(body.getY() + 1.0E-7D),
+                        Mth.floor(body.getZ()));
+                motion.release(id);
+                if (DeveloperTrace.enabled()) {
+                    Tactical.LOGGER.info("[Tactical] dev-trace levitation hold released session={} uuid={} y={}",
+                            session.sessionId(), id, body.getY());
+                }
+            }
+        }
+        for (PlayerMember member : List.copyOf(members.values())) {
+            UUID id = member.id();
+            if (motion.heldY(id) == null) continue;
+            ServerPlayer body = member.entity;
+            if (!body.isAlive() || body.isRemoved() || body.level() != level
+                    || !body.hasEffect(net.minecraft.world.effect.MobEffects.LEVITATION)) {
+                member.state.cell(new GridPos(Mth.floor(body.getX()), Mth.floor(body.getY() + 1.0E-7D),
+                        Mth.floor(body.getZ())));
+                motion.release(id);
+            }
+        }
+    }
+
+    /** True when that unit may not be pinned, snapped, knocked back or dropped by the other motion rules. */
+    private boolean motionOwns(UUID id) {
+        return motion.owns(id);
+    }
+
+    private boolean occupiedByOthers(GridPos cell, UUID bodyId) {
+        for (PlayerMember member : members.values()) {
+            if (!member.id().equals(bodyId) && member.state.cell().equals(cell)) return true;
+        }
+        for (EnemyState other : enemies.values()) {
+            if (other.mob.getUUID().equals(bodyId)) continue;
+            if (other.mob.isAlive() && !other.mob.isRemoved() && other.cell.equals(cell)) return true;
+        }
+        return false;
+    }
 
     /**
      * One encounter's own falling units.
@@ -9280,10 +10831,23 @@ public final class ServerBattle {
         if (id == null || unit == null || cell == null) return;
         if (!unit.isAlive() || unit.isRemoved() || unit.level() != level) return;
         if (terrainFall.unit(id) != null) return;
+        if (DeveloperTrace.enabled() && unit instanceof net.minecraft.world.entity.monster.Shulker) {
+            Tactical.LOGGER.info("[Tactical] dev-trace fall check session={} uuid={} cell={} zone={} selfUp={} "
+                            + "support={} owned={}", session.sessionId(), id, cell, zone.contains(cell),
+                    holdsItselfUp(unit), hasSupportBelow(cell), motionOwns(id));
+        }
+        // A body the encounter is holding is not unsupported: the native effect or the accepted impulse is what
+        // keeps it up, and the driver hands it back (and only then a fall may start) at its own boundary.
+        if (motionOwns(id)) return;
         if (!zone.contains(cell)) return;
         if (holdsItselfUp(unit)) return;
+        // A shell glued to a legal face carries itself: for that type the support question is vanilla's own
+        // canStayAt, not "is there a floor below". A hanging or wall shell is not an unsupported body, and
+        // treating one as a fall would leave it in a descent it can never finish.
+        if (shulkers.heldByItsOwnFace(unit)) return;
         if (hasSupportBelow(cell)) return;
         TerrainFall.Unit falling = terrainFall.begin(id, player, cell);
+        releaseFeet(id);
         // A wide spider holds its own lateral position against the wall it lost; the cells it falls through are
         // only half of that fact. Remembering the real feet here is what lets the descent keep them instead of
         // sliding the whole body onto the centre of every cell, which would put it back inside the wall.
@@ -9311,6 +10875,273 @@ public final class ServerBattle {
     private boolean hasSupportBelow(GridPos cell) {
         BlockPos ground = new BlockPos(cell.x(), cell.y() - 1, cell.z());
         return !level.getBlockState(ground).getCollisionShape(level, ground).isEmpty();
+    }
+
+    // ------------------------------------------------------------------
+    // a displacement that ended inside one cell: the fall starts from the real feet
+    // ------------------------------------------------------------------
+
+    /** How close the exact feet have to be to a real collision surface for it to be contact, not a height. */
+    private static final double SUPPORT_CONTACT = 1.0E-6D;
+
+    /** How much real area one collision-shape component must share with the footprint to be that body's floor. */
+    private static final double SUPPORT_OVERLAP = 1.0E-9D;
+
+    /**
+     * What the real world says about the floor under one whole body at one exact point.
+     *
+     * <p>Three answers, never confused: the surface the footprint would come to rest on, whether any surface
+     * exists between those feet and the build floor at all, and - by the answer being {@code null} - that the
+     * world could not be read. "Unknown" is not "no floor", and neither is "standing".</p>
+     */
+    private record RealSupport(double surface, boolean floorFound) { }
+
+    /**
+     * The one real surface this whole body would come to rest on at those exact feet.
+     *
+     * <p>The integer question - is the block under the cell solid - answers something else entirely: a body
+     * interrupted 0.601 above its floor is inside a "supported" cell and standing in mid air at the same time.
+     * Here every block column the real bounding box covers is asked for its own highest collision surface at or
+     * below the feet, and the body's floor is the highest of those, which is exactly where vanilla's own
+     * collision would stop it. A fractional surface (a slab, a partial block) is therefore a real landing, not a
+     * slice every descent has to wait out.</p>
+     *
+     * <p>A block is not one height: only the collision-shape <b>components</b> that really overlap the body's
+     * footprint count. A tall part standing beside the feet - a stair's upper step, a fence post at the edge of
+     * the box, a half-block wall the body merely touches - is not the floor this body would rest on, and a lower
+     * tread under the feet is not skipped just because a taller part of the same block exists elsewhere. The
+     * footprint test is what makes precise support precise; the whole-block maximum could call a hang contact or
+     * miss the real tread entirely.</p>
+     *
+     * @return {@code null} when a column the body covers is not loaded, so nothing is claimed from a guess
+     */
+    private RealSupport realSupportBelow(LivingEntity body, Vec3 feet) {
+        if (body == null || feet == null) return null;
+        AABB box = BodyGeometry.bodyAt(body, feet);
+        if (box == null) return null;
+        // Only the columns the body really covers a width of; a box that merely touches a boundary at its far
+        // face does not rest on that column.
+        int minX = Mth.floor(box.minX + 1.0E-9D);
+        int maxX = Math.max(minX, Mth.floor(box.maxX - 1.0E-9D));
+        int minZ = Mth.floor(box.minZ + 1.0E-9D);
+        int maxZ = Math.max(minZ, Mth.floor(box.maxZ - 1.0E-9D));
+        int topY = Mth.floor(feet.y);
+        int bottomY = level.getMinBuildHeight();
+        BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+        double surface = -Double.MAX_VALUE;
+        boolean found = false;
+        for (int x = minX; x <= maxX; x++) {
+            for (int z = minZ; z <= maxZ; z++) {
+                // A read of an unloaded column answers "nothing here" and would become a free fall through the
+                // world, so the question is refused instead of answered.
+                if (!level.hasChunk(x >> 4, z >> 4)) return null;
+                for (int y = topY; y >= bottomY; y--) {
+                    cursor.set(x, y, z);
+                    BlockState state = level.getBlockState(cursor);
+                    VoxelShape shape = state.getCollisionShape(level, cursor);
+                    if (shape.isEmpty()) continue;
+                    // Every component of that block is asked its own height, and only the ones that share a real
+                    // area with the footprint are floor candidates for this body.
+                    double columnTop = -Double.MAX_VALUE;
+                    boolean columnFound = false;
+                    for (AABB part : shape.toAabbs()) {
+                        if (x + part.maxX <= box.minX + SUPPORT_OVERLAP
+                                || x + part.minX >= box.maxX - SUPPORT_OVERLAP
+                                || z + part.maxZ <= box.minZ + SUPPORT_OVERLAP
+                                || z + part.minZ >= box.maxZ - SUPPORT_OVERLAP) {
+                            continue;
+                        }
+                        double top = y + part.maxY;
+                        if (top > feet.y + SUPPORT_CONTACT) continue;
+                        if (!columnFound || top > columnTop) columnTop = top;
+                        columnFound = true;
+                    }
+                    if (!columnFound) continue;
+                    if (!found || columnTop > surface) surface = columnTop;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        return new RealSupport(surface, found);
+    }
+
+    /**
+     * Hand a body that an accepted displacement left above its own floor back to the forced-fall rule.
+     *
+     * <p>Only the controlled-motion bridge calls this, and only once the driver no longer owns the body: a rise
+     * that is being held, a levitation the effect still carries, a body that carries itself, a shell glued to its
+     * own face and anything outside this battlefield are all left to their existing owner. What is new is only
+     * the last question, asked of the <b>real whole body</b> instead of the integer cell below it.</p>
+     */
+    private void beginPreciseFallIfUnsupported(LivingEntity body, UUID id, boolean player, GridPos cell, Vec3 feet) {
+        if (body == null || id == null || cell == null || feet == null) return;
+        if (!body.isAlive() || body.isRemoved() || body.level() != level) return;
+        if (terrainFall.unit(id) != null) return;
+        // The very same two gates the ordinary start uses: a body whose own trajectory is still advancing is
+        // not an unsupported body, it is a body in the middle of a move.
+        PlayerMember member = members.get(id);
+        if (member != null && member.state.moving()) return;
+        if (enemyMoving && id.toString().equals(queue.current())) return;
+        // The driver still owns it: a held or still-rising body is kept up by that hold, not by a floor.
+        if (motionOwns(id)) return;
+        if (!zone.contains(cell)) return;
+        if (holdsItselfUp(body)) return;
+        // A live levitation effect is a native cause this encounter honours at the body's own turn boundary. It
+        // is not a floor, and it must never be turned into a descent in the middle of its own hold.
+        if (body.hasEffect(net.minecraft.world.effect.MobEffects.LEVITATION)) return;
+        if (shulkers.heldByItsOwnFace(body)) return;
+        RealSupport support = realSupportBelow(body, feet);
+        if (support == null) return;
+        if (support.floorFound() && support.surface() >= feet.y() - SUPPORT_CONTACT) return;
+        TerrainFall.Unit falling = terrainFall.begin(id, player, cell);
+        TerrainFall.PreciseFeet precise = falling.beginPrecise(feet.x, feet.y, feet.z);
+        refreshFallLanding(falling);
+        if (DeveloperTrace.enabled()) {
+            Tactical.LOGGER.info("[Tactical] dev-trace precise fall begin session={} uuid={} feet=({},{},{}) "
+                            + "support={} cell={}", session.sessionId(), id,
+                    String.format(java.util.Locale.ROOT, "%.4f", precise.x()), precise.fromY(),
+                    String.format(java.util.Locale.ROOT, "%.4f", precise.z()),
+                    support.floorFound() ? String.format(java.util.Locale.ROOT, "%.4f", support.surface()) : "none",
+                    cell);
+        }
+        journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL_BEGIN,
+                BattleText.name(body), BattleText.literal(cell.toString())));
+        sendState();
+    }
+
+    /**
+     * One tick of a precise fall: keep the real lateral position, ask the real floor, descend one bounded slice.
+     *
+     * <p>Nothing here snaps a body to a cell centre or to an unproved fraction. The slice is the same bounded
+     * descent speed every other sub-block fall of this encounter uses ({@link #subCellDescent()}), swept as the
+     * whole body box between the two positions it really occupies, proved inside the battlefield, inside loaded
+     * columns, free of collisions and free of every other participant and reservation, and then written through
+     * the same precise native correction seam an accepted impulse already uses. A refused slice moves nothing and
+     * keeps the fall's own deadline, so a blocked or unloaded column ends in the existing exception path instead
+     * of a fabricated landing.</p>
+     */
+    private void stepPreciseFall(TerrainFall.Unit unit) {
+        TerrainFall.PreciseFeet precise = unit.precise();
+        PlayerMember member = members.get(unit.id());
+        EnemyState enemy = member == null ? enemies.get(unit.id()) : null;
+        LivingEntity body = member != null ? member.entity : enemy == null ? null : enemy.mob;
+        if (precise == null || body == null || !body.isAlive() || body.isRemoved() || body.level() != level) {
+            terrainFall.end(unit.id());
+            return;
+        }
+        Vec3 from = new Vec3(precise.x(), precise.y(), precise.z());
+        RealSupport support = realSupportBelow(body, from);
+        // The world did not answer: do not move on a guess, and let the deadline decide.
+        if (support == null) return;
+        if (support.floorFound() && support.surface() >= from.y - SUPPORT_CONTACT) {
+            settlePreciseFall(unit, body, new Vec3(from.x, support.surface(), from.z));
+            return;
+        }
+        double floor = support.floorFound() ? support.surface() : -Double.MAX_VALUE;
+        double target = Math.max(floor, from.y - subCellDescent());
+        if (!(target < from.y - SUPPORT_CONTACT)) return;
+        Vec3 to = new Vec3(from.x, target, from.z);
+        if (!preciseSliceClear(body, from, to)) return;
+        precise.y(target);
+        // The authoritative cell follows the real feet, so occupancy stays truthful while the body descends -
+        // and a sub-block drop inside one cell keeps the cell it never left.
+        GridPos descended = new GridPos(BodyGeometry.floor(to.x), BodyGeometry.floor(to.y), BodyGeometry.floor(to.z));
+        if (!descended.equals(unit.cell())) {
+            unit.cell(descended);
+            if (member != null) member.state.cell(descended);
+            else if (enemy != null) enemy.cell = descended;
+        }
+        writePreciseFrame(member, body, to);
+        if (target <= floor + SUPPORT_CONTACT) settlePreciseFall(unit, body, to);
+    }
+
+    /** One accepted slice reaches the body and, for a member, the client that follows it. */
+    private void writePreciseFrame(PlayerMember member, LivingEntity body, Vec3 feet) {
+        if (member != null) {
+            setPlayerPosition(member, feet);
+            correctPlayerPosition(member, feet);
+            member.clientFeet = feet;
+            // A stop/facing packet: a paid trajectory cannot express a sub-cell drop and must not stay
+            // interpolating a target this fall already left behind.
+            sendPlayerMotion(member, List.of());
+            return;
+        }
+        body.setPos(feet.x, feet.y, feet.z);
+        body.setDeltaMovement(Vec3.ZERO);
+        body.fallDistance = 0.0F;
+    }
+
+    /** The whole body between the two positions it really occupies, proved as one swept box. */
+    private boolean preciseSliceClear(LivingEntity body, Vec3 from, Vec3 to) {
+        AABB swept = BodyGeometry.swept(body, from, to);
+        if (swept == null) return false;
+        if (swept.minY < level.getMinBuildHeight() || swept.maxY > level.getMaxBuildHeight()) return false;
+        if (!level.getWorldBorder().isWithinBounds(swept)) return false;
+        if (!BodyGeometry.loaded(level, swept)) return false;
+        if (level.getBlockCollisions(body, swept).iterator().hasNext()) return false;
+        if (!BodyGeometry.boxInsideZone(swept, zone::contains)) return false;
+        return boxFreeOfBodies(body.getUUID(), swept, null);
+    }
+
+    /**
+     * Land a precise fall on the real surface the whole body really reached.
+     *
+     * <p>The contact is proved a second time before anything is written: the reported floor has to be the floor
+     * at those exact feet, and the body box there has to pass the same unified sweep a descent slice passes -
+     * loaded, inside the world, collision free with the body's own context, inside this battlefield, and free of
+     * every other participant and reservation. Only then is the fall ended - once - and the exact feet retained
+     * as the encounter's authority, so the ordinary pin keeps them instead of pulling the body onto a cell centre
+     * it never stood on. The whole-cell count is what the fall-damage rule already uses, which is why a descent
+     * inside one cell costs nothing.</p>
+     *
+     * @return true when the fall really ended here
+     */
+    private boolean settlePreciseFall(TerrainFall.Unit unit, LivingEntity body, Vec3 feet) {
+        RealSupport support = realSupportBelow(body, feet);
+        if (support == null || !support.floorFound()) return false;
+        if (Math.abs(support.surface() - feet.y) > SUPPORT_CONTACT) return false;
+        // The landing spot is proved with the very same sweep every descent slice uses - loaded columns, build
+        // limits, the world border, collision shapes with this body's own context, the battlefield and every
+        // other participant and reservation - so a contact is never written where the box would not be legal.
+        if (!preciseSliceClear(body, feet, feet)) return false;
+        GridPos landing = new GridPos(BodyGeometry.floor(feet.x), BodyGeometry.floor(feet.y),
+                BodyGeometry.floor(feet.z));
+        GridPos origin = unit.origin();
+        int cells = Math.max(0, origin.y() - landing.y());
+        terrainFall.end(unit.id());
+        retainFeet(unit.id(), feet);
+        PlayerMember member = members.get(unit.id());
+        if (member != null && member.entity == body) {
+            member.state.cell(landing);
+            setPlayerPosition(member, feet);
+            correctPlayerPosition(member, feet);
+            member.clientFeet = feet;
+            sendPlayerMotion(member, List.of());
+            settleFallDamage(body, landing, cells);
+            journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL,
+                    BattleText.name(body), BattleText.literal(origin.toString()),
+                    BattleText.literal(landing.toString()), cells));
+            removeDeadEnemies();
+            if (!finished) sendState();
+            return true;
+        }
+        EnemyState enemy = enemies.get(unit.id());
+        if (enemy == null || enemy.mob != body) return true;
+        enemy.cell = landing;
+        enemy.mob.setPos(feet.x, feet.y, feet.z);
+        enemy.mob.setDeltaMovement(Vec3.ZERO);
+        enemy.mob.fallDistance = 0.0F;
+        // A landed body of a family with its own surface state keeps whichever legal node it really reached.
+        resyncSpiderSurface(enemy, landing);
+        resyncGuardianHold(enemy);
+        settleFallDamage(body, landing, cells);
+        journal.record("move", BattleText.translatable(BattleText.KEY_MOVE_FALL,
+                BattleText.name(body), BattleText.literal(origin.toString()),
+                BattleText.literal(landing.toString()), cells));
+        removeDeadEnemies();
+        if (!finished) sendState();
+        return true;
     }
 
     private boolean standableCell(GridPos cell) {
@@ -9360,6 +11191,53 @@ public final class ServerBattle {
         BlockPos head = feet.above();
         return level.getBlockState(feet).getCollisionShape(level, feet).isEmpty()
                 && level.getBlockState(head).getCollisionShape(level, head).isEmpty();
+    }
+
+    /**
+     * Whether that swept box is free of every live participant body and every reservation but these two.
+     *
+     * <p>Asked for the whole box, because a body is not its destination cell: a displacement that passes through a
+     * neighbour on its way somewhere free is still a displacement through a body.</p>
+     */
+    private boolean boxFreeOfBodies(UUID bodyId, AABB box, UUID exceptBody) {
+        if (box == null) return false;
+        for (PlayerMember member : members.values()) {
+            if (member.id().equals(bodyId) || member.id().equals(exceptBody)) continue;
+            if (member.state.moving()) {
+                if (boxOverlapsCells(box, memberTrajectoryCells(member))) return false;
+                continue;
+            }
+            if (boxOverlapsCell(box, member.state.cell())) return false;
+        }
+        for (EnemyState other : enemies.values()) {
+            UUID otherId = other.mob.getUUID();
+            if (otherId.equals(bodyId) || otherId.equals(exceptBody)) continue;
+            if (!other.mob.isAlive() || other.mob.isRemoved() || other.mob.level() != level) continue;
+            if (boxOverlapsCell(box, other.cell)) return false;
+        }
+        return true;
+    }
+
+    /** The cells a moving member's own trajectory still owns: its step target and the rest of its path. */
+    private List<GridPos> memberTrajectoryCells(PlayerMember member) {
+        List<GridPos> cells = new ArrayList<>(4);
+        GridPos target = member.state.stepTarget();
+        if (target != null) cells.add(target);
+        List<GridPos> path = member.state.path();
+        for (int index = member.state.pathIndex(); index < path.size(); index++) cells.add(path.get(index));
+        return cells;
+    }
+
+    private boolean boxOverlapsCells(AABB box, List<GridPos> cells) {
+        for (GridPos cell : cells) if (boxOverlapsCell(box, cell)) return true;
+        return false;
+    }
+
+    private static boolean boxOverlapsCell(AABB box, GridPos cell) {
+        if (box == null || cell == null) return false;
+        return cell.x() >= Mth.floor(box.minX) && cell.x() <= Mth.floor(box.maxX)
+                && cell.y() >= Mth.floor(box.minY) && cell.y() <= Mth.floor(box.maxY)
+                && cell.z() >= Mth.floor(box.minZ) && cell.z() <= Mth.floor(box.maxZ);
     }
 
     private boolean occupiedByOther(GridPos cell, UUID except) {
@@ -9453,7 +11331,8 @@ public final class ServerBattle {
                 abandonTerrainFall(unit);
                 continue;
             }
-            if (unit.player()) stepFallingPlayer(unit);
+            if (unit.precise() != null) stepPreciseFall(unit);
+            else if (unit.player()) stepFallingPlayer(unit);
             else stepFallingEnemy(unit);
         }
         if (!terrainFall.busy()) {
@@ -9936,6 +11815,18 @@ public final class ServerBattle {
         return id != null && terrainFall.unit(id) != null;
     }
 
+    /**
+     * Fixture-only: adopt one displacement through the same validated handoff every real push uses.
+     *
+     * <p>Only the vector comes from the fixture. The swept proof, the clipping to the last real point, the
+     * authoritative cell, the precise client frame and the fall hand-back are the production path - this entry
+     * adds no second mover. It exists so a headless server fixture can prove the hand-back deterministically,
+     * while the real client leg proves the same hand-back for a vector vanilla itself wrote.</p>
+     */
+    boolean fixtureAdoptPush(LivingEntity body, Vec3 displacement) {
+        return body != null && motion.applyImpulse(body, body instanceof ServerPlayer, displacement, null);
+    }
+
     /** Fixture-only readback: the bounded descent one tick of this family's fall may take. */
     double fixtureSubCellDescent() {
         return subCellDescent();
@@ -9961,9 +11852,31 @@ public final class ServerBattle {
      * over makes the unit under test act next. This counter is the authoritative answer to "has its own turn
      * happened yet", and it only ever advances at that unit's own turn start.</p>
      */
+    /**
+     * Read-only fixture view of how many real flights this encounter is still tracking.
+     *
+     * <p>Used by the dedicated-server fixtures to separate "the shot is still in the air" from "the shot already
+     * resolved" without asserting on a private field. It changes nothing and prices nothing.</p>
+     */
+    int fixturePendingFlights() {
+        return projectiles.pendingCount();
+    }
+
     int fixtureOwnTurns(UUID id) {
         EnemyState state = id == null ? null : enemies.get(id);
         return state == null ? -1 : state.ownTurns;
+    }
+
+    /**
+     * Read-only fixture view of the one native jump this unit really holds right now.
+     *
+     * <p>A proof about "one real body across the first swept leg, before the first physical frame" has to read the
+     * arc that is really pending - its exact first leg, its epoch, its price and whether it already left the
+     * ground - instead of re-solving or guessing one. Nothing is written and nothing is decided.</p>
+     */
+    @javax.annotation.Nullable
+    BreezeController.JumpView fixtureJump(UUID id) {
+        return id == null ? null : breezes.fixtureJumpView(id);
     }
 
     /** Fixture-only: the cells of the water route this body is really swimming, or an empty list. */
@@ -10656,7 +12569,14 @@ public final class ServerBattle {
         return kind == 2 ? 24 : 16;
     }
 
-    private static final class EnemyState {
+    /**
+     * One admitted unit of this encounter.
+     *
+     * <p>It is also the controller's own view of that unit ({@link ShulkerController.Unit}): the roster entry the
+     * encounter already keeps is the single source of AP, cell and turn epoch, so a controller never holds a second
+     * copy of them that could disagree with the authoritative one.</p>
+     */
+    private static final class EnemyState implements ShulkerController.Unit, BreezeController.Unit {
         final Mob mob;
         final BattleSide side;
         final boolean originalNoAi;
@@ -10825,5 +12745,27 @@ public final class ServerBattle {
             this.moveCost = moveCost;
             this.initiative = initiative;
         }
+
+        // --- the controller's view of this unit: the same fields, never a copy ---
+
+        @Override public Mob mob() { return mob; }
+
+        @Override public GridPos cell() { return cell; }
+
+        @Override public void cell(GridPos next) { cell = next; }
+
+        @Override public void airOffset(Vec3 offset) { airOffset = offset; }
+
+        @Override public int ap() { return ap; }
+
+        @Override public void ap(int value) { ap = value; }
+
+        @Override public int paidActions() { return paidActions; }
+
+        @Override public void paidActionsIncremented() { paidActions++; }
+
+        @Override public int ownTurns() { return ownTurns; }
+
+        @Override public BattleSide side() { return side; }
     }
 }

@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.tactical.neoforge.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "ShulkerNativeInvoker",
+    "TacticalShulkerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

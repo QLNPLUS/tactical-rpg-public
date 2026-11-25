@@ -126,6 +126,7 @@ public final class BattleAiSession {
             case SLIME_HOP -> throw new IllegalArgumentException("Battle owner must animate SLIME_HOP; a hop is ordinary movement, never an instant attack");
             case GUARDIAN_SWIM -> throw new IllegalArgumentException("Battle owner must animate GUARDIAN_SWIM; a water route is ordinary movement, never an instant attack");
             case GUARDIAN_BEAM -> throw new IllegalArgumentException("Battle owner must own GUARDIAN_BEAM's native goal; a charged beam is never an instant attack");
+            case BREEZE_JUMP -> throw new IllegalArgumentException("Battle owner must animate BREEZE_JUMP; a native arc is never an instant attack");
             case MELEE -> context.attackPlayer();
             case RANGED -> context.rangedAttackPlayer();
             case DRINK_POTION -> {
@@ -163,6 +164,29 @@ public final class BattleAiSession {
                 if (context.fireballVolley()) {
                     participant.adapter.onActionResolved(action.kind());
                 }
+                return AiResolution.END_TURN;
+            }
+            case SHULKER_SHOT -> {
+                // One commit point: the encounter re-proves the locked opponent, the native firing band, the
+                // attachment and the frozen price, spawns the real native bullet and charges only once that
+                // projectile really joined the world.
+                if (context.shulkerShot()) participant.adapter.onActionResolved(action.kind());
+                return AiResolution.END_TURN;
+            }
+            case SHULKER_TELEPORT -> {
+                // One commit point: the encounter re-checks the quota, the frozen price and every landing gate,
+                // drives vanilla's own relocation and charges only when the native entry really moved the body to
+                // a legal attachment. The same own turn may then fire once or end.
+                if (!context.shulkerTeleport()) return AiResolution.END_TURN;
+                participant.adapter.onActionResolved(action.kind());
+                return AiResolution.RELOCATED;
+            }
+            case BREEZE_SHOT -> {
+                // One commit point: the encounter re-proves the locked opponent, the native firing band, the one
+                // facing decision and the frozen price, spawns the real native wind charge and charges only once
+                // that projectile really joined the world. The native inhale and recovery own the turn until the
+                // encounter itself hands it back.
+                if (context.breezeShot()) participant.adapter.onActionResolved(action.kind());
                 return AiResolution.END_TURN;
             }
             case TELEPORT -> {
@@ -384,6 +408,22 @@ public final class BattleAiSession {
                 || !context.enderman().mayTeleport() || !context.canTeleport())) {
             // No quota, no price the unit can pay, or no landing point that passes the gates: the relocation is
             // refused here, before anything is charged or moved.
+            return AiAction.endTurn();
+        }
+        if (action.kind() == AiAction.Kind.SHULKER_SHOT && !context.shulker().canShootNow(context.ap())) {
+            // No legal shot from where the body really holds, or its one main action is already spent: refused
+            // before anything is opened, spawned or charged.
+            return AiAction.endTurn();
+        }
+        if (action.kind() == AiAction.Kind.SHULKER_TELEPORT && !context.shulker().canTeleportNow(context.ap())) {
+            return AiAction.endTurn();
+        }
+        if (action.kind() == AiAction.Kind.BREEZE_SHOT && !context.breeze().canShootNow(context.ap())) {
+            // No legal charge from where the body really stands, or its one main action is already spent: refused
+            // before anything is inhaled, spawned or charged.
+            return AiAction.endTurn();
+        }
+        if (action.kind() == AiAction.Kind.BREEZE_JUMP && !context.breeze().canJumpNow(context.ap())) {
             return AiAction.endTurn();
         }
         if (action.kind() == AiAction.Kind.BREAK_DOOR) {

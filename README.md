@@ -9,9 +9,9 @@
 
 ## 当前源码树
 
-`gradle.properties` 的 `mod_version` 是 **0.33.0**，产物名 `tactical-neoforge-1.21.1-0.33.0.jar`。战斗名册显示玩家的**本模组升级加点角色等级**，以及非玩家生物的 **Advanced-Leveling 显示等级**；不使用玩家原版经验级，不新增 AL 玩家等级。Advanced-Leveling 1.0.3 的依赖对齐与只读 API 已签收并推送。Tactical 本轮完成 956 项 Java 单测（common 94 + NeoForge 862）、51 项发布辅助测试及构建/打包门；有限实机验收覆盖无 AL、248 双模组双客户端、隐藏规则、真实升级后另一端立即刷新、双语/长名/缩放/完整悬停提示、12/13 协议拒绝，以及退出重入/死亡复活/会话替换。选定真实截图已由主控通过新盲测后亲自审看，供用户复核视觉效果。最终小修仅涉及客户端 tooltip，未受影响的先前实机证据按原构建来源复用；具体范围与限制见 CHANGELOG。客户端采用加载打包模组的独立开发启动器，不等同正式启动器或测试机验收。无显示器的执行会话通过运行目录 `config/fml.toml` 的 `earlyWindowControl = false` 关闭 NeoForge 启动窗口后正常渲染，未改驱动、会话或权限。**源码更新不等于二进制发布；0.33.0 未上传 CurseForge 或 GitHub Releases，测试机共享不可用、未换包。**
+当前工作树的 `mod_version` 是 **0.34.0**，构建产物为 `tactical-neoforge-1.21.1-0.34.0.jar`。这个 Beta 版本加入潜影贝与旋风人的专属战斗 AI。本地打包检查、定向专服回归和实机交互已完成，D5/D6 原图的可读性与裁切仍待目视签收。验收范围见[更新记录](CHANGELOG.md#0340--shulker-and-breeze-encounter-ai)。
 
-网络协议：主协议 **Tactical 13**、独立技能通道 **Skill 4**、战斗记录通道 **BattleLog 2**。客户端与服务端必须同时更新到同一版本；混版会被通道协商明确拒绝，不会静默降级。协议较旧的已发布版本（0.32.0 为 `12`，0.23.1 为 `8` / `3`）与本源码树**不能混连**。
+网络协议：主协议 **Tactical 13**、独立技能通道 **Skill 4**、战斗记录通道 **BattleLog 2**，与 0.33.0 相同。客户端与服务端应使用同一版本；协议号相同不代表已验证跨版本兼容。较旧的协议（0.32.0 为 `12`，0.23.1 为 `8` / `3`）会在通道协商时被拒绝。
 
 逐版本改动与每轮实际跑过的检查见 [更新记录](CHANGELOG.md)。
 
@@ -86,7 +86,7 @@ python -m unittest discover -s tools -p test_release_pipeline.py -v
 python tools/check_release.py
 ```
 
-当前源码树这一轮的计数是 `:common:test` **86** 项与 `:neoforge-1.21.1:test` **789** 项 Java 测试、以及 **51** 项离线发布脚本测试，均为零失败。构建通过、打包门通过、服务端无头夹具通过都**不**等于真实客户端交互验收；真实鼠标/键盘回调、镜头与界面观感需要独立的人工运行。历史各版本的验证范围见 [docs/validation](docs/validation)，各版本「未宣称覆盖什么」写在 [更新记录](CHANGELOG.md) 对应章节里。
+0.34.0 本地候选包对应的构建记录为 `:common:test` **114** 项与 `:neoforge-1.21.1:test` **885** 项 Java 测试，零失败、错误或跳过；另有 **58** 项离线发布辅助测试通过。构建、打包检查与服务端无头夹具通过都**不**等于真实客户端交互验收。历史各版本的验证范围见 [docs/validation](docs/validation) 和 [更新记录](CHANGELOG.md)。
 
 ## 许可
 

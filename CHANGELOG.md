@@ -1,5 +1,15 @@
 # 更新记录
 
+## 0.34.0 — Shulker and Breeze encounter AI
+
+**Beta build** for Minecraft 1.21.1 with NeoForge 21.1.216. Building from source requires JDK 21. The artifact is `tactical-neoforge-1.21.1-0.34.0.jar`. Tactical **13**, Skill **4** and BattleLog **2** are unchanged.
+
+- **Shulker:** The encounter controller manages face attachment and shell opening, asks the native teleport and replication paths for their actual results, and fires real homing bullets. A native child goes through normal encounter admission instead of being treated as a second action by its parent.
+- **Breeze:** The encounter controller schedules jump and wind-charge actions on its own turn. Native impact, knockback and reflection remain distinct from action payment; encounter-marked wind charges suppress block interactions.
+- **Forced movement:** The server owns the exact feet. The flat-floor knockback case now lands the player without losing lateral position or advancing the turn while the fall is in progress.
+
+**Verification:** The local candidate passed packaging checks, 999 Java tests and 58 release-tool tests. Development runtime checks covered continuous Breeze landing, compound collision support, reflected arrow hits and cross-encounter refusals, and picking at a Shulker's old and new positions. A fresh dedicated-server fixture verified that a paid Shulker teleport retires its old levitation anchor and preserves the active effect. The D5/D6 screenshot readability review is pending. The packaged JAR and the test installation have yet to undergo runtime verification.
+
 ## 0.33.0 — Battle roster levels from the right source
 
 **Build:** Minecraft 1.21.1 / NeoForge 21.1.216 build baseline; joint runtime tested on NeoForge 21.1.248. Artifact `tactical-neoforge-1.21.1-0.33.0.jar`. Main protocol **12 → 13**; Skill **4** and BattleLog **2** are unchanged. Client and server must update together.

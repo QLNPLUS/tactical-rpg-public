@@ -38,6 +38,12 @@ config = "tactical.slime.mixins.json"
 [[mixins]]
 config = "tactical.guardian.mixins.json"
 
+[[mixins]]
+config = "tactical.shulker.mixins.json"
+
+[[mixins]]
+config = "tactical.breeze.mixins.json"
+
 [[mods]]
 modId = "${mod_id}"
 version = "${mod_version}"

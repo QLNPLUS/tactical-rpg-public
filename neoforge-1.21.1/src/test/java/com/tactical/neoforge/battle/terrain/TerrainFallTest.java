@@ -112,4 +112,56 @@ class TerrainFallTest {
         assertTrue(report.contains("cells=0"));
         assertEquals(1, fall.ids().size());
     }
+
+    @Test
+    void theOrdinaryFallHasNoPreciseFeet() {
+        TerrainFall fall = new TerrainFall();
+        TerrainFall.Unit unit = fall.begin(A, true, new GridPos(0, -60, 0));
+        assertNull(unit.precise(), "the cell-based descent is still the default and is unchanged");
+    }
+
+    @Test
+    void aPreciseFallKeepsItsLateralAnchorAndItsRealStart() {
+        TerrainFall fall = new TerrainFall();
+        TerrainFall.Unit unit = fall.begin(A, true, new GridPos(0, -60, 0));
+        TerrainFall.PreciseFeet feet = unit.beginPrecise(0.207D, -59.399D, 0.962D);
+        assertNotNull(unit.precise(), "the fall is now driven from the real feet");
+        assertEquals(0.207D, feet.x(), 1.0E-9D);
+        assertEquals(0.962D, feet.z(), 1.0E-9D);
+        assertEquals(-59.399D, feet.y(), 1.0E-9D);
+        assertEquals(-59.399D, feet.fromY(), 1.0E-9D, "the real start is what the fall reports");
+        feet.y(-59.899D);
+        assertEquals(-59.899D, feet.y(), 1.0E-9D, "an accepted slice moves the exact height");
+        assertEquals(-59.399D, feet.fromY(), 1.0E-9D, "and never rewrites where it started");
+        assertEquals(0.207D, feet.x(), 1.0E-9D, "a push is never re-centred laterally by its own descent");
+        assertEquals(0.962D, feet.z(), 1.0E-9D);
+        assertTrue(fall.describe().contains("precise="), "an abandoned precise fall names its real height");
+    }
+
+    @Test
+    void endingAClearOrRemovingTheUnitTakesThePreciseFeetWithIt() {
+        TerrainFall fall = new TerrainFall();
+        TerrainFall.Unit unit = fall.begin(A, true, new GridPos(0, -60, 0));
+        unit.beginPrecise(0.207D, -59.399D, 0.962D);
+        fall.end(A);
+        assertNull(fall.unit(A), "the unit is gone, so its precise feet are gone with it");
+        TerrainFall.Unit restarted = fall.begin(A, true, new GridPos(0, -60, 0));
+        assertNull(restarted.precise(), "a later fall of the same body starts from the ordinary rule again");
+        restarted.beginPrecise(1.5D, -59.0D, 0.5D);
+        fall.clear();
+        assertFalse(fall.busy());
+        assertNull(fall.unit(A));
+    }
+
+    @Test
+    void aPreciseFallKeepsTheSameDeadlineAsEveryOtherFall() {
+        TerrainFall fall = new TerrainFall();
+        TerrainFall.Unit unit = fall.begin(A, true, new GridPos(0, -60, 0));
+        unit.beginPrecise(0.207D, -59.399D, 0.962D);
+        for (int tick = 0; tick < TerrainFall.TIMEOUT_TICKS - 1; tick++) unit.advance();
+        assertFalse(unit.expired(), "a precise fall is bounded by the one existing deadline");
+        unit.advance();
+        assertTrue(unit.expired());
+        assertNotNull(unit.precise(), "the deadline path still sees the real feet it has to report");
+    }
 }

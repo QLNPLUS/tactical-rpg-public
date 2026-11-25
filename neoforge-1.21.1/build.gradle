@@ -193,6 +193,68 @@ neoForge {
             systemProperty 'tactical.selftest', 'guardian'
             systemProperty 'tactical.dev.trace', 'true'
         }
+        // Shulker fixture: own throwaway world and ephemeral port. A real floor/wall/ceiling attachment, a real
+        // closed-shell arrow refusal, a real native relocation with its event veto, a real native bullet and the
+        // native levitation translation are only decidable on a booted server.
+        serverShulkerTest {
+            server()
+            gameDirectory = file('run-server-shulker-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'shulker'
+            systemProperty 'tactical.dev.trace', 'true'
+        }
+        // Focused shulker proof fixture: its own throwaway world and ephemeral port. Four narrow groups, each with
+        // its own fresh arena and encounter - one real accepted opening push with the shell's own attack, one
+        // native spawn the world refuses, one marked shot whose block impact is cancelled and whose target leaves,
+        // and mark immutability plus owner cleanup isolation across two live sessions. It deliberately does not
+        // run the thirty-stage macro above.
+        serverShulkerProofTest {
+            server()
+            gameDirectory = file('run-server-shulker-proof-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'shulker_proof'
+            systemProperty 'tactical.dev.trace', 'true'
+        }
+        // The same fixture's isolated native replication group alone: its own evidence never waits behind the
+        // other groups, and it uses the same throwaway world and ephemeral port.
+        serverShulkerProofQTest {
+            server()
+            gameDirectory = file('run-server-shulker-proof-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'shulker_proof_q'
+            systemProperty 'tactical.dev.trace', 'true'
+        }
+        // The same fixture's isolated levitation hand-over group alone: one floating shell's own paid relocation,
+        // adopted while the encounter still holds it up. Its own throwaway world and ephemeral port, no client.
+        serverShulkerHoldTest {
+            server()
+            gameDirectory = file('run-server-shulker-proof-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'shulker_hold'
+            systemProperty 'tactical.dev.trace', 'true'
+        }
+        // Breeze fixture: own throwaway world and ephemeral port. A real native wind charge with its own
+        // inhale, a real long-jump arc and landing, a real burst that must leave a door and a button alone, a real
+        // pre-launch refusal, a real native deflection and the untouched native control are only decidable on a
+        // booted server.
+        serverBreezeTest {
+            server()
+            gameDirectory = file('run-server-breeze-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'breeze'
+            systemProperty 'tactical.dev.trace', 'true'
+        }
+        // Breeze repair fixture: the six findings of the phase-C review, each on real entities, real projectiles,
+        // real explosions and the encounter's own books. Own throwaway world and ephemeral port.
+        serverBreezeRepairTest {
+            server()
+            gameDirectory = file('run-server-breeze-repair-test')
+            programArguments.addAll '--nogui', '--port', '0'
+            systemProperty 'tactical.selftest', 'breeze_repair'
+            systemProperty 'tactical.dev.trace', 'true'
+            // Focused reruns: -Pgroups=H runs only the named groups of this fixture.
+            if (project.hasProperty('groups')) systemProperty 'tactical.repair.groups', project.property('groups')
+        }
         serverVindicatorTest {            server()
             gameDirectory = file('run-server-vindicator-test')
             systemProperty 'tactical.selftest', 'vindicator'

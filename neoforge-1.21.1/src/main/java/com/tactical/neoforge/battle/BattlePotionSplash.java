@@ -55,7 +55,7 @@ public final class BattlePotionSplash {
         if (rule == null || candidates == null || candidates.isEmpty()) return candidates;
         List<LivingEntity> allowed = new ArrayList<>(candidates.size());
         for (LivingEntity candidate : candidates) {
-            if (rule.battle().acceptsSplash(rule.thrower(), candidate)) allowed.add(candidate);
+            if (rule.battle().acceptsSplash(rule.thrower(), candidate, potion)) allowed.add(candidate);
         }
         return allowed;
     }

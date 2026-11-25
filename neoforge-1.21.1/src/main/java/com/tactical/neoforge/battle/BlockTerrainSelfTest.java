@@ -40,8 +40,10 @@ import net.minecraft.world.item.enchantment.Enchantment;
 import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.item.enchantment.ItemEnchantments;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.StairBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.SlabType;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
@@ -154,7 +156,360 @@ public final class BlockTerrainSelfTest {
         noLandingRefusal();
         flyingUnitsAreNotAffected();
         blockedMidStep();
+        subCellPushFall();
+        subCellPushOverAPit();
+        compoundTreadUnderTheFootprint();
+        liveLevitationIsNotDropped();
+        groundRecipientThroughTheBridge();
         fallDeath();
+    }
+
+    /**
+     * An accepted push that ended <em>inside</em> one cell: the fall has to start from the real feet.
+     *
+     * <p>This is the observed D4 first difference, proved on a live server. The push leaves the body 0.601 of a
+     * block above the only floor under it while its integer cell still has a solid block beneath it, so the
+     * ordinary "is there a block below the cell" question answers "supported" about a body standing in mid air.
+     * The hand-back asks the real whole body instead: a fall must begin on the spot, descend in bounded slices
+     * without ever leaving the lateral position the push gave it, land <em>on</em> the real surface rather than a
+     * fraction above it, and cost neither AP, an action, nor any other member's resources.</p>
+     */
+    private static void subCellPushFall() {
+        ensureBreakAffordable();
+        settle();
+        GridPos cell = battle.playerCell();
+        check(cell != null, "the acting member has an authoritative cell");
+        flatCell(cell);
+        owner.setPos(cell.x() + .5D, cell.y(), cell.z() + .5D);
+        owner.setDeltaMovement(Vec3.ZERO);
+        owner.setHealth(owner.getMaxHealth());
+        owner.removeEffect(MobEffects.LEVITATION);
+        int ap = battle.currentAp();
+        int paid = battle.successfulPaidActions();
+        int partnerPaid = battle.fixtureMemberPaid(partner);
+        float health = owner.getHealth();
+        float partnerHealth = partner.getHealth();
+        check(!battle.terrainFallActive(), "the sub-cell stage starts with no fall in flight");
+        // The push vanilla accepted in the observed scene: a lateral part that stays inside the cell and a
+        // vertical part that leaves the body less than one block above its own floor.
+        Vec3 push = new Vec3(-0.293D, 0.601D, 0.462D);
+        check(battle.fixtureAdoptPush(owner, push), "the accepted push really moved the owner");
+        double exactX = cell.x() + 0.207D;
+        double exactZ = cell.z() + 0.962D;
+        check(close(owner.getY(), cell.y() + 0.601D), "the body is at the fractional height: " + owner.getY());
+        check(close(owner.getX(), exactX) && close(owner.getZ(), exactZ),
+                "the push's real lateral feet are authoritative: " + owner.getX() + "," + owner.getZ());
+        check(battle.terrainFallActive(),
+                "the unsupported fractional feet start a fall in the same tick instead of idling there");
+        check(owner.isAlive() && owner.getHealth() == health, "the push itself changed no health");
+        check(battle.currentAp() == ap && battle.successfulPaidActions() == paid,
+                "the accepted push charged no AP and counted as no action");
+        check(battle.fixtureMemberPaid(partner) == partnerPaid && partner.getHealth() == partnerHealth,
+                "the other member paid nothing for this push");
+
+        List<Double> heights = new ArrayList<>();
+        for (int guard = 0; guard < 40 && battle.terrainFallActive(); guard++) {
+            battle.tick();
+            heights.add(owner.getY());
+            check(close(owner.getX(), exactX) && close(owner.getZ(), exactZ),
+                    "every slice keeps the real lateral position: " + owner.getX() + "," + owner.getZ());
+        }
+        check(!battle.terrainFallActive(), "the fractional descent settles inside the encounter");
+        check(heights.size() >= 2, "the descent is bounded slices, not one snap: " + heights);
+        for (int index = 1; index < heights.size(); index++) {
+            check(heights.get(index) < heights.get(index - 1),
+                    "the descent is monotonic: " + heights.get(index - 1) + " -> " + heights.get(index));
+        }
+        check(close(owner.getY(), cell.y()),
+                "it lands on the real support surface, not a fraction above it: " + owner.getY());
+        check(battle.playerCell().equals(cell),
+                "a drop inside one cell keeps the cell: " + battle.playerCell() + " vs " + cell);
+        check(owner.getHealth() == health, "a sub-block drop inside one cell costs no fall damage");
+        check(battle.currentAp() == ap && battle.successfulPaidActions() == paid
+                        && battle.fixtureMemberPaid(partner) == partnerPaid,
+                "the fall charged nothing at all");
+
+        // Stable later reconciliation: the exact feet the fall landed on are the feet the encounter keeps.
+        for (int guard = 0; guard < 20; guard++) battle.tick();
+        check(!battle.terrainFallActive(), "no new fall starts from the landed feet");
+        check(close(owner.getY(), cell.y()), "the landed height is stable: " + owner.getY());
+        check(close(owner.getX(), exactX) && close(owner.getZ(), exactZ),
+                "the landed lateral feet are stable: " + owner.getX() + "," + owner.getZ());
+        check(battle.playerCell().equals(cell), "and the authoritative cell is unchanged: " + battle.playerCell());
+        check(owner.getHealth() == health, "no delayed fall damage either: " + owner.getHealth());
+
+        // The common case, as a control: a push that ends on the floor is not a fall at all. Without this the
+        // hand-back could pass by starting a fall for every displacement instead of only for a real one.
+        check(battle.fixtureAdoptPush(owner, new Vec3(0.2D, 0.0D, 0.0D)),
+                "a push along the floor is accepted too");
+        check(close(owner.getY(), cell.y()), "and it keeps the body on the surface: " + owner.getY());
+        check(!battle.terrainFallActive(), "a push that ends on a real floor starts no fall");
+        for (int guard = 0; guard < 5; guard++) battle.tick();
+        check(!battle.terrainFallActive() && close(owner.getY(), cell.y()),
+                "and it does not drift down afterwards: " + owner.getY());
+    }
+
+    /**
+     * The same bridge over a real pit: the floor under the whole body is five cells lower.
+     *
+     * <p>A precise fall is not "descend to the floor of my cell". The real support under the whole footprint can
+     * be anywhere below it, so the descent has to resolve it, count the whole cells it really fell and hand that
+     * count to the existing damage rule - the very rule the ordinary forced fall already uses.</p>
+     */
+    private static void subCellPushOverAPit() {
+        ensureBreakAffordable();
+        settle();
+        GridPos cell = pitCell();
+        int depth = 12;
+        for (int step = 1; step <= depth; step++) {
+            level.setBlock(new BlockPos(cell.x(), cell.y() - step, cell.z()), air(), 3);
+        }
+        level.setBlock(new BlockPos(cell.x(), cell.y() - depth - 1, cell.z()),
+                Blocks.STONE.defaultBlockState(), 3);
+        owner.setPos(cell.x() + .5D, cell.y(), cell.z() + .5D);
+        owner.setDeltaMovement(Vec3.ZERO);
+        owner.setHealth(owner.getMaxHealth());
+        float health = owner.getHealth();
+        int ap = battle.currentAp();
+        check(battle.fixtureAdoptPush(owner, new Vec3(0.0D, 0.601D, 0.0D)),
+                "the push over the pit is accepted");
+        check(close(owner.getY(), cell.y() + 0.601D), "the body hangs over the pit: " + owner.getY());
+        check(battle.terrainFallActive(), "the pit under the real feet starts a fall");
+        check(level.getBlockState(new BlockPos(cell.x(), cell.y() - 1, cell.z())).isAir(),
+                "and the integer cell below really is empty, so this is not the integer rule");
+
+        List<Double> heights = new ArrayList<>();
+        for (int guard = 0; guard < 80 && battle.terrainFallActive(); guard++) {
+            battle.tick();
+            heights.add(owner.getY());
+            check(close(owner.getX(), cell.x() + .5D) && close(owner.getZ(), cell.z() + .5D),
+                    "the pit descent keeps the lateral anchor");
+        }
+        check(!battle.terrainFallActive(), "the deeper fall settles");
+        check(heights.size() >= depth * 2, "a " + depth + "-cell precise descent is slice by slice: "
+                + heights.size());
+        check(close(owner.getY(), cell.y() - depth), "it lands on the pit floor: " + owner.getY());
+        check(battle.playerCell().equals(new GridPos(cell.x(), cell.y() - depth, cell.z())),
+                "the authoritative cell followed the whole cells it really fell: " + battle.playerCell());
+        // The existing policy is preserved, not re-decided: the whole cells it really fell are what the shared
+        // landing settlement receives, and the vanilla fall calculation turns them into damage.
+        int fell = cell.y() - battle.playerCell().y();
+        check(fell == depth, "the whole-cell count is the real descent: " + fell);
+        check(owner.getHealth() < health,
+                "the whole-cell descent reaches the existing damage rule: " + health + " -> " + owner.getHealth());
+        check(owner.isAlive(), "a " + depth + "-block drop is survivable");
+        check(battle.currentAp() == ap, "and it still charged no AP");
+    }
+
+    /**
+     * A compound block is not one height: only its parts that really overlap the footprint are floor.
+     *
+     * <p>Two stairs stand side by side with their tall halves pointing away from each other, and the body stands
+     * on the junction of their low treads. The footprint covers both low treads and neither tall half, so the
+     * real floor there is the tread top - a surface that is neither the block's own maximum nor the height of the
+     * cell below the body. Both ways the old whole-block answer got this wrong are checked on a live server: a
+     * body already standing on the tread must not be told it hangs (the tread is not skipped because a taller
+     * part of the same block exists elsewhere), and a body level with the tall halves must not be told it stands
+     * (the tall half is not contact when it is outside the footprint and above the real feet).</p>
+     */
+    private static void compoundTreadUnderTheFootprint() {
+        ensureBreakAffordable();
+        settle();
+        GridPos cell = battle.playerCell();
+        check(cell != null, "the acting member has an authoritative cell");
+        flatCell(cell);
+        BlockPos east = new BlockPos(cell.x(), cell.y() - 1, cell.z());
+        BlockPos west = east.west();
+        level.setBlock(east, Blocks.STONE_STAIRS.defaultBlockState().setValue(StairBlock.FACING, Direction.EAST), 3);
+        level.setBlock(west, Blocks.STONE_STAIRS.defaultBlockState().setValue(StairBlock.FACING, Direction.WEST), 3);
+        // The exact feet this stage drives to, and the geometry it depends on, checked instead of assumed.
+        double tread = cell.y() - 0.5D;
+        double junctionX = cell.x();
+        double z = cell.z() + 0.5D;
+        AABB footprint = new AABB(junctionX - 0.3D, tread, z - 0.3D, junctionX + 0.3D, tread, z - 0.3D + 0.6D);
+        for (BlockPos stair : List.of(east, west)) {
+            check(!level.getBlockState(stair).getCollisionShape(level, stair).isEmpty(),
+                    "the compound block really has collision shapes: " + stair);
+            for (AABB part : level.getBlockState(stair).getCollisionShape(level, stair).toAabbs()) {
+                AABB world = part.move(stair.getX(), stair.getY(), stair.getZ());
+                boolean overlaps = world.maxX > footprint.minX + 1.0E-9D && world.minX < footprint.maxX - 1.0E-9D
+                        && world.maxZ > footprint.minZ + 1.0E-9D && world.minZ < footprint.maxZ - 1.0E-9D;
+                if (!overlaps) continue;
+                check(close(world.maxY, tread),
+                        "only the low tread overlaps the footprint: part top=" + world.maxY + " expected=" + tread);
+            }
+        }
+
+        // First: standing exactly on that tread is support, so no fall may start and nothing may be charged.
+        owner.setPos(junctionX - 0.05D, tread, z);
+        owner.setDeltaMovement(Vec3.ZERO);
+        owner.setHealth(owner.getMaxHealth());
+        owner.removeEffect(MobEffects.LEVITATION);
+        float health = owner.getHealth();
+        int ap = battle.currentAp();
+        int paid = battle.successfulPaidActions();
+        int partnerPaid = battle.fixtureMemberPaid(partner);
+        check(!battle.terrainFallActive(), "the compound stage starts with no fall in flight");
+        check(battle.fixtureAdoptPush(owner, new Vec3(0.05D, 0.0D, 0.0D)),
+                "the push onto the junction of the two treads is accepted");
+        check(close(owner.getX(), junctionX) && close(owner.getZ(), z),
+                "the accepted feet are the junction: " + owner.getX() + "," + owner.getZ());
+        check(close(owner.getY(), tread), "the body stands exactly on the low treads: " + owner.getY());
+        check(!battle.terrainFallActive(),
+                "a body standing on a compound tread whose tall halves are outside its footprint is supported");
+        check(owner.getHealth() == health && battle.currentAp() == ap
+                        && battle.successfulPaidActions() == paid && battle.fixtureMemberPaid(partner) == partnerPaid,
+                "the accepted push onto the tread charged nothing at all");
+        for (int guard = 0; guard < 10; guard++) battle.tick();
+        check(!battle.terrainFallActive() && close(owner.getY(), tread)
+                        && close(owner.getX(), junctionX) && close(owner.getZ(), z),
+                "and it keeps standing on the tread: " + owner.getY() + " at " + owner.getX() + "," + owner.getZ());
+
+        // Second: level with the tall halves, the body is half a block above its own tread and must really fall
+        // onto it - the tall part is not a floor at any height.
+        settle();
+        owner.setPos(junctionX - 0.05D, cell.y(), z);
+        owner.setDeltaMovement(Vec3.ZERO);
+        owner.setHealth(owner.getMaxHealth());
+        owner.removeEffect(MobEffects.LEVITATION);
+        health = owner.getHealth();
+        ap = battle.currentAp();
+        check(battle.fixtureAdoptPush(owner, new Vec3(0.05D, 0.0D, 0.0D)),
+                "the push level with the tall halves is accepted");
+        check(close(owner.getX(), junctionX) && close(owner.getY(), cell.y()),
+                "the body is level with the tall halves: " + owner.getX() + "," + owner.getY());
+        check(battle.terrainFallActive(),
+                "a body level with the tall halves but above its own tread really falls");
+        for (int guard = 0; guard < 40 && battle.terrainFallActive(); guard++) {
+            battle.tick();
+            check(close(owner.getX(), junctionX) && close(owner.getZ(), z),
+                    "the compound descent keeps the lateral feet: " + owner.getX() + "," + owner.getZ());
+        }
+        check(!battle.terrainFallActive(), "the compound descent settles");
+        check(close(owner.getY(), tread),
+                "it lands on the low tread, not on the tall half's height: " + owner.getY() + " expected=" + tread);
+        check(!close(owner.getY(), cell.y()), "and never stops at the tall half: " + owner.getY());
+
+        // Third: the same compound floor from a full cell up, so the descent has to be several bounded slices and
+        // has to pass the tall half's own height without stopping there.
+        settle();
+        owner.setPos(junctionX - 0.05D, cell.y() + 1.0D, z);
+        owner.setDeltaMovement(Vec3.ZERO);
+        owner.setHealth(owner.getMaxHealth());
+        owner.removeEffect(MobEffects.LEVITATION);
+        health = owner.getHealth();
+        ap = battle.currentAp();
+        check(battle.fixtureAdoptPush(owner, new Vec3(0.05D, 0.0D, 0.0D)),
+                "the push higher above the tread is accepted");
+        check(close(owner.getY(), cell.y() + 1.0D), "the body is a full cell above the tread: " + owner.getY());
+        check(battle.terrainFallActive(), "the higher unsupported feet really fall");
+        List<Double> heights = new ArrayList<>();
+        for (int guard = 0; guard < 60 && battle.terrainFallActive(); guard++) {
+            battle.tick();
+            heights.add(owner.getY());
+            check(close(owner.getX(), junctionX) && close(owner.getZ(), z),
+                    "the higher compound descent keeps the lateral feet: " + owner.getX() + "," + owner.getZ());
+        }
+        check(!battle.terrainFallActive(), "the higher compound descent settles");
+        check(heights.size() >= 2, "it descends in bounded slices, not one snap: " + heights);
+        for (int index = 1; index < heights.size(); index++) {
+            check(heights.get(index) < heights.get(index - 1),
+                    "the compound descent is monotonic: " + heights.get(index - 1) + " -> " + heights.get(index));
+        }
+        check(close(owner.getY(), tread),
+                "it lands on the low tread from higher up too: " + owner.getY() + " expected=" + tread);
+        check(!close(owner.getY(), cell.y()), "and it never stopped at the tall half on the way down");
+        // The descent really crossed a whole cell, so the existing whole-cell settlement rule receives it; that
+        // rule's own native three-cell grace is what decides the damage, and this case stays below it.
+        int fell = cell.y() + 1 - battle.playerCell().y();
+        check(fell == 2, "the whole-cell count is the real crossing: " + fell);
+        check(owner.getHealth() == health,
+                "a two-cell compound drop stays inside the existing grace: " + health + " -> " + owner.getHealth());
+        check(battle.currentAp() == ap, "and it charged no AP");
+    }
+
+    /**
+     * A live levitation effect is a native cause, not a floor: it must never be turned into a descent.
+     *
+     * <p>Then, with the effect gone, the very same feet are handed to the fall rule. This is what proves the
+     * guard is the effect itself and not "never start a fall after a push".</p>
+     */
+    private static void liveLevitationIsNotDropped() {
+        settle();
+        GridPos cell = battle.playerCell();
+        flatCell(cell);
+        owner.setPos(cell.x() + .5D, cell.y(), cell.z() + .5D);
+        owner.setDeltaMovement(Vec3.ZERO);
+        owner.setHealth(owner.getMaxHealth());
+        owner.addEffect(new MobEffectInstance(MobEffects.LEVITATION, 1200, 0));
+        check(battle.fixtureAdoptPush(owner, new Vec3(0.0D, 0.601D, 0.0D)),
+                "the push under levitation is accepted");
+        check(close(owner.getY(), cell.y() + 0.601D), "the body is held at the fractional height");
+        check(!battle.terrainFallActive(), "a live levitation effect is never turned into a fall");
+        for (int guard = 0; guard < 5; guard++) battle.tick();
+        check(!battle.terrainFallActive(), "and it stays that way while the native effect lasts");
+        owner.removeEffect(MobEffects.LEVITATION);
+        check(battle.fixtureAdoptPush(owner, new Vec3(0.0D, 0.0D, -0.2D)),
+                "with the effect gone the same feet accept another push");
+        check(battle.terrainFallActive(), "and this one really starts a fall");
+        settle();
+        check(!battle.terrainFallActive(), "the fall settles after the effect is gone");
+        check(close(owner.getY(), cell.y()), "it lands on the real surface: " + owner.getY());
+    }
+
+    /**
+     * The same bridge for an ordinary ground AI recipient, if this fixture can admit one.
+     *
+     * <p>A member and an AI unit settle through one seat, so the hand-back must not be member-only. The recipient
+     * is a native zombie with no vanilla AI, admitted through the encounter's own admission transaction; if this
+     * fixture cannot admit it, the sub-case is reported as not covered rather than counted as a pass.</p>
+     */
+    private static void groundRecipientThroughTheBridge() {
+        settle();
+        Zombie recipient = EntityType.ZOMBIE.create(level);
+        check(recipient != null, "the ground recipient was created");
+        recipient.setPos(origin.getX() + 4.5D, origin.getY(), origin.getZ() + 4.5D);
+        recipient.setNoAi(true);
+        recipient.setPersistenceRequired();
+        recipient.getAttribute(Attributes.MAX_HEALTH).setBaseValue(1000);
+        recipient.setHealth(1000);
+        level.addFreshEntity(recipient);
+        spawned.add(recipient);
+        if (!battle.tryAbsorb(recipient)) {
+            Tactical.LOGGER.warn("[Tactical] BLOCK_TERRAIN SKIP a ground AI recipient could not be admitted "
+                    + "by this fixture; the bridge is proved for the member path only here");
+            recipient.discard();
+            return;
+        }
+        try {
+            ServerBattle.EnemyView before = battle.fixtureEnemy(recipient.getUUID());
+            check(before != null, "the recipient really is a participant");
+            GridPos cell = before.cell();
+            check(cell != null, "the recipient has an authoritative cell");
+            int ap = before.ap();
+            double x = recipient.getX();
+            double z = recipient.getZ();
+            check(battle.fixtureAdoptPush(recipient, new Vec3(0.15D, 0.601D, 0.0D)),
+                    "the push on the AI recipient is accepted");
+            check(battle.terrainFallActive(), "the unsupported AI feet start a fall through the same bridge");
+            for (int guard = 0; guard < 40 && battle.terrainFallActive(); guard++) {
+                battle.tick();
+                check(close(recipient.getX(), x + 0.15D) && close(recipient.getZ(), z),
+                        "the AI descent keeps its real lateral position");
+            }
+            check(!battle.terrainFallActive(), "the AI fall settles");
+            check(close(recipient.getY(), cell.y()), "it lands on the real surface: " + recipient.getY());
+            ServerBattle.EnemyView after = battle.fixtureEnemy(recipient.getUUID());
+            check(after != null && after.ap() == ap, "the AI fall charged no AP");
+            check(after != null && after.paidActions() == before.paidActions(), "and counted no action");
+        } finally {
+            recipient.discard();
+            for (int guard = 0; guard < 20 && battle.fixtureEnemy(recipient.getUUID()) != null; guard++) {
+                battle.tick();
+            }
+            check(battle.fixtureEnemy(recipient.getUUID()) == null,
+                    "the fixture recipient really left the encounter again");
+        }
     }
 
     /** Placement still works, and the item command is no longer a second way to place. */
@@ -553,6 +908,35 @@ public final class BlockTerrainSelfTest {
 
     private static BlockState air() {
         return Blocks.AIR.defaultBlockState();
+    }
+
+    /** One exact-foot comparison: every precise receipt here is a number, never a rounded cell. */
+    private static boolean close(double actual, double expected) {
+        return Math.abs(actual - expected) < 1.0E-6D;
+    }
+
+    /**
+     * A cell whose floor is the block directly under it and whose neighbourhood is open air.
+     *
+     * <p>The body box is wider than the push's own cell, so the four columns it can straddle have to be as flat
+     * as the one it lands in; otherwise the real-support answer would legitimately be a neighbouring floor and
+     * the stage would be measuring the fixture instead of the rule.</p>
+     */
+    private static void flatCell(GridPos cell) {
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                level.setBlock(new BlockPos(cell.x() + dx, cell.y() - 1, cell.z() + dz),
+                        Blocks.STONE.defaultBlockState(), 3);
+                for (int dy = 0; dy <= 2; dy++) {
+                    level.setBlock(new BlockPos(cell.x() + dx, cell.y() + dy, cell.z() + dz), air(), 3);
+                }
+            }
+        }
+    }
+
+    /** An untouched cell of the platform, so the pit stage never reuses a shaft an earlier stage dug. */
+    private static GridPos pitCell() {
+        return new GridPos(origin.getX() - 8, origin.getY(), origin.getZ() - 8);
     }
 
     private static void attemptCell(GridPos actual, GridPos expected) {

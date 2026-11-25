@@ -25,6 +25,46 @@ public final class TerrainFall {
     /** A fall that has not settled is abandoned after this many ticks; the encounter then gives up. */
     public static final int TIMEOUT_TICKS = 100;
 
+    /**
+     * The real fractional feet one <em>precise</em> fall holds.
+     *
+     * <p>An ordinary forced fall descends whole cells, which is right for a body that was standing on a cell
+     * boundary. A body that was displaced <em>inside</em> its own cell - an accepted push that ended 0.601 above
+     * the floor - was never on one, so the cell centre is not a place it can be put without inventing a move.
+     * Here the lateral position is fixed for the lifetime of the fall and the height is written once per accepted
+     * descent slice.</p>
+     *
+     * <p>World-free bookkeeping, like the rest of this type: it is a value record kept <em>inside</em> the unit,
+     * so {@link TerrainFall#end}, {@link TerrainFall#clear} and the deadline drop it with the fall itself and no
+     * second lifetime has to be maintained.</p>
+     */
+    public static final class PreciseFeet {
+        private final double x;
+        private final double z;
+        private final double fromY;
+        private double y;
+
+        private PreciseFeet(double x, double y, double z) {
+            this.x = x;
+            this.z = z;
+            this.fromY = y;
+            this.y = y;
+        }
+
+        /** The horizontal position the fall was handed and may never change: no cell-centre snap. */
+        public double x() { return x; }
+
+        public double z() { return z; }
+
+        /** Where the real feet were when the push was accepted; never rewritten. */
+        public double fromY() { return fromY; }
+
+        /** Where the real feet are after the last accepted slice. */
+        public double y() { return y; }
+
+        public void y(double value) { y = value; }
+    }
+
     /** One falling unit's own progress. Cells are authoritative; nothing here is a client prediction. */
     public static final class Unit {
         private final UUID id;
@@ -38,6 +78,7 @@ public final class TerrainFall {
         private int ticks;
         private int progress;
         private int motionTicks;
+        private PreciseFeet precise;
 
         private Unit(UUID id, boolean player, GridPos cell) {
             this.id = id;
@@ -73,6 +114,20 @@ public final class TerrainFall {
         public int progress() { return progress; }
 
         public int motionTicks() { return motionTicks; }
+
+        /**
+         * The real fractional feet of a precise fall, or {@code null} for the ordinary whole-cell descent.
+         *
+         * <p>This is the only difference between the two: everything else - the deadline, the busy barrier, the
+         * landing reservation, the origin the journal reports - stays the one forced-fall state.</p>
+         */
+        public PreciseFeet precise() { return precise; }
+
+        /** Anchor this fall at the real feet it really starts from, instead of at a cell centre. */
+        public PreciseFeet beginPrecise(double x, double y, double z) {
+            precise = new PreciseFeet(x, y, z);
+            return precise;
+        }
 
         public void beginStep(GridPos from, GridPos to, int motion) {
             stepFrom = from;
@@ -157,6 +212,10 @@ public final class TerrainFall {
             builder.append(unit.id()).append('@').append(unit.cell())
                     .append(" ticks=").append(unit.ticks())
                     .append(" cells=").append(unit.cells());
+            if (unit.precise() != null) {
+                builder.append(" precise=")
+                        .append(String.format(java.util.Locale.ROOT, "%.4f", unit.precise().y()));
+            }
         }
         return builder.toString();
     }

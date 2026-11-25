@@ -191,7 +191,7 @@ public final class DrownedTridents {
         HitResult hit = event.getRayTraceResult();
         if (hit == null || hit.getType() != HitResult.Type.ENTITY) return;
         if (!(hit instanceof EntityHitResult entityHit)) return;
-        if (mark.battle().acceptsTrident(mark.actorId(), entityHit.getEntity())) return;
+        if (mark.battle().acceptsTrident(mark.actorId(), entityHit.getEntity(), trident)) return;
         event.setCanceled(true);
     }
 
